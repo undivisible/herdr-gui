@@ -1,0 +1,11 @@
+[workspace]
+members = ["crates/herdr-gui"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
