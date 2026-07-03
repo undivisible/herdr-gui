@@ -897,7 +897,7 @@ impl HerdrGui {
         let size = window.bounds().size;
         let width = (size.width.to_f64() - self.sidebar_width()).max(320.0);
         let height = size.height.to_f64().max(240.0);
-        let cols = (width / 7.0).ceil().clamp(40.0, 1000.0) as u16;
+        let cols = (width / 8.0).floor().clamp(40.0, 500.0) as u16;
         let rows = (height / 18.0).floor().clamp(12.0, 180.0) as u16;
         (cols, rows, width.round() as u16, height.round() as u16)
     }
@@ -991,37 +991,11 @@ impl HerdrGui {
     }
 
     fn agent_rows(&self, theme: UiTheme, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let mut seen = self
-            .state
-            .agents
-            .iter()
-            .map(|agent| {
-                agent
-                    .pane_id
-                    .as_deref()
-                    .unwrap_or(agent.terminal_id.as_str())
-                    .to_string()
-            })
-            .collect::<std::collections::HashSet<_>>();
-        let mut rows = self
-            .state
+        self.state
             .agents
             .iter()
             .map(|agent| agent_row(agent, &self.state, theme, cx))
-            .collect::<Vec<_>>();
-        rows.extend(self.state.panes.iter().filter_map(|pane| {
-            let key = pane
-                .terminal_id
-                .as_deref()
-                .unwrap_or(pane.pane_id.as_str())
-                .to_string();
-            if seen.insert(key) {
-                Some(pane_agent_row(pane, &self.state, theme, cx))
-            } else {
-                None
-            }
-        }));
-        rows
+            .collect()
     }
 
     fn pane_grid(
@@ -1130,6 +1104,7 @@ fn space_switcher(
         .or_else(|| workspace.map(|workspace| workspace.workspace_id.as_str()))
         .unwrap_or("space");
     div()
+        .w_full()
         .h(px(34.0))
         .flex()
         .items_center()
@@ -1139,6 +1114,7 @@ fn space_switcher(
         .child(
             div()
                 .flex_1()
+                .min_w_0()
                 .h(px(32.0))
                 .px_2()
                 .flex()
@@ -1158,6 +1134,7 @@ fn space_switcher(
             div()
                 .w(px(32.0))
                 .h(px(32.0))
+                .flex_none()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -1252,64 +1229,6 @@ fn workspace_row(
     row(title, detail, focused, theme, on_click).into_any_element()
 }
 
-fn pane_agent_title(pane: &Pane, state: &HerdrState) -> String {
-    pane.agent
-        .as_deref()
-        .or(pane.terminal_title.as_deref())
-        .or(pane.title.as_deref())
-        .or(pane.label.as_deref())
-        .or_else(|| {
-            pane.tab_id.as_deref().and_then(|tab_id| {
-                state
-                    .tabs
-                    .iter()
-                    .find(|tab| tab.tab_id == tab_id)
-                    .and_then(|tab| {
-                        tab.terminal_title
-                            .as_deref()
-                            .or(tab.title.as_deref())
-                            .or(tab.label.as_deref())
-                    })
-            })
-        })
-        .or(pane.terminal_id.as_deref())
-        .unwrap_or(&pane.pane_id)
-        .to_string()
-}
-
-fn pane_agent_row(
-    pane: &Pane,
-    state: &HerdrState,
-    theme: UiTheme,
-    cx: &mut Context<HerdrGui>,
-) -> AnyElement {
-    let workspace_id = pane.workspace_id.clone();
-    let tab_id = pane.tab_id.clone();
-    let pane_id = pane.pane_id.clone();
-    let title = pane_agent_title(pane, state);
-    let status = pane
-        .agent_status
-        .as_deref()
-        .unwrap_or("unknown")
-        .to_string();
-    let focused = pane.focused
-        || state
-            .focused_pane_id
-            .as_deref()
-            .is_some_and(|focused| focused == pane.pane_id);
-    let on_click = cx.listener(move |this, _, window, cx| {
-        this.focus_target(
-            workspace_id.clone(),
-            tab_id.clone(),
-            Some(pane_id.clone()),
-            window,
-            cx,
-        )
-    });
-
-    agent_row_element(title, status, focused, theme, on_click).into_any_element()
-}
-
 fn agent_row(
     agent: &Agent,
     state: &HerdrState,
@@ -1333,6 +1252,11 @@ fn agent_row(
         .or(agent.agent_status.as_deref())
         .unwrap_or("unknown")
         .to_string();
+    let status_key = agent
+        .agent_status
+        .as_deref()
+        .unwrap_or(status.as_str())
+        .to_string();
     let focused = agent.focused
         || pane_id.as_deref().is_some_and(|pane_id| {
             state
@@ -1350,12 +1274,13 @@ fn agent_row(
         );
     });
 
-    agent_row_element(title, status, focused, theme, on_click).into_any_element()
+    agent_row_element(title, status, status_key, focused, theme, on_click).into_any_element()
 }
 
 fn agent_row_element(
     title: String,
     status: String,
+    status_key: String,
     focused: bool,
     theme: UiTheme,
     on_click: impl Fn(&crepuscularity_gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
@@ -1367,9 +1292,13 @@ fn agent_row_element(
         .items_center()
         .justify_between()
         .cursor_pointer()
+        .bg(rgb(agent_status_background(&status_key, theme)))
         .hover(move |style| style.bg(rgb(theme.hover)))
         .on_mouse_down(MouseButton::Left, on_click)
-        .when(focused, |el| el.bg(rgb(theme.active)))
+        .when(focused, |el| {
+            el.border_l_2()
+                .border_color(rgb(agent_status_accent(&status_key)))
+        })
         .child(
             div()
                 .flex()
@@ -1382,12 +1311,49 @@ fn agent_row_element(
         .into_any_element()
 }
 
+fn agent_status_background(status: &str, theme: UiTheme) -> u32 {
+    let light = theme.bg > 0x808080;
+    match status {
+        "working" => {
+            if light {
+                0xfff3d6
+            } else {
+                0x2a210f
+            }
+        }
+        "blocked" => {
+            if light {
+                0xffe1e1
+            } else {
+                0x2b1515
+            }
+        }
+        "done" => {
+            if light {
+                0xdff6e6
+            } else {
+                0x102615
+            }
+        }
+        _ => theme.panel,
+    }
+}
+
+fn agent_status_accent(status: &str) -> u32 {
+    match status {
+        "working" => 0xf59e0b,
+        "blocked" => 0xef4444,
+        "done" => 0x22c55e,
+        _ => 0x8a8a8a,
+    }
+}
+
 fn status_color(status: &str) -> u32 {
     match status {
-        "working" => 0xffffff,
-        "blocked" => 0xd0d0d0,
-        "done" => 0xa0a0a0,
-        "idle" => 0x777777,
+        "working" => 0xf59e0b,
+        "blocked" => 0xef4444,
+        "done" => 0x22c55e,
+        "idle" => 0x8a8a8a,
         _ => 0x555555,
     }
 }
@@ -1759,7 +1725,7 @@ fn main() {
 fn poll_terminal(receiver: Receiver<TerminalFrame>, token: u64, cx: &mut Context<HerdrGui>) {
     cx.spawn(async move |this, cx| loop {
         cx.background_executor()
-            .timer(Duration::from_millis(33))
+            .timer(Duration::from_millis(16))
             .await;
         let mut latest = None;
         let mut disconnected = false;

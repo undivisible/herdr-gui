@@ -479,7 +479,7 @@ mod tests {
     #[test]
     fn session_snapshot_should_preserve_focused_window_context() {
         let snapshot: SessionSnapshotResult = parse_json(
-            r#"{"type":"session_snapshot","snapshot":{"version":"0.6.0","protocol":8,"focused_workspace_id":"1","focused_tab_id":"1:2","focused_pane_id":"1:p3","workspaces":[{"workspace_id":"1","label":"repo","focused":true,"active_tab_id":"1:2"}],"tabs":[{"tab_id":"1:1","workspace_id":"1","label":"build","focused":false},{"tab_id":"1:2","workspace_id":"1","label":"shell","focused":true}],"panes":[{"pane_id":"1:p3","terminal_id":"term_3","workspace_id":"1","tab_id":"1:2","focused":true,"agent_status":"idle"}],"layouts":[],"agents":[]}}"#,
+            r#"{"type":"session_snapshot","snapshot":{"version":"0.6.0","protocol":8,"focused_workspace_id":"1","focused_tab_id":"1:2","focused_pane_id":"1:p3","workspaces":[{"workspace_id":"1","label":"repo","focused":true,"active_tab_id":"1:2"}],"tabs":[{"tab_id":"1:1","workspace_id":"1","label":"build","focused":false},{"tab_id":"1:2","workspace_id":"1","label":"shell","focused":true}],"panes":[{"pane_id":"1:p3","terminal_id":"term_3","workspace_id":"1","tab_id":"1:2","focused":true,"agent_status":"idle"}],"layouts":[],"agents":[{"terminal_id":"term_3","agent":"pi","agent_status":"working","workspace_id":"1","tab_id":"1:2","pane_id":"1:p3","focused":true,"revision":1}]}}"#,
         );
         let state = super::HerdrState::from(snapshot.snapshot);
 
@@ -488,7 +488,9 @@ mod tests {
         assert_eq!(state.focused_pane_id.as_deref(), Some("1:p3"));
         assert_eq!(state.tabs[1].workspace_id.as_deref(), Some("1"));
         assert_eq!(state.panes[0].tab_id.as_deref(), Some("1:2"));
-        assert!(state.agents.is_empty());
+        assert_eq!(state.agents.len(), 1);
+        assert_eq!(state.agents[0].agent.as_deref(), Some("pi"));
+        assert_eq!(state.agents[0].pane_id.as_deref(), Some("1:p3"));
     }
 
     fn parse_json<T: serde::de::DeserializeOwned>(json: &str) -> T {
