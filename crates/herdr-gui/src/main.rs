@@ -897,7 +897,7 @@ impl HerdrGui {
         let size = window.bounds().size;
         let width = (size.width.to_f64() - self.sidebar_width()).max(320.0);
         let height = size.height.to_f64().max(240.0);
-        let cols = (width / 8.0).floor().clamp(40.0, 500.0) as u16;
+        let cols = (width / 7.5).floor().clamp(40.0, 500.0) as u16;
         let rows = (height / 18.0).floor().clamp(12.0, 180.0) as u16;
         (cols, rows, width.round() as u16, height.round() as u16)
     }
@@ -1108,9 +1108,7 @@ fn space_switcher(
         .h(px(34.0))
         .flex()
         .items_center()
-        .gap_1()
         .pl(px(82.0))
-        .pr_1()
         .child(
             div()
                 .flex_1()
@@ -1121,6 +1119,9 @@ fn space_switcher(
                 .items_center()
                 .cursor_pointer()
                 .overflow_hidden()
+                .text_size(px(14.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(theme.label))
                 .hover(move |style| style.bg(rgb(theme.hover)))
                 .on_mouse_down(
                     MouseButton::Left,
@@ -1128,7 +1129,7 @@ fn space_switcher(
                         this.toggle_spaces(&ToggleSpaces, window, cx)
                     }),
                 )
-                .child(label(&truncate_label(name, 18), theme.label)),
+                .child(truncate_label(name, 64)),
         )
         .child(
             div()
