@@ -259,6 +259,16 @@ impl HerdrClient {
         Ok(())
     }
 
+    pub fn close_tab(&self, tab_id: &str) -> Result<(), HerdrError> {
+        let _: Value = self.call("tab.close", json!({ "tab_id": tab_id }))?;
+        Ok(())
+    }
+
+    pub fn create_workspace(&self) -> Result<(), HerdrError> {
+        let _: Value = self.call("workspace.create", json!({ "focus": true }))?;
+        Ok(())
+    }
+
     pub fn focus_pane(&self, pane_id: &str) -> Result<(), HerdrError> {
         let _: Value = self.call("pane.focus", json!({ "pane_id": pane_id }))?;
         Ok(())

@@ -10,7 +10,10 @@ use crepuscularity_gpui::{
 };
 use ghostty::{TerminalFrame, TerminalLine, TerminalRun, TerminalSession};
 use herdr::{HerdrClient, HerdrState, Pane, Tab, Workspace};
-use std::{sync::mpsc::Receiver, time::Duration};
+use std::{
+    sync::mpsc::{Receiver, TryRecvError},
+    time::Duration,
+};
 
 actions!(
     herdr_gui,
@@ -25,8 +28,13 @@ actions!(
         PreviousTab,
         NextTab,
         NewTab,
+        CloseTab,
+        NewWorkspace,
         PreviousWorkspace,
         NextWorkspace,
+        ToggleSpaces,
+        ToggleSidebar,
+        ToggleAgents,
         ToggleSidebarLayout
     ]
 );
@@ -42,10 +50,15 @@ struct HerdrGui {
     terminal: Option<TerminalSession>,
     terminal_target: Option<String>,
     terminal_size: Option<TerminalSize>,
+    terminal_token: u64,
     terminal_frame: TerminalFrame,
     state: HerdrState,
     status: String,
     show_help: bool,
+    show_spaces: bool,
+    sidebar_collapsed: bool,
+    sidebar_hovered: bool,
+    agents_collapsed: bool,
     sidebar_layout: SidebarLayout,
     scroll_x: f64,
     focus_handle: FocusHandle,
@@ -67,10 +80,15 @@ impl HerdrGui {
             terminal: None,
             terminal_target: None,
             terminal_size: None,
+            terminal_token: 0,
             terminal_frame: TerminalFrame::default(),
             state,
             status,
             show_help: false,
+            show_spaces: false,
+            sidebar_collapsed: false,
+            sidebar_hovered: false,
+            agents_collapsed: false,
             sidebar_layout: SidebarLayout::Arc,
             scroll_x: 0.0,
             focus_handle: cx.focus_handle(),
@@ -92,6 +110,21 @@ impl HerdrGui {
             SidebarLayout::Warp => SidebarLayout::Arc,
             SidebarLayout::Arc => SidebarLayout::Warp,
         };
+        cx.notify();
+    }
+
+    fn toggle_spaces(&mut self, _: &ToggleSpaces, _window: &mut Window, cx: &mut Context<Self>) {
+        self.show_spaces = !self.show_spaces;
+        cx.notify();
+    }
+
+    fn toggle_sidebar(&mut self, _: &ToggleSidebar, _window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_collapsed = !self.sidebar_collapsed;
+        cx.notify();
+    }
+
+    fn toggle_agents(&mut self, _: &ToggleAgents, _window: &mut Window, cx: &mut Context<Self>) {
+        self.agents_collapsed = !self.agents_collapsed;
         cx.notify();
     }
 
@@ -148,6 +181,23 @@ impl HerdrGui {
         cx.notify();
     }
 
+    fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        let tab_id = self.active_tab().map(|tab| tab.tab_id.clone());
+        if let Some(tab_id) = tab_id {
+            self.with_client(|client| client.close_tab(&tab_id));
+            self.refresh_state();
+            self.attach_focused_terminal(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn new_workspace(&mut self, _: &NewWorkspace, window: &mut Window, cx: &mut Context<Self>) {
+        self.with_client(HerdrClient::create_workspace);
+        self.refresh_state();
+        self.attach_focused_terminal(window, cx);
+        cx.notify();
+    }
+
     fn previous_workspace(
         &mut self,
         _: &PreviousWorkspace,
@@ -167,6 +217,7 @@ impl HerdrGui {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.show_spaces = false;
         self.with_client(|client| client.focus_workspace(&workspace_id));
         self.refresh_state();
         self.attach_focused_terminal(window, cx);
@@ -271,11 +322,13 @@ impl HerdrGui {
         match TerminalSession::attach(&target, size.0, size.1) {
             Ok(mut session) => {
                 if let Some(receiver) = session.output.take() {
+                    self.terminal_token = self.terminal_token.wrapping_add(1);
+                    let token = self.terminal_token;
                     self.terminal = Some(session);
                     self.terminal_target = Some(target);
                     self.terminal_size = Some(size);
                     self.status = "connected".to_string();
-                    poll_terminal(receiver, cx);
+                    poll_terminal(receiver, token, cx);
                 }
             }
             Err(err) => {
@@ -398,8 +451,13 @@ impl Render for HerdrGui {
             .on_action(cx.listener(Self::previous_tab))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::new_tab))
+            .on_action(cx.listener(Self::close_tab))
+            .on_action(cx.listener(Self::new_workspace))
             .on_action(cx.listener(Self::previous_workspace))
             .on_action(cx.listener(Self::next_workspace))
+            .on_action(cx.listener(Self::toggle_spaces))
+            .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::toggle_agents))
             .on_action(cx.listener(Self::toggle_sidebar_layout))
             .on_scroll_wheel(cx.listener(Self::handle_workspace_scroll))
             .child(self.sidebar(cx))
@@ -506,30 +564,48 @@ impl HerdrGui {
     }
 
     fn agent_panes(&self) -> Vec<Pane> {
-        self.visible_panes()
-            .into_iter()
+        self.state
+            .panes
+            .iter()
             .filter(|pane| pane.agent.is_some())
+            .cloned()
             .collect()
     }
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .w(px(210.0))
+            .w(if self.sidebar_collapsed && !self.sidebar_hovered {
+                px(6.0)
+            } else {
+                px(210.0)
+            })
             .h_full()
             .border_r_1()
-            .border_color(rgb(0x222222))
-            .bg(rgb(0x0f0f0f))
+            .border_color(rgb(0x181818))
+            .bg(rgb(0x0b0b0b))
             .p_2()
             .flex()
             .flex_col()
             .gap_2()
-            .child(div().h(px(36.0)))
+            .overflow_hidden()
+            .when(self.sidebar_collapsed && !self.sidebar_hovered, |el| el)
+            .child(space_switcher(self.active_workspace(), cx))
+            .when(self.show_spaces, |el| {
+                el.child(
+                    div().flex().flex_col().gap_2().children(
+                        self.state.workspaces.iter().map(|workspace| {
+                            workspace_row(workspace, self.active_workspace_id(), cx)
+                        }),
+                    ),
+                )
+            })
             .when(self.sidebar_layout == SidebarLayout::Warp, |el| {
                 el.child(self.warp_sidebar(cx))
             })
             .when(self.sidebar_layout == SidebarLayout::Arc, |el| {
                 el.child(self.arc_sidebar(cx))
             })
+            .into_any_element()
     }
 
     fn warp_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -546,12 +622,14 @@ impl HerdrGui {
                     .map(|workspace| workspace_row(workspace, self.active_workspace_id(), cx)),
             )
             .child(div().flex_1())
-            .child(section("agents"))
-            .children(
-                self.agent_panes()
-                    .into_iter()
-                    .map(|pane| pane_row(&pane, &self.state, cx)),
-            )
+            .child(agent_header(cx))
+            .when(!self.agents_collapsed, |el| {
+                el.children(
+                    self.agent_panes()
+                        .into_iter()
+                        .map(|pane| agent_row(&pane, &self.state, cx)),
+                )
+            })
     }
 
     fn arc_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -560,17 +638,11 @@ impl HerdrGui {
             .flex()
             .flex_col()
             .gap_2()
-            .child(section("spaces"))
-            .children(
-                self.state
-                    .workspaces
-                    .iter()
-                    .map(|workspace| workspace_row(workspace, self.active_workspace_id(), cx)),
-            )
             .child(tab_header(cx))
             .children(self.visible_tabs().into_iter().map(|tab| {
                 let id = tab.tab_id.clone();
-                row(
+                let close_id = tab.tab_id.clone();
+                tab_row(
                     tab.label.as_deref().unwrap_or(&tab.tab_id).to_string(),
                     tab.agent_status.unwrap_or_else(|| "tab".to_string()),
                     tab.focused
@@ -582,15 +654,23 @@ impl HerdrGui {
                     cx.listener(move |this, _, window, cx| {
                         this.focus_tab_id(id.clone(), window, cx)
                     }),
+                    cx.listener(move |this, _, window, cx| {
+                        this.with_client(|client| client.close_tab(&close_id));
+                        this.refresh_state();
+                        this.attach_focused_terminal(window, cx);
+                        cx.notify();
+                    }),
                 )
             }))
             .child(div().flex_1())
-            .child(section("agents"))
-            .children(
-                self.agent_panes()
-                    .into_iter()
-                    .map(|pane| pane_row(&pane, &self.state, cx)),
-            )
+            .child(agent_header(cx))
+            .when(!self.agents_collapsed, |el| {
+                el.children(
+                    self.agent_panes()
+                        .into_iter()
+                        .map(|pane| agent_row(&pane, &self.state, cx)),
+                )
+            })
     }
 
     fn pane_grid(
@@ -666,6 +746,57 @@ fn section(text: &str) -> impl IntoElement {
         .child(text.to_string())
 }
 
+fn space_switcher(workspace: Option<&Workspace>, cx: &mut Context<HerdrGui>) -> impl IntoElement {
+    let name = workspace
+        .and_then(|workspace| workspace.label.as_deref())
+        .or_else(|| workspace.map(|workspace| workspace.workspace_id.as_str()))
+        .unwrap_or("space");
+    div()
+        .h(px(28.0))
+        .flex()
+        .items_center()
+        .gap_2()
+        .pl(px(54.0))
+        .child(
+            div()
+                .flex_1()
+                .h(px(26.0))
+                .px_2()
+                .flex()
+                .items_center()
+                .justify_between()
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(0x181818)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.toggle_spaces(&ToggleSpaces, window, cx)
+                    }),
+                )
+                .child(label(name, 0xf0f0f0))
+                .child(small("⌄")),
+        )
+        .child(
+            div()
+                .w(px(26.0))
+                .h(px(26.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(14.0))
+                .text_color(rgb(0xd0d0d0))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(0x181818)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.new_workspace(&NewWorkspace, window, cx)
+                    }),
+                )
+                .child("+"),
+        )
+}
+
 fn tab_header(cx: &mut Context<HerdrGui>) -> impl IntoElement {
     div()
         .pt_1()
@@ -682,14 +813,41 @@ fn tab_header(cx: &mut Context<HerdrGui>) -> impl IntoElement {
                 .justify_center()
                 .text_size(px(14.0))
                 .text_color(rgb(0xd0d0d0))
-                .bg(rgb(0x202020))
                 .cursor_pointer()
-                .hover(|style| style.bg(rgb(0x2b2b2b)))
+                .hover(|style| style.bg(rgb(0x181818)))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, window, cx| this.new_tab(&NewTab, window, cx)),
                 )
                 .child("+"),
+        )
+}
+
+fn agent_header(cx: &mut Context<HerdrGui>) -> impl IntoElement {
+    div()
+        .pt_1()
+        .flex()
+        .items_center()
+        .justify_between()
+        .child(section("agents"))
+        .child(
+            div()
+                .w(px(22.0))
+                .h(px(22.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(14.0))
+                .text_color(rgb(0xd0d0d0))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(0x181818)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.toggle_agents(&ToggleAgents, window, cx)
+                    }),
+                )
+                .child("⌃"),
         )
 }
 
@@ -713,15 +871,10 @@ fn workspace_row(
     row(title, detail, focused, on_click).into_any_element()
 }
 
-fn pane_row(pane: &Pane, state: &HerdrState, cx: &mut Context<HerdrGui>) -> AnyElement {
+fn agent_row(pane: &Pane, state: &HerdrState, cx: &mut Context<HerdrGui>) -> AnyElement {
     let id = pane.pane_id.clone();
-    let title = pane
-        .agent
-        .as_deref()
-        .or(pane.label.as_deref())
-        .unwrap_or(&pane.pane_id)
-        .to_string();
-    let detail = pane
+    let title = pane.agent.as_deref().unwrap_or(&pane.pane_id).to_string();
+    let status = pane
         .agent_status
         .as_deref()
         .unwrap_or("unknown")
@@ -734,7 +887,40 @@ fn pane_row(pane: &Pane, state: &HerdrState, cx: &mut Context<HerdrGui>) -> AnyE
     let on_click =
         cx.listener(move |this, _, window, cx| this.focus_pane_id(id.clone(), window, cx));
 
-    row(title, detail, focused, on_click).into_any_element()
+    div()
+        .bg(if focused {
+            rgb(0x2a2a2a)
+        } else {
+            rgb(0x000000)
+        })
+        .px_3()
+        .py_2()
+        .flex()
+        .items_center()
+        .justify_between()
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(0x181818)))
+        .on_mouse_down(MouseButton::Left, on_click)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(label(&title, 0xf0f0f0))
+                .child(small(&status)),
+        )
+        .child(div().w(px(8.0)).h(px(8.0)).bg(rgb(status_color(&status))))
+        .into_any_element()
+}
+
+fn status_color(status: &str) -> u32 {
+    match status {
+        "working" => 0xffffff,
+        "blocked" => 0xd0d0d0,
+        "done" => 0xa0a0a0,
+        "idle" => 0x777777,
+        _ => 0x555555,
+    }
 }
 
 fn row(
@@ -745,15 +931,9 @@ fn row(
 ) -> impl IntoElement {
     div()
         .bg(if focused {
-            rgb(0x454545)
+            rgb(0x2a2a2a)
         } else {
-            rgb(0x202020)
-        })
-        .border_1()
-        .border_color(if focused {
-            rgb(0x5a5a5a)
-        } else {
-            rgb(0x303030)
+            rgb(0x000000)
         })
         .px_3()
         .py_2()
@@ -761,10 +941,53 @@ fn row(
         .flex_col()
         .gap_0p5()
         .cursor_pointer()
-        .hover(|style| style.bg(rgb(0x2b2b2b)))
+        .hover(|style| style.bg(rgb(0x181818)))
         .on_mouse_down(MouseButton::Left, on_click)
         .child(label(&title, 0xf0f0f0))
         .child(small(&detail))
+}
+
+fn tab_row(
+    title: String,
+    detail: String,
+    focused: bool,
+    on_click: impl Fn(&crepuscularity_gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
+    on_close: impl Fn(&crepuscularity_gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .bg(if focused {
+            rgb(0x2a2a2a)
+        } else {
+            rgb(0x000000)
+        })
+        .px_3()
+        .py_2()
+        .flex()
+        .items_center()
+        .justify_between()
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(0x181818)))
+        .on_mouse_down(MouseButton::Left, on_click)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(label(&title, 0xf0f0f0))
+                .child(small(&detail)),
+        )
+        .child(
+            div()
+                .w(px(18.0))
+                .h(px(18.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(0xaaaaaa))
+                .hover(|style| style.text_color(rgb(0xffffff)))
+                .on_mouse_down(MouseButton::Left, on_close)
+                .child("x"),
+        )
 }
 
 fn empty_state(status: &str) -> impl IntoElement {
@@ -878,31 +1101,46 @@ fn main() {
     std::env::set_var("OS_ACTIVITY_MODE", "disable");
 
     Application::new().run(|cx: &mut App| {
-        cx.set_menus(vec![Menu {
-            name: "Herdr".into(),
-            items: vec![
-                MenuItem::os_submenu("Services", SystemMenuType::Services),
-                MenuItem::separator(),
-                MenuItem::action("Refresh", Refresh),
-                MenuItem::action("Toggle Help", ToggleHelp),
-                MenuItem::action("Toggle Sidebar Layout", ToggleSidebarLayout),
-                MenuItem::separator(),
-                MenuItem::action("New Tab", NewTab),
-                MenuItem::action("Previous Workspace", PreviousWorkspace),
-                MenuItem::action("Next Workspace", NextWorkspace),
-            ],
-        }]);
+        cx.set_menus(vec![
+            Menu {
+                name: "Herdr".into(),
+                items: vec![
+                    MenuItem::os_submenu("Services", SystemMenuType::Services),
+                    MenuItem::separator(),
+                    MenuItem::action("Refresh", Refresh),
+                    MenuItem::action("New Workspace", NewWorkspace),
+                    MenuItem::action("New Tab", NewTab),
+                    MenuItem::action("Close Tab", CloseTab),
+                    MenuItem::action("Previous Workspace", PreviousWorkspace),
+                    MenuItem::action("Next Workspace", NextWorkspace),
+                ],
+            },
+            Menu {
+                name: "Settings".into(),
+                items: vec![
+                    MenuItem::action("Toggle Help", ToggleHelp),
+                    MenuItem::action("Toggle Spaces", ToggleSpaces),
+                    MenuItem::action("Toggle Sidebar", ToggleSidebar),
+                    MenuItem::action("Toggle Agents", ToggleAgents),
+                    MenuItem::action("Toggle Sidebar Layout", ToggleSidebarLayout),
+                ],
+            },
+        ]);
 
         cx.bind_keys([
             KeyBinding::new("f1", ToggleHelp, None),
             KeyBinding::new("cmd-r", Refresh, None),
+            KeyBinding::new("cmd-shift-s", ToggleSpaces, None),
+            KeyBinding::new("cmd-b", ToggleSidebar, None),
+            KeyBinding::new("cmd-shift-a", ToggleAgents, None),
             KeyBinding::new("cmd-shift-l", ToggleSidebarLayout, None),
             KeyBinding::new("cmd-t", NewTab, None),
+            KeyBinding::new("cmd-w", CloseTab, None),
             KeyBinding::new("cmd-]", SplitRight, None),
             KeyBinding::new("cmd-shift-]", SplitDown, None),
             KeyBinding::new("right", FocusRight, None),
             KeyBinding::new("shift-right", ResizeRight, None),
-            KeyBinding::new("cmd-w", ClosePane, None),
+            KeyBinding::new("cmd-shift-w", ClosePane, None),
             KeyBinding::new("cmd-left", PreviousTab, None),
             KeyBinding::new("cmd-right", NextTab, None),
             KeyBinding::new("cmd-shift-left", PreviousWorkspace, None),
@@ -940,18 +1178,29 @@ fn main() {
     });
 }
 
-fn poll_terminal(receiver: Receiver<TerminalFrame>, cx: &mut Context<HerdrGui>) {
+fn poll_terminal(receiver: Receiver<TerminalFrame>, token: u64, cx: &mut Context<HerdrGui>) {
     cx.spawn(async move |this, cx| loop {
         cx.background_executor()
             .timer(Duration::from_millis(33))
             .await;
         let mut latest = None;
-        while let Ok(text) = receiver.try_recv() {
-            latest = Some(text);
+        let mut disconnected = false;
+        loop {
+            match receiver.try_recv() {
+                Ok(text) => latest = Some(text),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
         }
         if let Some(frame) = latest {
             if this
                 .update(cx, |view, cx| {
+                    if view.terminal_token != token {
+                        return;
+                    }
                     view.terminal_frame = frame;
                     cx.notify();
                 })
@@ -959,6 +1208,19 @@ fn poll_terminal(receiver: Receiver<TerminalFrame>, cx: &mut Context<HerdrGui>) 
             {
                 break;
             }
+        }
+        if disconnected {
+            let _ = this.update(cx, |view, cx| {
+                if view.terminal_token != token {
+                    return;
+                }
+                view.terminal = None;
+                view.terminal_target = None;
+                view.terminal_size = None;
+                view.refresh_state();
+                cx.notify();
+            });
+            break;
         }
     })
     .detach();
