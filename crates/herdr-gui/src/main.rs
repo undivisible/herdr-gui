@@ -8,7 +8,7 @@ use crepuscularity_gpui::{
     FocusHandle, IntoElement, KeyBinding, Keystroke, MouseButton, Render, SharedString, Window,
     WindowBounds,
 };
-use ghostty::{GhosttyRuntime, TerminalSession};
+use ghostty::TerminalSession;
 use herdr::{HerdrClient, HerdrState, Pane, Tab, Workspace};
 use std::{sync::mpsc::Receiver, time::Duration};
 
@@ -29,9 +29,9 @@ actions!(
 
 struct HerdrGui {
     client: Option<HerdrClient>,
-    ghostty_status: String,
     terminal: Option<TerminalSession>,
     terminal_target: Option<String>,
+    terminal_size: Option<(u16, u16)>,
     terminal_text: String,
     state: HerdrState,
     status: String,
@@ -41,10 +41,6 @@ struct HerdrGui {
 
 impl HerdrGui {
     fn new(cx: &mut Context<Self>) -> Self {
-        let ghostty_status = match GhosttyRuntime::detect() {
-            Ok(runtime) => format!("Ghostty VT · {}", runtime.root.display()),
-            Err(err) => err,
-        };
         let (client, state, status) = match HerdrClient::bootstrap() {
             Ok(client) => match client.state() {
                 Ok(state) => (Some(client), state, "connected".to_string()),
@@ -52,19 +48,17 @@ impl HerdrGui {
             },
             Err(err) => (None, HerdrState::default(), err.to_string()),
         };
-        let mut app = Self {
+        Self {
             client,
-            ghostty_status,
             terminal: None,
             terminal_target: None,
+            terminal_size: None,
             terminal_text: String::new(),
             state,
             status,
             show_help: false,
             focus_handle: cx.focus_handle(),
-        };
-        app.attach_focused_terminal(cx);
-        app
+        }
     }
 
     fn toggle_help(&mut self, _: &ToggleHelp, _window: &mut Window, cx: &mut Context<Self>) {
@@ -72,9 +66,9 @@ impl HerdrGui {
         cx.notify();
     }
 
-    fn refresh(&mut self, _: &Refresh, _window: &mut Window, cx: &mut Context<Self>) {
+    fn refresh(&mut self, _: &Refresh, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_state();
-        self.attach_focused_terminal(cx);
+        self.attach_focused_terminal(window, cx);
         cx.notify();
     }
 
@@ -90,10 +84,10 @@ impl HerdrGui {
         cx.notify();
     }
 
-    fn focus_right(&mut self, _: &FocusRight, _window: &mut Window, cx: &mut Context<Self>) {
+    fn focus_right(&mut self, _: &FocusRight, window: &mut Window, cx: &mut Context<Self>) {
         self.with_client(HerdrClient::focus_right);
         self.refresh_state();
-        self.attach_focused_terminal(cx);
+        self.attach_focused_terminal(window, cx);
         cx.notify();
     }
 
@@ -109,29 +103,34 @@ impl HerdrGui {
         cx.notify();
     }
 
-    fn previous_tab(&mut self, _: &PreviousTab, _window: &mut Window, cx: &mut Context<Self>) {
-        self.focus_tab_offset(-1, cx);
+    fn previous_tab(&mut self, _: &PreviousTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_tab_offset(-1, window, cx);
     }
 
-    fn next_tab(&mut self, _: &NextTab, _window: &mut Window, cx: &mut Context<Self>) {
-        self.focus_tab_offset(1, cx);
+    fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_tab_offset(1, window, cx);
     }
 
-    fn focus_workspace_id(&mut self, workspace_id: String, cx: &mut Context<Self>) {
+    fn focus_workspace_id(
+        &mut self,
+        workspace_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.with_client(|client| client.focus_workspace(&workspace_id));
         self.refresh_state();
-        self.attach_focused_terminal(cx);
+        self.attach_focused_terminal(window, cx);
         cx.notify();
     }
 
-    fn focus_tab_id(&mut self, tab_id: String, cx: &mut Context<Self>) {
+    fn focus_tab_id(&mut self, tab_id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.with_client(|client| client.focus_tab(&tab_id));
         self.refresh_state();
-        self.attach_focused_terminal(cx);
+        self.attach_focused_terminal(window, cx);
         cx.notify();
     }
 
-    fn focus_tab_offset(&mut self, offset: isize, cx: &mut Context<Self>) {
+    fn focus_tab_offset(&mut self, offset: isize, window: &mut Window, cx: &mut Context<Self>) {
         let tabs = self.visible_tabs();
         if tabs.is_empty() {
             return;
@@ -145,13 +144,13 @@ impl HerdrGui {
             .and_then(|id| tabs.iter().position(|tab| tab.tab_id == id))
             .unwrap_or(0);
         let next_index = (active_index as isize + offset).rem_euclid(tabs.len() as isize) as usize;
-        self.focus_tab_id(tabs[next_index].tab_id.clone(), cx);
+        self.focus_tab_id(tabs[next_index].tab_id.clone(), window, cx);
     }
 
-    fn focus_pane_id(&mut self, pane_id: String, cx: &mut Context<Self>) {
+    fn focus_pane_id(&mut self, pane_id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.with_client(|client| client.focus_pane(&pane_id));
         self.refresh_state();
-        self.attach_focused_terminal(cx);
+        self.attach_focused_terminal(window, cx);
         cx.notify();
     }
 
@@ -167,23 +166,26 @@ impl HerdrGui {
         }
     }
 
-    fn attach_focused_terminal(&mut self, cx: &mut Context<Self>) {
+    fn attach_focused_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let size = terminal_size(window);
         let target = self
             .focused_pane()
             .and_then(|pane| pane.terminal_id.clone())
             .or_else(|| self.focused_pane().map(|pane| pane.pane_id.clone()));
-        if target.is_none() || target == self.terminal_target {
+        if target.is_none() || (target == self.terminal_target && self.terminal_size == Some(size))
+        {
             return;
         }
         let target = match target {
             Some(target) => target,
             None => return,
         };
-        match TerminalSession::attach(&target, 120, 40) {
+        match TerminalSession::attach(&target, size.0, size.1) {
             Ok(mut session) => {
                 if let Some(receiver) = session.output.take() {
                     self.terminal = Some(session);
                     self.terminal_target = Some(target);
+                    self.terminal_size = Some(size);
                     self.status = "connected".to_string();
                     poll_terminal(receiver, cx);
                 }
@@ -191,6 +193,7 @@ impl HerdrGui {
             Err(err) => {
                 self.terminal = None;
                 self.terminal_target = None;
+                self.terminal_size = None;
                 self.terminal_text = err.clone();
                 self.status = err;
             }
@@ -257,7 +260,8 @@ impl HerdrGui {
 }
 
 impl Render for HerdrGui {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.attach_focused_terminal(window, cx);
         let panes = self.visible_panes();
         let pane_text = self.terminal_text.clone();
 
@@ -382,7 +386,6 @@ impl HerdrGui {
     }
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let workspace = self.active_workspace();
         let tab = self.active_tab();
         let pane_count = self.visible_panes().len();
 
@@ -396,35 +399,28 @@ impl HerdrGui {
             .flex()
             .flex_col()
             .gap_2()
-            .child(
-                div()
-                    .h(px(24.0))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(section("window"))
-                    .child(status_dot(&self.status)),
-            )
-            .child(status_band(&self.status))
-            .child(status_band(&self.ghostty_status))
-            .when_some(workspace, |el, workspace| {
+            .child(section("sessions"))
+            .children(self.state.workspaces.iter().map(|workspace| {
                 let id = workspace.workspace_id.clone();
-                el.child(row(
+                row(
                     workspace
                         .label
                         .as_deref()
                         .unwrap_or(&workspace.workspace_id)
                         .to_string(),
-                    workspace
-                        .agent_status
-                        .as_deref()
-                        .unwrap_or("unknown")
-                        .to_string(),
-                    true,
-                    cx.listener(move |this, _, _, cx| this.focus_workspace_id(id.clone(), cx)),
-                ))
-            })
-            .child(section("current tab"))
+                    workspace.cwd.as_deref().unwrap_or("~").to_string(),
+                    workspace.focused
+                        || self
+                            .state
+                            .focused_workspace_id
+                            .as_deref()
+                            .is_some_and(|focused| focused == workspace.workspace_id),
+                    cx.listener(move |this, _, window, cx| {
+                        this.focus_workspace_id(id.clone(), window, cx)
+                    }),
+                )
+            }))
+            .child(section("tab"))
             .when_some(tab, |el, tab| {
                 let id = tab.tab_id.clone();
                 el.child(row(
@@ -433,11 +429,13 @@ impl HerdrGui {
                         .clone()
                         .unwrap_or_else(|| format!("{pane_count} pane{}", plural(pane_count))),
                     true,
-                    cx.listener(move |this, _, _, cx| this.focus_tab_id(id.clone(), cx)),
+                    cx.listener(move |this, _, window, cx| {
+                        this.focus_tab_id(id.clone(), window, cx)
+                    }),
                 ))
             })
-            .child(section("visible panes"))
-            .children(self.visible_panes().into_iter().map(|pane| {
+            .child(section("agents"))
+            .children(self.state.panes.iter().map(|pane| {
                 let id = pane.pane_id.clone();
                 row(
                     pane.agent
@@ -449,10 +447,29 @@ impl HerdrGui {
                         .as_deref()
                         .unwrap_or("unknown")
                         .to_string(),
-                    pane.focused,
-                    cx.listener(move |this, _, _, cx| this.focus_pane_id(id.clone(), cx)),
+                    pane.focused
+                        || self
+                            .state
+                            .focused_pane_id
+                            .as_deref()
+                            .is_some_and(|focused| focused == pane.pane_id),
+                    cx.listener(move |this, _, window, cx| {
+                        this.focus_pane_id(id.clone(), window, cx)
+                    }),
                 )
             }))
+            .child(div().flex_1())
+            .child(section("settings"))
+            .child(
+                div()
+                    .rounded_md()
+                    .bg(rgb(0x242b36))
+                    .px_3()
+                    .py_2()
+                    .text_size(px(12.0))
+                    .text_color(rgb(0x94a3b8))
+                    .child("F1 help · Cmd R refresh"),
+            )
     }
 
     fn pane_grid(
@@ -486,13 +503,14 @@ impl HerdrGui {
                     .cursor_pointer()
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| this.focus_pane_id(pane_id.clone(), cx)),
+                        cx.listener(move |this, _, window, cx| {
+                            this.focus_pane_id(pane_id.clone(), window, cx)
+                        }),
                     )
                     .child(
                         div()
                             .flex_1()
                             .overflow_hidden()
-                            .p_4()
                             .text_size(px(12.0))
                             .font_family("Menlo")
                             .line_height(px(18.0))
@@ -555,39 +573,12 @@ fn row(
         .child(small(&detail))
 }
 
-fn status_band(text: &str) -> impl IntoElement {
-    div()
-        .rounded_md()
-        .bg(rgb(0x1d232d))
-        .px_3()
-        .py_2()
-        .text_size(px(12.0))
-        .text_color(if text == "connected" || text.starts_with("Ghostty VT") {
-            rgb(0xa7f3d0)
-        } else {
-            rgb(0xfca5a5)
-        })
-        .child(text.to_string())
-}
-
 fn plural(count: usize) -> &'static str {
     if count == 1 {
         ""
     } else {
         "s"
     }
-}
-
-fn status_dot(text: &str) -> impl IntoElement {
-    div()
-        .w(px(9.0))
-        .h(px(9.0))
-        .rounded_full()
-        .bg(if text == "connected" {
-            rgb(0x34d399)
-        } else {
-            rgb(0xf87171)
-        })
 }
 
 fn empty_state(status: &str) -> impl IntoElement {
@@ -615,6 +606,15 @@ fn empty_state(status: &str) -> impl IntoElement {
                 .text_color(rgb(0x94a3b8))
                 .child("Open Herdr in a terminal, create a workspace/pane, then press Refresh."),
         )
+}
+
+fn terminal_size(window: &Window) -> (u16, u16) {
+    let size = window.bounds().size;
+    let width = (size.width.to_f64() - 210.0).max(320.0);
+    let height = size.height.to_f64().max(240.0);
+    let cols = (width / 7.2).floor().clamp(40.0, 240.0) as u16;
+    let rows = (height / 18.0).floor().clamp(12.0, 120.0) as u16;
+    (cols, rows)
 }
 
 fn kbd_hint(text: &str) -> impl IntoElement {
