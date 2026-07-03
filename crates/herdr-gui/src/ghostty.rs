@@ -3,7 +3,7 @@ use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, Pt
 use std::{
     env,
     ffi::c_void,
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     ptr,
     sync::{
@@ -19,7 +19,6 @@ pub struct GhosttyRuntime {
 }
 
 pub struct TerminalSession {
-    pub input: Sender<Vec<u8>>,
     pub output: Option<Receiver<TerminalFrame>>,
     resize_tx: Sender<PtySize>,
     output_tx: Sender<TerminalFrame>,
@@ -186,7 +185,7 @@ impl TerminalSession {
             })
             .map_err(|err| err.to_string())?;
         let mut command = CommandBuilder::new("herdr");
-        command.args(["terminal", "attach", terminal_id, "--takeover"]);
+        command.args(["terminal", "attach", terminal_id]);
         let mut child = pty
             .slave
             .spawn_command(command)
@@ -198,22 +197,9 @@ impl TerminalSession {
             .master
             .try_clone_reader()
             .map_err(|err| err.to_string())?;
-        let mut writer = pty.master.take_writer().map_err(|err| err.to_string())?;
-        let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
         let (output_tx, output_rx) = mpsc::channel::<TerminalFrame>();
         let (resize_tx, resize_rx) = mpsc::channel::<PtySize>();
         let terminal = Arc::new(Mutex::new(GhosttyTerminal::new(api, cols, rows)?));
-
-        thread::spawn(move || {
-            for bytes in input_rx {
-                if writer.write_all(&bytes).is_err() {
-                    break;
-                }
-                if writer.flush().is_err() {
-                    break;
-                }
-            }
-        });
 
         let terminal_for_reader = terminal.clone();
         let output_tx_for_reader = output_tx.clone();
@@ -248,7 +234,6 @@ impl TerminalSession {
         });
 
         Ok(Self {
-            input: input_tx,
             output: Some(output_rx),
             resize_tx,
             output_tx,

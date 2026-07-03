@@ -141,22 +141,7 @@ struct PaneList {
 }
 
 #[derive(Debug, Deserialize)]
-struct SessionSnapshotResult {
-    snapshot: SessionSnapshot,
-}
-
-#[derive(Debug, Deserialize)]
-struct SessionSnapshot {
-    #[serde(default)]
-    focused_workspace_id: Option<String>,
-    #[serde(default)]
-    focused_tab_id: Option<String>,
-    #[serde(default)]
-    focused_pane_id: Option<String>,
-    workspaces: Vec<Workspace>,
-    tabs: Vec<Tab>,
-    panes: Vec<Pane>,
-    #[serde(default)]
+struct AgentList {
     agents: Vec<Agent>,
 }
 
@@ -200,15 +185,7 @@ impl HerdrClient {
     }
 
     pub fn state(&self) -> Result<HerdrState, HerdrError> {
-        match self.snapshot_state() {
-            Ok(state) => Ok(state),
-            Err(_) => self.list_state(),
-        }
-    }
-
-    fn snapshot_state(&self) -> Result<HerdrState, HerdrError> {
-        let result: SessionSnapshotResult = self.call("session.snapshot", json!({}))?;
-        Ok(result.snapshot.into())
+        self.list_state()
     }
 
     fn list_state(&self) -> Result<HerdrState, HerdrError> {
@@ -224,32 +201,24 @@ impl HerdrClient {
                     .first()
                     .map(|workspace| workspace.workspace_id.clone())
             });
-        let tabs: TabList = self.call(
-            "tab.list",
-            focused_workspace_id
-                .as_ref()
-                .map(|workspace_id| json!({ "workspace_id": workspace_id }))
-                .unwrap_or_else(|| json!({})),
-        )?;
+        let tabs: TabList = self.call("tab.list", json!({}))?;
         let focused_tab_id = tabs
             .tabs
             .iter()
             .find(|tab| tab.focused)
             .map(|tab| tab.tab_id.clone())
             .or_else(|| tabs.tabs.first().map(|tab| tab.tab_id.clone()));
-        let panes: PaneList = self.call(
-            "pane.list",
-            focused_workspace_id
-                .as_ref()
-                .map(|workspace_id| json!({ "workspace_id": workspace_id }))
-                .unwrap_or_else(|| json!({})),
-        )?;
+        let panes: PaneList = self.call("pane.list", json!({}))?;
         let focused_pane_id = panes
             .panes
             .iter()
             .find(|pane| pane.focused)
             .map(|pane| pane.pane_id.clone())
             .or_else(|| panes.panes.first().map(|pane| pane.pane_id.clone()));
+        let agents = self
+            .call::<AgentList>("agent.list", json!({}))
+            .map(|list| list.agents)
+            .unwrap_or_default();
         Ok(HerdrState {
             focused_workspace_id,
             focused_tab_id,
@@ -257,7 +226,7 @@ impl HerdrClient {
             workspaces: workspaces.workspaces,
             tabs: tabs.tabs,
             panes: panes.panes,
-            agents: Vec::new(),
+            agents,
         })
     }
 
@@ -307,6 +276,11 @@ impl HerdrClient {
 
     pub fn create_workspace(&self) -> Result<(), HerdrError> {
         let _: Value = self.call("workspace.create", json!({ "focus": true }))?;
+        Ok(())
+    }
+
+    pub fn close_workspace(&self, workspace_id: &str) -> Result<(), HerdrError> {
+        let _: Value = self.call("workspace.close", json!({ "workspace_id": workspace_id }))?;
         Ok(())
     }
 
@@ -363,20 +337,6 @@ impl HerdrClient {
             Ok(result)
         } else {
             Err(HerdrError::Api("missing result".to_string()))
-        }
-    }
-}
-
-impl From<SessionSnapshot> for HerdrState {
-    fn from(snapshot: SessionSnapshot) -> Self {
-        Self {
-            focused_workspace_id: snapshot.focused_workspace_id,
-            focused_tab_id: snapshot.focused_tab_id,
-            focused_pane_id: snapshot.focused_pane_id,
-            workspaces: snapshot.workspaces,
-            tabs: snapshot.tabs,
-            panes: snapshot.panes,
-            agents: snapshot.agents,
         }
     }
 }
@@ -445,9 +405,7 @@ fn socket_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        command_exists, socket_path, PaneList, SessionSnapshotResult, TabList, WorkspaceList,
-    };
+    use super::{command_exists, socket_path, AgentList, PaneList, TabList, WorkspaceList};
 
     #[test]
     fn socket_path_should_default_to_config_dir() {
@@ -477,20 +435,14 @@ mod tests {
     }
 
     #[test]
-    fn session_snapshot_should_preserve_focused_window_context() {
-        let snapshot: SessionSnapshotResult = parse_json(
-            r#"{"type":"session_snapshot","snapshot":{"version":"0.6.0","protocol":8,"focused_workspace_id":"1","focused_tab_id":"1:2","focused_pane_id":"1:p3","workspaces":[{"workspace_id":"1","label":"repo","focused":true,"active_tab_id":"1:2"}],"tabs":[{"tab_id":"1:1","workspace_id":"1","label":"build","focused":false},{"tab_id":"1:2","workspace_id":"1","label":"shell","focused":true}],"panes":[{"pane_id":"1:p3","terminal_id":"term_3","workspace_id":"1","tab_id":"1:2","focused":true,"agent_status":"idle"}],"layouts":[],"agents":[{"terminal_id":"term_3","agent":"pi","agent_status":"working","workspace_id":"1","tab_id":"1:2","pane_id":"1:p3","focused":true,"revision":1}]}}"#,
+    fn agent_list_should_parse_cross_workspace_agents() {
+        let agents: AgentList = parse_json(
+            r#"{"type":"agent_list","agents":[{"terminal_id":"term_1","agent":"pi","agent_status":"idle","workspace_id":"w1","tab_id":"w1:t1","pane_id":"w1:p1"},{"terminal_id":"term_2","agent":"devin","agent_status":"working","workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1"}]}"#,
         );
-        let state = super::HerdrState::from(snapshot.snapshot);
 
-        assert_eq!(state.focused_workspace_id.as_deref(), Some("1"));
-        assert_eq!(state.focused_tab_id.as_deref(), Some("1:2"));
-        assert_eq!(state.focused_pane_id.as_deref(), Some("1:p3"));
-        assert_eq!(state.tabs[1].workspace_id.as_deref(), Some("1"));
-        assert_eq!(state.panes[0].tab_id.as_deref(), Some("1:2"));
-        assert_eq!(state.agents.len(), 1);
-        assert_eq!(state.agents[0].agent.as_deref(), Some("pi"));
-        assert_eq!(state.agents[0].pane_id.as_deref(), Some("1:p3"));
+        assert_eq!(agents.agents.len(), 2);
+        assert_eq!(agents.agents[0].workspace_id.as_deref(), Some("w1"));
+        assert_eq!(agents.agents[1].agent.as_deref(), Some("devin"));
     }
 
     fn parse_json<T: serde::de::DeserializeOwned>(json: &str) -> T {
