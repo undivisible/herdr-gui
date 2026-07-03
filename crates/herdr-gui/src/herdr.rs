@@ -63,6 +63,21 @@ pub struct Pane {
 }
 
 #[derive(Debug, Deserialize)]
+struct WorkspaceList {
+    workspaces: Vec<Workspace>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TabList {
+    tabs: Vec<Tab>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaneList {
+    panes: Vec<Pane>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ApiResponse<T> {
     result: Option<T>,
     error: Option<ApiError>,
@@ -81,7 +96,7 @@ impl HerdrClient {
     pub fn bootstrap() -> Result<Self, HerdrError> {
         ensure_herdr_installed()?;
         let socket_path = socket_path();
-        if !socket_path.is_file()
+        if !socket_path.exists()
             || (Self {
                 socket_path: socket_path.clone(),
             })
@@ -102,18 +117,19 @@ impl HerdrClient {
     }
 
     pub fn snapshot(&self) -> Result<Snapshot, HerdrError> {
-        let workspaces: Vec<Workspace> = self.call("workspace.list", json!({}))?;
-        let tabs: Vec<Tab> = self.call("tab.list", json!({}))?;
-        let panes: Vec<Pane> = self.call("pane.list", json!({}))?;
+        let workspaces: WorkspaceList = self.call("workspace.list", json!({}))?;
+        let tabs: TabList = self.call("tab.list", json!({}))?;
+        let panes: PaneList = self.call("pane.list", json!({}))?;
         let pane_text = panes
+            .panes
             .first()
             .map(|pane| self.read_pane(&pane.pane_id))
             .transpose()?
             .unwrap_or_default();
         Ok(Snapshot {
-            workspaces,
-            tabs,
-            panes,
+            workspaces: workspaces.workspaces,
+            tabs: tabs.tabs,
+            panes: panes.panes,
             pane_text,
         })
     }
@@ -136,14 +152,6 @@ impl HerdrClient {
 
     pub fn close_pane(&self, pane_id: &str) -> Result<(), HerdrError> {
         let _: Value = self.call("pane.close", json!({ "pane_id": pane_id }))?;
-        Ok(())
-    }
-
-    pub fn send_text(&self, pane_id: &str, text: &str) -> Result<(), HerdrError> {
-        let _: Value = self.call(
-            "pane.send_text",
-            json!({ "pane_id": pane_id, "text": text }),
-        )?;
         Ok(())
     }
 
@@ -236,7 +244,7 @@ fn start_server() -> Result<(), HerdrError> {
 
 fn wait_for_socket(path: &Path) -> Result<(), HerdrError> {
     for _ in 0..30 {
-        if path.is_file() {
+        if path.exists() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(100));
@@ -265,7 +273,7 @@ fn socket_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_exists, socket_path};
+    use super::{command_exists, socket_path, PaneList, TabList, WorkspaceList};
 
     #[test]
     fn socket_path_should_default_to_config_dir() {
@@ -276,5 +284,27 @@ mod tests {
     #[test]
     fn command_exists_should_find_shell() {
         assert!(command_exists("sh"));
+    }
+
+    #[test]
+    fn list_responses_should_parse_herdr_socket_shape() {
+        let workspaces: WorkspaceList = parse_json(
+            r#"{"type":"workspace_list","workspaces":[{"workspace_id":"w1","label":"repo"}]}"#,
+        );
+        let tabs: TabList = parse_json(r#"{"type":"tab_list","tabs":[{"tab_id":"w1:t1"}]}"#);
+        let panes: PaneList = parse_json(
+            r#"{"type":"pane_list","panes":[{"pane_id":"w1:p1","agent_status":"working"}]}"#,
+        );
+
+        assert_eq!(workspaces.workspaces[0].workspace_id, "w1");
+        assert_eq!(tabs.tabs[0].tab_id, "w1:t1");
+        assert_eq!(panes.panes[0].agent_status.as_deref(), Some("working"));
+    }
+
+    fn parse_json<T: serde::de::DeserializeOwned>(json: &str) -> T {
+        match serde_json::from_str(json) {
+            Ok(value) => value,
+            Err(err) => panic!("{err}"),
+        }
     }
 }
