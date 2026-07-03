@@ -281,20 +281,12 @@ impl Render for HerdrGui {
             .child(self.sidebar(cx))
             .child(
                 div()
-                    .flex()
-                    .flex_col()
                     .flex_1()
                     .h_full()
-                    .bg(rgb(0x252b35))
-                    .child(self.toolbar())
-                    .child(
-                        div()
-                            .flex()
-                            .flex_1()
-                            .overflow_hidden()
-                            .child(self.pane_grid(panes, pane_text, cx))
-                            .when(self.show_help, |el| el.child(help_overlay())),
-                    ),
+                    .bg(rgb(0x0f1117))
+                    .overflow_hidden()
+                    .child(self.pane_grid(panes, pane_text, cx))
+                    .when(self.show_help, |el| el.child(help_overlay())),
             )
     }
 }
@@ -406,7 +398,7 @@ impl HerdrGui {
             .gap_2()
             .child(
                 div()
-                    .h(px(26.0))
+                    .h(px(24.0))
                     .flex()
                     .items_center()
                     .justify_between()
@@ -414,6 +406,7 @@ impl HerdrGui {
                     .child(status_dot(&self.status)),
             )
             .child(status_band(&self.status))
+            .child(status_band(&self.ghostty_status))
             .when_some(workspace, |el, workspace| {
                 let id = workspace.workspace_id.clone();
                 el.child(row(
@@ -462,26 +455,6 @@ impl HerdrGui {
             }))
     }
 
-    fn toolbar(&self) -> impl IntoElement {
-        div()
-            .h(px(34.0))
-            .border_b_1()
-            .border_color(rgb(0x343b48))
-            .px_4()
-            .flex()
-            .items_center()
-            .justify_between()
-            .child(small("herdr"))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(small(&self.ghostty_status))
-                    .child(kbd_hint("F1")),
-            )
-    }
-
     fn pane_grid(
         &self,
         panes: Vec<Pane>,
@@ -502,49 +475,24 @@ impl HerdrGui {
             .flex()
             .flex_1()
             .h_full()
-            .p_3()
-            .gap_3()
+            .bg(rgb(0x0f1117))
             .children(panes.into_iter().map(|pane| {
                 let pane_id = pane.pane_id.clone();
                 div()
                     .flex_1()
                     .h_full()
-                    .bg(rgb(0x151922))
-                    .border_1()
-                    .border_color(if pane.focused {
-                        rgb(0x5f86d9)
-                    } else {
-                        rgb(0x303846)
-                    })
-                    .rounded_lg()
+                    .bg(rgb(0x0f1117))
                     .flex()
-                    .flex_col()
                     .cursor_pointer()
-                    .hover(|style| style.border_color(rgb(0x6f7d94)))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| this.focus_pane_id(pane_id.clone(), cx)),
                     )
                     .child(
                         div()
-                            .h(px(32.0))
-                            .px_3()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .border_b_1()
-                            .border_color(rgb(0x303846))
-                            .child(label(
-                                pane.terminal_id.as_deref().unwrap_or(&pane.pane_id),
-                                0xd7dde8,
-                            ))
-                            .child(status(pane.agent_status.as_deref().unwrap_or("unknown"))),
-                    )
-                    .child(
-                        div()
                             .flex_1()
                             .overflow_hidden()
-                            .p_3()
+                            .p_4()
                             .text_size(px(12.0))
                             .font_family("Menlo")
                             .line_height(px(18.0))
@@ -614,7 +562,7 @@ fn status_band(text: &str) -> impl IntoElement {
         .px_3()
         .py_2()
         .text_size(px(12.0))
-        .text_color(if text == "connected" {
+        .text_color(if text == "connected" || text.starts_with("Ghostty VT") {
             rgb(0xa7f3d0)
         } else {
             rgb(0xfca5a5)
@@ -695,7 +643,7 @@ fn key_row(key: &str, action: &str) -> impl IntoElement {
 fn help_overlay() -> impl IntoElement {
     div()
         .absolute()
-        .top(px(56.0))
+        .top(px(20.0))
         .right(px(20.0))
         .w(px(300.0))
         .rounded_lg()
@@ -716,27 +664,6 @@ fn help_overlay() -> impl IntoElement {
         .child(key_row("Cmd ←", "previous tab"))
         .child(key_row("Cmd →", "next tab"))
         .child(key_row("Cmd W", "close pane"))
-}
-
-fn status(text: &str) -> impl IntoElement {
-    div()
-        .rounded_md()
-        .bg(status_color(Some(text)))
-        .px_2()
-        .py_1()
-        .text_size(px(11.0))
-        .text_color(rgb(0x030712))
-        .child(text.to_string())
-}
-
-fn status_color(status: Option<&str>) -> crepuscularity_gpui::Rgba {
-    match status {
-        Some("working") => rgb(0xf59e0b),
-        Some("blocked") => rgb(0xef4444),
-        Some("done") => rgb(0x22c55e),
-        Some("idle") => rgb(0x38bdf8),
-        _ => rgb(0x475569),
-    }
 }
 
 fn main() {
