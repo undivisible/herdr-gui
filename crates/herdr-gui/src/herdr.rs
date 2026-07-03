@@ -42,6 +42,10 @@ pub struct Workspace {
     pub label: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    #[serde(default)]
+    pub agent_status: Option<String>,
+    #[serde(default)]
+    pub focused: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -49,6 +53,10 @@ pub struct Tab {
     pub tab_id: String,
     #[serde(default)]
     pub label: Option<String>,
+    #[serde(default)]
+    pub agent_status: Option<String>,
+    #[serde(default)]
+    pub focused: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -60,6 +68,10 @@ pub struct Pane {
     pub cwd: Option<String>,
     #[serde(default)]
     pub agent_status: Option<String>,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub focused: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,7 +134,9 @@ impl HerdrClient {
         let panes: PaneList = self.call("pane.list", json!({}))?;
         let pane_text = panes
             .panes
-            .first()
+            .iter()
+            .find(|pane| pane.focused)
+            .or_else(|| panes.panes.first())
             .map(|pane| self.read_pane(&pane.pane_id))
             .transpose()?
             .unwrap_or_default();

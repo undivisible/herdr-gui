@@ -211,14 +211,23 @@ impl HerdrGui {
                         .as_deref()
                         .unwrap_or(&workspace.workspace_id)
                         .to_string(),
-                    workspace.cwd.as_deref().unwrap_or("").to_string(),
+                    workspace
+                        .agent_status
+                        .as_deref()
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    workspace.focused,
                 )
             }))
             .child(section("Tabs"))
             .children(self.snapshot.tabs.iter().map(|tab| {
                 item(
                     tab.label.as_deref().unwrap_or(&tab.tab_id).to_string(),
-                    tab.tab_id.clone(),
+                    tab.agent_status
+                        .as_deref()
+                        .unwrap_or(&tab.tab_id)
+                        .to_string(),
+                    tab.focused,
                 )
             }))
     }
@@ -259,7 +268,11 @@ impl HerdrGui {
                     .h_full()
                     .bg(rgb(0x080a0f))
                     .border_1()
-                    .border_color(rgb(0x2a3240))
+                    .border_color(if pane.focused {
+                        rgb(0x6ea8ff)
+                    } else {
+                        rgb(0x2a3240)
+                    })
                     .rounded_xl()
                     .flex()
                     .flex_col()
@@ -272,7 +285,10 @@ impl HerdrGui {
                             .justify_between()
                             .border_b_1()
                             .border_color(rgb(0x202633))
-                            .child(label(&pane.pane_id, 0xf8fafc))
+                            .child(label(
+                                pane.agent.as_deref().unwrap_or(&pane.pane_id),
+                                0xf8fafc,
+                            ))
                             .child(status(pane.agent_status.as_deref().unwrap_or("unknown"))),
                     )
                     .child(
@@ -313,12 +329,20 @@ fn section(text: &str) -> impl IntoElement {
         .child(text.to_string())
 }
 
-fn item(title: String, detail: String) -> impl IntoElement {
+fn item(title: String, detail: String, focused: bool) -> impl IntoElement {
     div()
         .rounded_md()
-        .bg(rgb(0x111722))
+        .bg(if focused {
+            rgb(0x172033)
+        } else {
+            rgb(0x111722)
+        })
         .border_1()
-        .border_color(rgb(0x222a38))
+        .border_color(if focused {
+            rgb(0x6ea8ff)
+        } else {
+            rgb(0x222a38)
+        })
         .px_3()
         .py_2()
         .flex()
@@ -454,6 +478,8 @@ fn status_color(status: Option<&str>) -> crepuscularity_gpui::Rgba {
 }
 
 fn main() {
+    std::env::set_var("OS_ACTIVITY_MODE", "disable");
+
     Application::new().run(|cx: &mut App| {
         cx.bind_keys([
             KeyBinding::new("f1", ToggleHelp, None),
