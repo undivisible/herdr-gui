@@ -20,22 +20,57 @@ pub struct GhosttyRuntime {
 
 pub struct TerminalSession {
     pub input: Sender<Vec<u8>>,
-    pub output: Option<Receiver<String>>,
+    pub output: Option<Receiver<TerminalFrame>>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TerminalFrame {
+    pub lines: Vec<TerminalLine>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TerminalLine {
+    pub runs: Vec<TerminalRun>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalRun {
+    pub text: String,
+    pub fg: u32,
+    pub bg: Option<u32>,
 }
 
 pub struct GhosttyTerminal {
     api: Arc<GhosttyApi>,
     terminal: GhosttyTerminalHandle,
-    formatter: GhosttyFormatterHandle,
+    render_state: GhosttyRenderStateHandle,
+    row_iterator: GhosttyRowIteratorHandle,
+    row_cells: GhosttyRowCellsHandle,
 }
 
 type GhosttyResult = i32;
 type GhosttyTerminalHandle = *mut c_void;
-type GhosttyFormatterHandle = *mut c_void;
+type GhosttyRenderStateHandle = *mut c_void;
+type GhosttyRowIteratorHandle = *mut c_void;
+type GhosttyRowCellsHandle = *mut c_void;
+type GhosttyCell = u64;
 
 const GHOSTTY_SUCCESS: GhosttyResult = 0;
-const GHOSTTY_FORMATTER_FORMAT_PLAIN: i32 = 0;
+const GHOSTTY_INVALID_VALUE: GhosttyResult = -2;
+const RENDER_STATE_DATA_ROW_ITERATOR: u32 = 4;
+const RENDER_STATE_ROW_DATA_CELLS: u32 = 3;
+const ROW_CELLS_DATA_RAW: u32 = 1;
+const ROW_CELLS_DATA_GRAPHEMES_LEN: u32 = 3;
+const ROW_CELLS_DATA_GRAPHEMES_BUF: u32 = 4;
+const ROW_CELLS_DATA_BG_COLOR: u32 = 5;
+const ROW_CELLS_DATA_FG_COLOR: u32 = 6;
+const CELL_DATA_CODEPOINT: u32 = 1;
+const CELL_DATA_WIDE: u32 = 3;
+const CELL_DATA_HAS_TEXT: u32 = 4;
+const CELL_WIDE_SPACER_TAIL: u32 = 2;
+const CELL_WIDE_SPACER_HEAD: u32 = 3;
+const DEFAULT_FG: u32 = 0xc5ceda;
 
 #[repr(C)]
 struct GhosttyTerminalOptions {
@@ -45,62 +80,53 @@ struct GhosttyTerminalOptions {
 }
 
 #[repr(C)]
-struct GhosttyFormatterScreenExtra {
-    size: usize,
-    cursor: bool,
-    style: bool,
-    hyperlink: bool,
-    protection: bool,
-    kitty_keyboard: bool,
-    charsets: bool,
-}
-
-#[repr(C)]
-struct GhosttyFormatterTerminalExtra {
-    size: usize,
-    palette: bool,
-    modes: bool,
-    scrolling_region: bool,
-    tabstops: bool,
-    pwd: bool,
-    keyboard: bool,
-    screen: GhosttyFormatterScreenExtra,
-}
-
-#[repr(C)]
-struct GhosttyFormatterTerminalOptions {
-    size: usize,
-    emit: i32,
-    unwrap: bool,
-    trim: bool,
-    extra: GhosttyFormatterTerminalExtra,
-    selection: *const c_void,
+#[derive(Default)]
+struct GhosttyColorRgb {
+    r: u8,
+    g: u8,
+    b: u8,
 }
 
 type GhosttyTerminalNew =
     unsafe extern "C" fn(*const c_void, *mut GhosttyTerminalHandle, GhosttyTerminalOptions) -> i32;
 type GhosttyTerminalFree = unsafe extern "C" fn(GhosttyTerminalHandle);
 type GhosttyTerminalVtWrite = unsafe extern "C" fn(GhosttyTerminalHandle, *const u8, usize);
-type GhosttyFormatterTerminalNew = unsafe extern "C" fn(
-    *const c_void,
-    *mut GhosttyFormatterHandle,
-    GhosttyTerminalHandle,
-    GhosttyFormatterTerminalOptions,
-) -> i32;
-type GhosttyFormatterFormatAlloc =
-    unsafe extern "C" fn(GhosttyFormatterHandle, *const c_void, *mut *mut u8, *mut usize) -> i32;
-type GhosttyFormatterFree = unsafe extern "C" fn(GhosttyFormatterHandle);
-type GhosttyFree = unsafe extern "C" fn(*const c_void, *mut u8, usize);
+type GhosttyRenderStateNew =
+    unsafe extern "C" fn(*const c_void, *mut GhosttyRenderStateHandle) -> i32;
+type GhosttyRenderStateFree = unsafe extern "C" fn(GhosttyRenderStateHandle);
+type GhosttyRenderStateUpdate =
+    unsafe extern "C" fn(GhosttyRenderStateHandle, GhosttyTerminalHandle) -> i32;
+type GhosttyRenderStateGet =
+    unsafe extern "C" fn(GhosttyRenderStateHandle, u32, *mut c_void) -> i32;
+type GhosttyRowIteratorNew =
+    unsafe extern "C" fn(*const c_void, *mut GhosttyRowIteratorHandle) -> i32;
+type GhosttyRowIteratorFree = unsafe extern "C" fn(GhosttyRowIteratorHandle);
+type GhosttyRowIteratorNext = unsafe extern "C" fn(GhosttyRowIteratorHandle) -> bool;
+type GhosttyRowGet = unsafe extern "C" fn(GhosttyRowIteratorHandle, u32, *mut c_void) -> i32;
+type GhosttyRowCellsNew = unsafe extern "C" fn(*const c_void, *mut GhosttyRowCellsHandle) -> i32;
+type GhosttyRowCellsFree = unsafe extern "C" fn(GhosttyRowCellsHandle);
+type GhosttyRowCellsNext = unsafe extern "C" fn(GhosttyRowCellsHandle) -> bool;
+type GhosttyRowCellsGet = unsafe extern "C" fn(GhosttyRowCellsHandle, u32, *mut c_void) -> i32;
+type GhosttyCellGet = unsafe extern "C" fn(GhosttyCell, u32, *mut c_void) -> i32;
 
 struct GhosttyApi {
     _library: Library,
     terminal_new: GhosttyTerminalNew,
     terminal_free: GhosttyTerminalFree,
     terminal_vt_write: GhosttyTerminalVtWrite,
-    formatter_terminal_new: GhosttyFormatterTerminalNew,
-    formatter_format_alloc: GhosttyFormatterFormatAlloc,
-    formatter_free: GhosttyFormatterFree,
-    free: GhosttyFree,
+    render_state_new: GhosttyRenderStateNew,
+    render_state_free: GhosttyRenderStateFree,
+    render_state_update: GhosttyRenderStateUpdate,
+    render_state_get: GhosttyRenderStateGet,
+    row_iterator_new: GhosttyRowIteratorNew,
+    row_iterator_free: GhosttyRowIteratorFree,
+    row_iterator_next: GhosttyRowIteratorNext,
+    row_get: GhosttyRowGet,
+    row_cells_new: GhosttyRowCellsNew,
+    row_cells_free: GhosttyRowCellsFree,
+    row_cells_next: GhosttyRowCellsNext,
+    row_cells_get: GhosttyRowCellsGet,
+    cell_get: GhosttyCellGet,
 }
 
 impl GhosttyRuntime {
@@ -145,7 +171,7 @@ impl TerminalSession {
             .map_err(|err| err.to_string())?;
         let mut writer = pty.master.take_writer().map_err(|err| err.to_string())?;
         let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
-        let (output_tx, output_rx) = mpsc::channel::<String>();
+        let (output_tx, output_rx) = mpsc::channel::<TerminalFrame>();
 
         thread::spawn(move || {
             for bytes in input_rx {
@@ -162,7 +188,7 @@ impl TerminalSession {
             let mut terminal = match GhosttyTerminal::new(api, cols, rows) {
                 Ok(terminal) => terminal,
                 Err(err) => {
-                    let _ = output_tx.send(err);
+                    let _ = output_tx.send(TerminalFrame::message(err));
                     return;
                 }
             };
@@ -172,12 +198,12 @@ impl TerminalSession {
                     Ok(0) => break,
                     Ok(n) => {
                         terminal.write(&buf[..n]);
-                        if let Ok(text) = terminal.format_plain() {
-                            let _ = output_tx.send(text);
+                        if let Ok(frame) = terminal.frame() {
+                            let _ = output_tx.send(frame);
                         }
                     }
                     Err(err) => {
-                        let _ = output_tx.send(err.to_string());
+                        let _ = output_tx.send(TerminalFrame::message(err.to_string()));
                         break;
                     }
                 }
@@ -218,21 +244,46 @@ impl GhosttyTerminal {
             return Err(format!("ghostty_terminal_new failed: {result}"));
         }
 
-        let mut formatter = ptr::null_mut();
-        let result = unsafe {
-            (api.formatter_terminal_new)(ptr::null(), &mut formatter, terminal, formatter_options())
-        };
+        let mut render_state = ptr::null_mut();
+        let result = unsafe { (api.render_state_new)(ptr::null(), &mut render_state) };
         if result != GHOSTTY_SUCCESS {
             unsafe {
                 (api.terminal_free)(terminal);
             }
-            return Err(format!("ghostty_formatter_terminal_new failed: {result}"));
+            return Err(format!("ghostty_render_state_new failed: {result}"));
+        }
+
+        let mut row_iterator = ptr::null_mut();
+        let result = unsafe { (api.row_iterator_new)(ptr::null(), &mut row_iterator) };
+        if result != GHOSTTY_SUCCESS {
+            unsafe {
+                (api.render_state_free)(render_state);
+                (api.terminal_free)(terminal);
+            }
+            return Err(format!(
+                "ghostty_render_state_row_iterator_new failed: {result}"
+            ));
+        }
+
+        let mut row_cells = ptr::null_mut();
+        let result = unsafe { (api.row_cells_new)(ptr::null(), &mut row_cells) };
+        if result != GHOSTTY_SUCCESS {
+            unsafe {
+                (api.row_iterator_free)(row_iterator);
+                (api.render_state_free)(render_state);
+                (api.terminal_free)(terminal);
+            }
+            return Err(format!(
+                "ghostty_render_state_row_cells_new failed: {result}"
+            ));
         }
 
         Ok(Self {
             api,
             terminal,
-            formatter,
+            render_state,
+            row_iterator,
+            row_cells,
         })
     }
 
@@ -242,28 +293,157 @@ impl GhosttyTerminal {
         }
     }
 
-    pub fn format_plain(&self) -> Result<String, String> {
-        let mut ptr_out = ptr::null_mut();
-        let mut len = 0_usize;
+    pub fn frame(&mut self) -> Result<TerminalFrame, String> {
+        let result = unsafe { (self.api.render_state_update)(self.render_state, self.terminal) };
+        if result != GHOSTTY_SUCCESS {
+            return Err(format!("ghostty_render_state_update failed: {result}"));
+        }
         let result = unsafe {
-            (self.api.formatter_format_alloc)(self.formatter, ptr::null(), &mut ptr_out, &mut len)
+            (self.api.render_state_get)(
+                self.render_state,
+                RENDER_STATE_DATA_ROW_ITERATOR,
+                (&mut self.row_iterator as *mut GhosttyRowIteratorHandle).cast(),
+            )
         };
         if result != GHOSTTY_SUCCESS {
-            return Err(format!("ghostty_formatter_format_alloc failed: {result}"));
+            return Err(format!(
+                "ghostty_render_state_get row iterator failed: {result}"
+            ));
         }
-        let bytes = unsafe { std::slice::from_raw_parts(ptr_out, len) };
-        let text = String::from_utf8_lossy(bytes).into_owned();
-        unsafe {
-            (self.api.free)(ptr::null(), ptr_out, len);
+
+        let mut lines = Vec::new();
+        while unsafe { (self.api.row_iterator_next)(self.row_iterator) } {
+            let result = unsafe {
+                (self.api.row_get)(
+                    self.row_iterator,
+                    RENDER_STATE_ROW_DATA_CELLS,
+                    (&mut self.row_cells as *mut GhosttyRowCellsHandle).cast(),
+                )
+            };
+            if result != GHOSTTY_SUCCESS {
+                return Err(format!(
+                    "ghostty_render_state_row_get cells failed: {result}"
+                ));
+            }
+            let mut line = TerminalLine::default();
+            while unsafe { (self.api.row_cells_next)(self.row_cells) } {
+                let text = self.cell_text()?;
+                if text.is_empty() {
+                    continue;
+                }
+                let fg = self
+                    .cell_color(ROW_CELLS_DATA_FG_COLOR)?
+                    .unwrap_or(DEFAULT_FG);
+                let bg = self.cell_color(ROW_CELLS_DATA_BG_COLOR)?;
+                push_run(&mut line.runs, text, fg, bg);
+            }
+            trim_line(&mut line);
+            lines.push(line);
         }
-        Ok(text)
+        Ok(TerminalFrame { lines })
+    }
+
+    fn cell_text(&self) -> Result<String, String> {
+        let mut raw = GhosttyCell::default();
+        let result = unsafe {
+            (self.api.row_cells_get)(
+                self.row_cells,
+                ROW_CELLS_DATA_RAW,
+                (&mut raw as *mut GhosttyCell).cast(),
+            )
+        };
+        if result != GHOSTTY_SUCCESS {
+            return Err(format!("ghostty row cell raw failed: {result}"));
+        }
+
+        let mut wide = 0_u32;
+        let result =
+            unsafe { (self.api.cell_get)(raw, CELL_DATA_WIDE, (&mut wide as *mut u32).cast()) };
+        if result != GHOSTTY_SUCCESS {
+            return Err(format!("ghostty cell wide failed: {result}"));
+        }
+        if wide == CELL_WIDE_SPACER_TAIL || wide == CELL_WIDE_SPACER_HEAD {
+            return Ok(String::new());
+        }
+
+        let mut len = 0_u32;
+        let result = unsafe {
+            (self.api.row_cells_get)(
+                self.row_cells,
+                ROW_CELLS_DATA_GRAPHEMES_LEN,
+                (&mut len as *mut u32).cast(),
+            )
+        };
+        if result != GHOSTTY_SUCCESS {
+            return Err(format!("ghostty row cell grapheme len failed: {result}"));
+        }
+        if len > 0 {
+            let mut codepoints = vec![0_u32; len as usize];
+            let result = unsafe {
+                (self.api.row_cells_get)(
+                    self.row_cells,
+                    ROW_CELLS_DATA_GRAPHEMES_BUF,
+                    codepoints.as_mut_ptr().cast(),
+                )
+            };
+            if result != GHOSTTY_SUCCESS {
+                return Err(format!("ghostty row cell grapheme buffer failed: {result}"));
+            }
+            return Ok(codepoints
+                .into_iter()
+                .map(|codepoint| char::from_u32(codepoint).unwrap_or(char::REPLACEMENT_CHARACTER))
+                .collect());
+        }
+
+        let mut has_text = false;
+        let result = unsafe {
+            (self.api.cell_get)(raw, CELL_DATA_HAS_TEXT, (&mut has_text as *mut bool).cast())
+        };
+        if result != GHOSTTY_SUCCESS {
+            return Err(format!("ghostty cell has text failed: {result}"));
+        }
+        if !has_text {
+            return Ok(" ".to_string());
+        }
+        let mut codepoint = 0_u32;
+        let result = unsafe {
+            (self.api.cell_get)(
+                raw,
+                CELL_DATA_CODEPOINT,
+                (&mut codepoint as *mut u32).cast(),
+            )
+        };
+        if result != GHOSTTY_SUCCESS {
+            return Err(format!("ghostty cell codepoint failed: {result}"));
+        }
+        Ok(char::from_u32(codepoint)
+            .unwrap_or(char::REPLACEMENT_CHARACTER)
+            .to_string())
+    }
+
+    fn cell_color(&self, data: u32) -> Result<Option<u32>, String> {
+        let mut color = GhosttyColorRgb::default();
+        let result = unsafe {
+            (self.api.row_cells_get)(
+                self.row_cells,
+                data,
+                (&mut color as *mut GhosttyColorRgb).cast(),
+            )
+        };
+        match result {
+            GHOSTTY_SUCCESS => Ok(Some(rgb_u32(color))),
+            GHOSTTY_INVALID_VALUE => Ok(None),
+            other => Err(format!("ghostty row cell color failed: {other}")),
+        }
     }
 }
 
 impl Drop for GhosttyTerminal {
     fn drop(&mut self) {
         unsafe {
-            (self.api.formatter_free)(self.formatter);
+            (self.api.row_cells_free)(self.row_cells);
+            (self.api.row_iterator_free)(self.row_iterator);
+            (self.api.render_state_free)(self.render_state);
             (self.api.terminal_free)(self.terminal);
         }
     }
@@ -300,63 +480,107 @@ impl GhosttyApi {
             load_symbol::<GhosttyTerminalFree>(&library, b"ghostty_terminal_free\0")?;
         let terminal_vt_write =
             load_symbol::<GhosttyTerminalVtWrite>(&library, b"ghostty_terminal_vt_write\0")?;
-        let formatter_terminal_new = load_symbol::<GhosttyFormatterTerminalNew>(
+        let render_state_new =
+            load_symbol::<GhosttyRenderStateNew>(&library, b"ghostty_render_state_new\0")?;
+        let render_state_free =
+            load_symbol::<GhosttyRenderStateFree>(&library, b"ghostty_render_state_free\0")?;
+        let render_state_update =
+            load_symbol::<GhosttyRenderStateUpdate>(&library, b"ghostty_render_state_update\0")?;
+        let render_state_get =
+            load_symbol::<GhosttyRenderStateGet>(&library, b"ghostty_render_state_get\0")?;
+        let row_iterator_new = load_symbol::<GhosttyRowIteratorNew>(
             &library,
-            b"ghostty_formatter_terminal_new\0",
+            b"ghostty_render_state_row_iterator_new\0",
         )?;
-        let formatter_format_alloc = load_symbol::<GhosttyFormatterFormatAlloc>(
+        let row_iterator_free = load_symbol::<GhosttyRowIteratorFree>(
             &library,
-            b"ghostty_formatter_format_alloc\0",
+            b"ghostty_render_state_row_iterator_free\0",
         )?;
-        let formatter_free =
-            load_symbol::<GhosttyFormatterFree>(&library, b"ghostty_formatter_free\0")?;
-        let free = load_symbol::<GhosttyFree>(&library, b"ghostty_free\0")?;
+        let row_iterator_next = load_symbol::<GhosttyRowIteratorNext>(
+            &library,
+            b"ghostty_render_state_row_iterator_next\0",
+        )?;
+        let row_get = load_symbol::<GhosttyRowGet>(&library, b"ghostty_render_state_row_get\0")?;
+        let row_cells_new =
+            load_symbol::<GhosttyRowCellsNew>(&library, b"ghostty_render_state_row_cells_new\0")?;
+        let row_cells_free =
+            load_symbol::<GhosttyRowCellsFree>(&library, b"ghostty_render_state_row_cells_free\0")?;
+        let row_cells_next =
+            load_symbol::<GhosttyRowCellsNext>(&library, b"ghostty_render_state_row_cells_next\0")?;
+        let row_cells_get =
+            load_symbol::<GhosttyRowCellsGet>(&library, b"ghostty_render_state_row_cells_get\0")?;
+        let cell_get = load_symbol::<GhosttyCellGet>(&library, b"ghostty_cell_get\0")?;
 
         Ok(Arc::new(Self {
             _library: library,
             terminal_new,
             terminal_free,
             terminal_vt_write,
-            formatter_terminal_new,
-            formatter_format_alloc,
-            formatter_free,
-            free,
+            render_state_new,
+            render_state_free,
+            render_state_update,
+            render_state_get,
+            row_iterator_new,
+            row_iterator_free,
+            row_iterator_next,
+            row_get,
+            row_cells_new,
+            row_cells_free,
+            row_cells_next,
+            row_cells_get,
+            cell_get,
         }))
     }
+}
+
+impl TerminalFrame {
+    fn message(text: String) -> Self {
+        Self {
+            lines: vec![TerminalLine {
+                runs: vec![TerminalRun {
+                    text,
+                    fg: 0xfca5a5,
+                    bg: None,
+                }],
+            }],
+        }
+    }
+}
+
+fn push_run(runs: &mut Vec<TerminalRun>, text: String, fg: u32, bg: Option<u32>) {
+    if let Some(last) = runs.last_mut() {
+        if last.fg == fg && last.bg == bg {
+            last.text.push_str(&text);
+            return;
+        }
+    }
+    runs.push(TerminalRun { text, fg, bg });
+}
+
+fn trim_line(line: &mut TerminalLine) {
+    while line
+        .runs
+        .last()
+        .is_some_and(|run| run.bg.is_none() && run.text.chars().all(|ch| ch == ' '))
+    {
+        line.runs.pop();
+    }
+    if let Some(last) = line.runs.last_mut() {
+        if last.bg.is_none() {
+            let trimmed = last.text.trim_end_matches(' ').len();
+            last.text.truncate(trimmed);
+        }
+    }
+}
+
+fn rgb_u32(color: GhosttyColorRgb) -> u32 {
+    (u32::from(color.r) << 16) | (u32::from(color.g) << 8) | u32::from(color.b)
 }
 
 fn load_symbol<T: Copy>(library: &Library, name: &[u8]) -> Result<T, String> {
     unsafe { library.get::<T>(name) }
         .map(|symbol| *symbol)
         .map_err(|err| err.to_string())
-}
-
-fn formatter_options() -> GhosttyFormatterTerminalOptions {
-    GhosttyFormatterTerminalOptions {
-        size: std::mem::size_of::<GhosttyFormatterTerminalOptions>(),
-        emit: GHOSTTY_FORMATTER_FORMAT_PLAIN,
-        unwrap: false,
-        trim: false,
-        extra: GhosttyFormatterTerminalExtra {
-            size: std::mem::size_of::<GhosttyFormatterTerminalExtra>(),
-            palette: false,
-            modes: false,
-            scrolling_region: false,
-            tabstops: false,
-            pwd: false,
-            keyboard: false,
-            screen: GhosttyFormatterScreenExtra {
-                size: std::mem::size_of::<GhosttyFormatterScreenExtra>(),
-                cursor: true,
-                style: false,
-                hyperlink: false,
-                protection: false,
-                kitty_keyboard: false,
-                charsets: false,
-            },
-        },
-        selection: ptr::null(),
-    }
 }
 
 fn has_vt(root: &Path) -> bool {
@@ -391,11 +615,29 @@ fn ghostty_roots() -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::GhosttyRuntime;
+    use super::{push_run, trim_line, GhosttyRuntime, TerminalLine, TerminalRun};
 
     #[test]
     fn detect_should_find_local_ghostty_checkout() {
         let runtime = GhosttyRuntime::detect();
         assert!(runtime.is_ok() || runtime.is_err());
+    }
+
+    #[test]
+    fn terminal_runs_merge_and_trim_plain_trailing_spaces() {
+        let mut line = TerminalLine::default();
+        push_run(&mut line.runs, "a".to_string(), 0x111111, None);
+        push_run(&mut line.runs, " b  ".to_string(), 0x111111, None);
+        push_run(&mut line.runs, "  ".to_string(), 0x222222, None);
+        trim_line(&mut line);
+
+        assert_eq!(
+            line.runs,
+            vec![TerminalRun {
+                text: "a b".to_string(),
+                fg: 0x111111,
+                bg: None,
+            },]
+        );
     }
 }

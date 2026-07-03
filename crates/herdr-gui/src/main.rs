@@ -5,10 +5,9 @@ use crepuscularity_gpui as gpui;
 use crepuscularity_gpui::prelude::*;
 use crepuscularity_gpui::{
     actions, bounds, div, gpui_window_options, point, px, rgb, size, App, Application, Context,
-    FocusHandle, IntoElement, KeyBinding, Keystroke, MouseButton, Render, SharedString, Window,
-    WindowBounds,
+    FocusHandle, IntoElement, KeyBinding, Keystroke, MouseButton, Render, Window, WindowBounds,
 };
-use ghostty::TerminalSession;
+use ghostty::{TerminalFrame, TerminalLine, TerminalRun, TerminalSession};
 use herdr::{HerdrClient, HerdrState, Pane, Tab, Workspace};
 use std::{sync::mpsc::Receiver, time::Duration};
 
@@ -32,7 +31,7 @@ struct HerdrGui {
     terminal: Option<TerminalSession>,
     terminal_target: Option<String>,
     terminal_size: Option<(u16, u16)>,
-    terminal_text: String,
+    terminal_frame: TerminalFrame,
     state: HerdrState,
     status: String,
     show_help: bool,
@@ -53,7 +52,7 @@ impl HerdrGui {
             terminal: None,
             terminal_target: None,
             terminal_size: None,
-            terminal_text: String::new(),
+            terminal_frame: TerminalFrame::default(),
             state,
             status,
             show_help: false,
@@ -194,7 +193,15 @@ impl HerdrGui {
                 self.terminal = None;
                 self.terminal_target = None;
                 self.terminal_size = None;
-                self.terminal_text = err.clone();
+                self.terminal_frame = TerminalFrame {
+                    lines: vec![TerminalLine {
+                        runs: vec![TerminalRun {
+                            text: err.clone(),
+                            fg: 0xfca5a5,
+                            bg: None,
+                        }],
+                    }],
+                };
                 self.status = err;
             }
         }
@@ -263,7 +270,7 @@ impl Render for HerdrGui {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.attach_focused_terminal(window, cx);
         let panes = self.visible_panes();
-        let pane_text = self.terminal_text.clone();
+        let pane_frame = self.terminal_frame.clone();
 
         div()
             .w_full()
@@ -289,7 +296,7 @@ impl Render for HerdrGui {
                     .h_full()
                     .bg(rgb(0x0f1117))
                     .overflow_hidden()
-                    .child(self.pane_grid(panes, pane_text, cx))
+                    .child(self.pane_grid(panes, pane_frame, cx))
                     .when(self.show_help, |el| el.child(help_overlay())),
             )
     }
@@ -475,7 +482,7 @@ impl HerdrGui {
     fn pane_grid(
         &self,
         panes: Vec<Pane>,
-        pane_text: String,
+        pane_frame: TerminalFrame,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         if panes.is_empty() {
@@ -515,11 +522,7 @@ impl HerdrGui {
                             .font_family("Menlo")
                             .line_height(px(18.0))
                             .text_color(rgb(0xc5ceda))
-                            .child(SharedString::from(if pane.focused {
-                                pane_text.clone()
-                            } else {
-                                String::new()
-                            })),
+                            .when(pane.focused, |el| el.child(terminal_frame(&pane_frame))),
                     )
             }))
     }
@@ -608,12 +611,34 @@ fn empty_state(status: &str) -> impl IntoElement {
         )
 }
 
+fn terminal_frame(frame: &TerminalFrame) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .children(frame.lines.iter().map(terminal_line))
+}
+
+fn terminal_line(line: &TerminalLine) -> impl IntoElement {
+    div()
+        .h(px(18.0))
+        .flex()
+        .flex_none()
+        .children(line.runs.iter().map(terminal_run))
+}
+
+fn terminal_run(run: &TerminalRun) -> impl IntoElement {
+    div()
+        .text_color(rgb(run.fg))
+        .when_some(run.bg, |el, bg| el.bg(rgb(bg)))
+        .child(run.text.replace(' ', "\u{00a0}"))
+}
+
 fn terminal_size(window: &Window) -> (u16, u16) {
     let size = window.bounds().size;
-    let width = (size.width.to_f64() - 210.0).max(320.0);
-    let height = size.height.to_f64().max(240.0);
-    let cols = (width / 7.2).floor().clamp(40.0, 240.0) as u16;
-    let rows = (height / 18.0).floor().clamp(12.0, 120.0) as u16;
+    let width = (size.width.to_f64() - 224.0).max(320.0);
+    let height = (size.height.to_f64() - 34.0).max(240.0);
+    let cols = (width / 8.0).floor().clamp(40.0, 220.0) as u16;
+    let rows = (height / 18.0).floor().clamp(12.0, 110.0) as u16;
     (cols, rows)
 }
 
@@ -708,7 +733,7 @@ fn main() {
     });
 }
 
-fn poll_terminal(receiver: Receiver<String>, cx: &mut Context<HerdrGui>) {
+fn poll_terminal(receiver: Receiver<TerminalFrame>, cx: &mut Context<HerdrGui>) {
     cx.spawn(async move |this, cx| loop {
         cx.background_executor()
             .timer(Duration::from_millis(33))
@@ -717,10 +742,10 @@ fn poll_terminal(receiver: Receiver<String>, cx: &mut Context<HerdrGui>) {
         while let Ok(text) = receiver.try_recv() {
             latest = Some(text);
         }
-        if let Some(text) = latest {
+        if let Some(frame) = latest {
             if this
                 .update(cx, |view, cx| {
-                    view.terminal_text = text;
+                    view.terminal_frame = frame;
                     cx.notify();
                 })
                 .is_err()
