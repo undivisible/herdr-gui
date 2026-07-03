@@ -8,7 +8,7 @@ use std::{
     ptr,
     sync::{
         mpsc::{self, Receiver, Sender},
-        Arc,
+        Arc, Mutex,
     },
     thread,
 };
@@ -22,6 +22,8 @@ pub struct TerminalSession {
     pub input: Sender<Vec<u8>>,
     pub output: Option<Receiver<TerminalFrame>>,
     resize_tx: Sender<PtySize>,
+    output_tx: Sender<TerminalFrame>,
+    terminal: Arc<Mutex<GhosttyTerminal>>,
     master: Box<dyn MasterPty>,
     killer: Box<dyn ChildKiller + Send + Sync>,
 }
@@ -98,6 +100,8 @@ type GhosttyTerminalNew =
 type GhosttyTerminalFree = unsafe extern "C" fn(GhosttyTerminalHandle);
 type GhosttyTerminalResize = unsafe extern "C" fn(GhosttyTerminalHandle, u16, u16, u32, u32) -> i32;
 type GhosttyTerminalVtWrite = unsafe extern "C" fn(GhosttyTerminalHandle, *const u8, usize);
+type GhosttyTerminalScrollViewport =
+    unsafe extern "C" fn(GhosttyTerminalHandle, GhosttyScrollViewport);
 type GhosttyRenderStateNew =
     unsafe extern "C" fn(*const c_void, *mut GhosttyRenderStateHandle) -> i32;
 type GhosttyRenderStateFree = unsafe extern "C" fn(GhosttyRenderStateHandle);
@@ -122,6 +126,7 @@ struct GhosttyApi {
     terminal_free: GhosttyTerminalFree,
     terminal_resize: GhosttyTerminalResize,
     terminal_vt_write: GhosttyTerminalVtWrite,
+    terminal_scroll_viewport: GhosttyTerminalScrollViewport,
     render_state_new: GhosttyRenderStateNew,
     render_state_free: GhosttyRenderStateFree,
     render_state_update: GhosttyRenderStateUpdate,
@@ -136,6 +141,22 @@ struct GhosttyApi {
     row_cells_get: GhosttyRowCellsGet,
     cell_get: GhosttyCellGet,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GhosttyScrollViewportValue {
+    delta: isize,
+    padding: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GhosttyScrollViewport {
+    tag: u32,
+    value: GhosttyScrollViewportValue,
+}
+
+const GHOSTTY_SCROLL_VIEWPORT_DELTA: u32 = 2;
 
 impl GhosttyRuntime {
     pub fn detect() -> Result<Self, String> {
@@ -181,6 +202,7 @@ impl TerminalSession {
         let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
         let (output_tx, output_rx) = mpsc::channel::<TerminalFrame>();
         let (resize_tx, resize_rx) = mpsc::channel::<PtySize>();
+        let terminal = Arc::new(Mutex::new(GhosttyTerminal::new(api, cols, rows)?));
 
         thread::spawn(move || {
             for bytes in input_rx {
@@ -193,31 +215,30 @@ impl TerminalSession {
             }
         });
 
+        let terminal_for_reader = terminal.clone();
+        let output_tx_for_reader = output_tx.clone();
         thread::spawn(move || {
-            let mut terminal = match GhosttyTerminal::new(api, cols, rows) {
-                Ok(terminal) => terminal,
-                Err(err) => {
-                    let _ = output_tx.send(TerminalFrame::message(err));
-                    return;
-                }
-            };
             let mut buf = [0_u8; 8192];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
                         for size in resize_rx.try_iter() {
-                            if let Err(err) = terminal.resize(size) {
-                                let _ = output_tx.send(TerminalFrame::message(err));
+                            if let Ok(mut terminal) = terminal_for_reader.lock() {
+                                if let Err(err) = terminal.resize(size) {
+                                    let _ = output_tx_for_reader.send(TerminalFrame::message(err));
+                                }
                             }
                         }
-                        terminal.write(&buf[..n]);
-                        if let Ok(frame) = terminal.frame() {
-                            let _ = output_tx.send(frame);
+                        if let Ok(mut terminal) = terminal_for_reader.lock() {
+                            terminal.write(&buf[..n]);
+                            if let Ok(frame) = terminal.frame() {
+                                let _ = output_tx_for_reader.send(frame);
+                            }
                         }
                     }
                     Err(err) => {
-                        let _ = output_tx.send(TerminalFrame::message(err.to_string()));
+                        let _ = output_tx_for_reader.send(TerminalFrame::message(err.to_string()));
                         break;
                     }
                 }
@@ -230,6 +251,8 @@ impl TerminalSession {
             input: input_tx,
             output: Some(output_rx),
             resize_tx,
+            output_tx,
+            terminal,
             master: pty.master,
             killer,
         })
@@ -244,6 +267,15 @@ impl TerminalSession {
         };
         let _ = self.master.resize(size);
         let _ = self.resize_tx.send(size);
+    }
+
+    pub fn scroll(&self, rows: isize) {
+        if let Ok(mut terminal) = self.terminal.lock() {
+            terminal.scroll(rows);
+            if let Ok(frame) = terminal.frame() {
+                let _ = self.output_tx.send(frame);
+            }
+        }
     }
 }
 
@@ -317,6 +349,21 @@ impl GhosttyTerminal {
     pub fn write(&mut self, bytes: &[u8]) {
         unsafe {
             (self.api.terminal_vt_write)(self.terminal, bytes.as_ptr(), bytes.len());
+        }
+    }
+
+    pub fn scroll(&mut self, rows: isize) {
+        unsafe {
+            (self.api.terminal_scroll_viewport)(
+                self.terminal,
+                GhosttyScrollViewport {
+                    tag: GHOSTTY_SCROLL_VIEWPORT_DELTA,
+                    value: GhosttyScrollViewportValue {
+                        delta: rows,
+                        padding: 0,
+                    },
+                },
+            );
         }
     }
 
@@ -573,6 +620,10 @@ impl GhosttyApi {
             load_symbol::<GhosttyTerminalResize>(&library, b"ghostty_terminal_resize\0")?;
         let terminal_vt_write =
             load_symbol::<GhosttyTerminalVtWrite>(&library, b"ghostty_terminal_vt_write\0")?;
+        let terminal_scroll_viewport = load_symbol::<GhosttyTerminalScrollViewport>(
+            &library,
+            b"ghostty_terminal_scroll_viewport\0",
+        )?;
         let render_state_new =
             load_symbol::<GhosttyRenderStateNew>(&library, b"ghostty_render_state_new\0")?;
         let render_state_free =
@@ -610,6 +661,7 @@ impl GhosttyApi {
             terminal_free,
             terminal_resize,
             terminal_vt_write,
+            terminal_scroll_viewport,
             render_state_new,
             render_state_free,
             render_state_update,
@@ -782,6 +834,32 @@ mod tests {
         assert!(has_text(&frame, "reverse"));
     }
 
+    #[test]
+    fn ghostty_scroll_viewport_changes_frame() {
+        let Ok(runtime) = GhosttyRuntime::detect() else {
+            return;
+        };
+        let Ok(api) = runtime.load_api() else {
+            return;
+        };
+        let mut terminal = match GhosttyTerminal::new(api, 8, 3) {
+            Ok(terminal) => terminal,
+            Err(err) => panic!("{err}"),
+        };
+        terminal.write(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        let bottom = match terminal.frame() {
+            Ok(frame) => frame,
+            Err(err) => panic!("{err}"),
+        };
+        terminal.scroll(-2);
+        let scrolled = match terminal.frame() {
+            Ok(frame) => frame,
+            Err(err) => panic!("{err}"),
+        };
+
+        assert_ne!(frame_text(&bottom), frame_text(&scrolled));
+    }
+
     fn has_background(frame: &TerminalFrame, text: &str) -> bool {
         frame.lines.iter().any(|line| {
             line.runs
@@ -795,5 +873,15 @@ mod tests {
             .lines
             .iter()
             .any(|line| line.runs.iter().any(|run| run.text.contains(text)))
+    }
+
+    fn frame_text(frame: &TerminalFrame) -> String {
+        frame
+            .lines
+            .iter()
+            .flat_map(|line| line.runs.iter())
+            .map(|run| run.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

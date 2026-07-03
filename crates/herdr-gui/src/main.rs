@@ -37,8 +37,24 @@ actions!(
         ToggleSidebar,
         ToggleAgents,
         ToggleSidebarLayout,
-        ThemeDark,
-        ThemeLight,
+        ThemeCatppuccin,
+        ThemeCatppuccinLatte,
+        ThemeTerminal,
+        ThemeTokyoNight,
+        ThemeTokyoNightDay,
+        ThemeDracula,
+        ThemeNord,
+        ThemeGruvbox,
+        ThemeGruvboxLight,
+        ThemeOneDark,
+        ThemeOneLight,
+        ThemeSolarized,
+        ThemeSolarizedLight,
+        ThemeKanagawa,
+        ThemeKanagawaLotus,
+        ThemeRosePine,
+        ThemeRosePineDawn,
+        ThemeVesper,
         ThemeSystem,
         ReloadHerdrConfig
     ]
@@ -52,8 +68,7 @@ enum SidebarLayout {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ThemeMode {
-    Dark,
-    Light,
+    Herdr(&'static str),
     System,
 }
 
@@ -116,7 +131,7 @@ impl HerdrGui {
             sidebar_hovered: false,
             agents_collapsed: false,
             sidebar_layout: SidebarLayout::Arc,
-            theme_mode: ThemeMode::Dark,
+            theme_mode: ThemeMode::Herdr("catppuccin"),
             scroll_x: 0.0,
             focus_handle: cx.focus_handle(),
         }
@@ -152,16 +167,6 @@ impl HerdrGui {
 
     fn toggle_agents(&mut self, _: &ToggleAgents, _window: &mut Window, cx: &mut Context<Self>) {
         self.agents_collapsed = !self.agents_collapsed;
-        cx.notify();
-    }
-
-    fn theme_dark(&mut self, _: &ThemeDark, _window: &mut Window, cx: &mut Context<Self>) {
-        self.theme_mode = ThemeMode::Dark;
-        cx.notify();
-    }
-
-    fn theme_light(&mut self, _: &ThemeLight, _window: &mut Window, cx: &mut Context<Self>) {
-        self.theme_mode = ThemeMode::Light;
         cx.notify();
     }
 
@@ -468,6 +473,13 @@ impl HerdrGui {
     ) {
         let delta = event.delta.pixel_delta(px(18.0));
         if delta.x.abs() <= delta.y.abs() {
+            let rows = (delta.y.to_f64() / 18.0).round() as isize;
+            if rows != 0 {
+                if let Some(terminal) = &self.terminal {
+                    terminal.scroll(-rows);
+                    cx.notify();
+                }
+            }
             return;
         }
         self.scroll_x += delta.x.to_f64();
@@ -477,6 +489,128 @@ impl HerdrGui {
         let offset = if self.scroll_x < 0.0 { 1 } else { -1 };
         self.scroll_x = 0.0;
         self.focus_workspace_offset(offset, window, cx);
+    }
+
+    fn set_theme(&mut self, name: &'static str, cx: &mut Context<Self>) {
+        self.theme_mode = ThemeMode::Herdr(name);
+        cx.notify();
+    }
+
+    fn theme_catppuccin(
+        &mut self,
+        _: &ThemeCatppuccin,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_theme("catppuccin", cx);
+    }
+
+    fn theme_catppuccin_latte(
+        &mut self,
+        _: &ThemeCatppuccinLatte,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_theme("catppuccin-latte", cx);
+    }
+
+    fn theme_terminal(&mut self, _: &ThemeTerminal, _window: &mut Window, cx: &mut Context<Self>) {
+        self.set_theme("terminal", cx);
+    }
+
+    fn theme_tokyo_night(
+        &mut self,
+        _: &ThemeTokyoNight,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_theme("tokyo-night", cx);
+    }
+
+    fn theme_tokyo_night_day(
+        &mut self,
+        _: &ThemeTokyoNightDay,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_theme("tokyo-night-day", cx);
+    }
+
+    fn theme_dracula(&mut self, _: &ThemeDracula, _window: &mut Window, cx: &mut Context<Self>) {
+        self.set_theme("dracula", cx);
+    }
+
+    fn theme_nord(&mut self, _: &ThemeNord, _window: &mut Window, cx: &mut Context<Self>) {
+        self.set_theme("nord", cx);
+    }
+
+    fn theme_gruvbox(&mut self, _: &ThemeGruvbox, _window: &mut Window, cx: &mut Context<Self>) {
+        self.set_theme("gruvbox", cx);
+    }
+
+    fn theme_gruvbox_light(
+        &mut self,
+        _: &ThemeGruvboxLight,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_theme("gruvbox-light", cx);
+    }
+
+    fn theme_one_dark(&mut self, _: &ThemeOneDark, _window: &mut Window, cx: &mut Context<Self>) {
+        self.set_theme("one-dark", cx);
+    }
+
+    fn theme_one_light(&mut self, _: &ThemeOneLight, _window: &mut Window, cx: &mut Context<Self>) {
+        self.set_theme("one-light", cx);
+    }
+
+    fn theme_solarized(
+        &mut self,
+        _: &ThemeSolarized,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_theme("solarized", cx);
+    }
+
+    fn theme_solarized_light(
+        &mut self,
+        _: &ThemeSolarizedLight,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_theme("solarized-light", cx);
+    }
+
+    fn theme_kanagawa(&mut self, _: &ThemeKanagawa, _window: &mut Window, cx: &mut Context<Self>) {
+        self.set_theme("kanagawa", cx);
+    }
+
+    fn theme_kanagawa_lotus(
+        &mut self,
+        _: &ThemeKanagawaLotus,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_theme("kanagawa-lotus", cx);
+    }
+
+    fn theme_rose_pine(&mut self, _: &ThemeRosePine, _window: &mut Window, cx: &mut Context<Self>) {
+        self.set_theme("rose-pine", cx);
+    }
+
+    fn theme_rose_pine_dawn(
+        &mut self,
+        _: &ThemeRosePineDawn,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_theme("rose-pine-dawn", cx);
+    }
+
+    fn theme_vesper(&mut self, _: &ThemeVesper, _window: &mut Window, cx: &mut Context<Self>) {
+        self.set_theme("vesper", cx);
     }
 
     fn handle_mouse_move(
@@ -493,11 +627,12 @@ impl HerdrGui {
 
     fn theme(&self, window: &Window) -> UiTheme {
         match self.theme_mode {
-            ThemeMode::Dark => dark_theme(),
-            ThemeMode::Light => light_theme(),
+            ThemeMode::Herdr(name) => herdr_theme(name),
             ThemeMode::System => match window.appearance() {
-                WindowAppearance::Light | WindowAppearance::VibrantLight => light_theme(),
-                WindowAppearance::Dark | WindowAppearance::VibrantDark => dark_theme(),
+                WindowAppearance::Light | WindowAppearance::VibrantLight => {
+                    herdr_theme("catppuccin-latte")
+                }
+                WindowAppearance::Dark | WindowAppearance::VibrantDark => herdr_theme("catppuccin"),
             },
         }
     }
@@ -536,8 +671,24 @@ impl Render for HerdrGui {
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_agents))
             .on_action(cx.listener(Self::toggle_sidebar_layout))
-            .on_action(cx.listener(Self::theme_dark))
-            .on_action(cx.listener(Self::theme_light))
+            .on_action(cx.listener(Self::theme_catppuccin))
+            .on_action(cx.listener(Self::theme_catppuccin_latte))
+            .on_action(cx.listener(Self::theme_terminal))
+            .on_action(cx.listener(Self::theme_tokyo_night))
+            .on_action(cx.listener(Self::theme_tokyo_night_day))
+            .on_action(cx.listener(Self::theme_dracula))
+            .on_action(cx.listener(Self::theme_nord))
+            .on_action(cx.listener(Self::theme_gruvbox))
+            .on_action(cx.listener(Self::theme_gruvbox_light))
+            .on_action(cx.listener(Self::theme_one_dark))
+            .on_action(cx.listener(Self::theme_one_light))
+            .on_action(cx.listener(Self::theme_solarized))
+            .on_action(cx.listener(Self::theme_solarized_light))
+            .on_action(cx.listener(Self::theme_kanagawa))
+            .on_action(cx.listener(Self::theme_kanagawa_lotus))
+            .on_action(cx.listener(Self::theme_rose_pine))
+            .on_action(cx.listener(Self::theme_rose_pine_dawn))
+            .on_action(cx.listener(Self::theme_vesper))
             .on_action(cx.listener(Self::theme_system))
             .on_action(cx.listener(Self::reload_herdr_config))
             .on_scroll_wheel(cx.listener(Self::handle_workspace_scroll))
@@ -649,7 +800,7 @@ impl HerdrGui {
         if self.sidebar_collapsed && !self.sidebar_hovered {
             6.0
         } else {
-            210.0
+            220.0
         }
     }
 
@@ -660,15 +811,6 @@ impl HerdrGui {
         let cols = (width / 8.0).floor().clamp(40.0, 500.0) as u16;
         let rows = (height / 18.0).floor().clamp(12.0, 180.0) as u16;
         (cols, rows, width.round() as u16, height.round() as u16)
-    }
-
-    fn agent_panes(&self) -> Vec<Pane> {
-        self.state
-            .panes
-            .iter()
-            .filter(|pane| pane.agent.is_some())
-            .cloned()
-            .collect()
     }
 
     fn sidebar(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -760,18 +902,37 @@ impl HerdrGui {
     }
 
     fn agent_rows(&self, theme: UiTheme, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        if self.state.agents.is_empty() {
-            return self
-                .agent_panes()
-                .into_iter()
-                .map(|pane| pane_agent_row(&pane, &self.state, theme, cx))
-                .collect();
-        }
-        self.state
+        let mut seen = self
+            .state
+            .agents
+            .iter()
+            .map(|agent| {
+                agent
+                    .pane_id
+                    .as_deref()
+                    .unwrap_or(agent.terminal_id.as_str())
+                    .to_string()
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let mut rows = self
+            .state
             .agents
             .iter()
             .map(|agent| agent_row(agent, &self.state, theme, cx))
-            .collect()
+            .collect::<Vec<_>>();
+        rows.extend(self.state.panes.iter().filter_map(|pane| {
+            let key = pane
+                .terminal_id
+                .as_deref()
+                .unwrap_or(pane.pane_id.as_str())
+                .to_string();
+            if seen.insert(key) {
+                Some(pane_agent_row(pane, &self.state, theme, cx))
+            } else {
+                None
+            }
+        }));
+        rows
     }
 
     fn pane_grid(
@@ -863,16 +1024,16 @@ fn space_switcher(
         .or_else(|| workspace.map(|workspace| workspace.workspace_id.as_str()))
         .unwrap_or("space");
     div()
-        .h(px(28.0))
+        .h(px(34.0))
         .flex()
         .items_center()
         .gap_1()
-        .pl(px(54.0))
+        .pl(px(82.0))
         .pr_1()
         .child(
             div()
                 .flex_1()
-                .h(px(28.0))
+                .h(px(32.0))
                 .px_2()
                 .flex()
                 .items_center()
@@ -890,8 +1051,8 @@ fn space_switcher(
         )
         .child(
             div()
-                .w(px(28.0))
-                .h(px(28.0))
+                .w(px(32.0))
+                .h(px(32.0))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -1086,31 +1247,84 @@ fn status_color(status: &str) -> u32 {
     }
 }
 
-fn dark_theme() -> UiTheme {
-    UiTheme {
-        bg: 0x0b0b0b,
-        panel: 0x0b0b0b,
-        terminal: 0x080808,
-        text: 0xf2f2f2,
-        label: 0xf0f0f0,
-        muted: 0x8a8a8a,
-        hover: 0x181818,
-        active: 0x202020,
-        border: 0x303030,
+fn herdr_theme(name: &str) -> UiTheme {
+    match name {
+        "catppuccin-latte" => theme(
+            0xf5f5f5, 0xeff1f5, 0xffffff, 0x4c4f69, 0x6c6f85, 0xe6e9ef, 0xccd0da,
+        ),
+        "terminal" => theme(
+            0x0b0b0b, 0x0b0b0b, 0x080808, 0xf2f2f2, 0x8a8a8a, 0x181818, 0x202020,
+        ),
+        "tokyo-night" => theme(
+            0x1a1b26, 0x1a1b26, 0x11121a, 0xc0caf5, 0xa9b1d6, 0x24283b, 0x414868,
+        ),
+        "tokyo-night-day" => theme(
+            0xe1e2e7, 0xe1e2e7, 0xf8f8fb, 0x3760bf, 0x6172b0, 0xd2d3da, 0xc4c8da,
+        ),
+        "dracula" => theme(
+            0x282a36, 0x282a36, 0x15161c, 0xf8f8f2, 0xd2d2dc, 0x44475a, 0x6272a4,
+        ),
+        "nord" => theme(
+            0x2e3440, 0x2e3440, 0x20242d, 0xeceff4, 0xd8dee9, 0x3b4252, 0x434c5e,
+        ),
+        "gruvbox" => theme(
+            0x282828, 0x282828, 0x1d2021, 0xebdbb2, 0xd5c4a1, 0x3c3836, 0x504945,
+        ),
+        "gruvbox-light" => theme(
+            0xfbf1c7, 0xfbf1c7, 0xfffff0, 0x3c3836, 0x504945, 0xf2e5bc, 0xebdbb2,
+        ),
+        "one-dark" => theme(
+            0x282c34, 0x282c34, 0x1f2329, 0xabb2bf, 0x969ca8, 0x2c313a, 0x3e4451,
+        ),
+        "one-light" => theme(
+            0xfafafa, 0xfafafa, 0xffffff, 0x383a42, 0x686b77, 0xf5f5f6, 0xe5e5e6,
+        ),
+        "solarized" => theme(
+            0x002b36, 0x002b36, 0x001f27, 0x93a1a1, 0x839496, 0x073642, 0x586e75,
+        ),
+        "solarized-light" => theme(
+            0xfdf6e3, 0xfdf6e3, 0xfffff4, 0x657b83, 0x839496, 0xeee8d5, 0x93a1a1,
+        ),
+        "kanagawa" => theme(
+            0x1f1f28, 0x1f1f28, 0x16161d, 0xdcd7ba, 0xc8c3aa, 0x2a2a37, 0x363646,
+        ),
+        "kanagawa-lotus" => theme(
+            0xf2ecbc, 0xf2ecbc, 0xfffae0, 0x545464, 0x43436c, 0xd5cea3, 0xdcd5ac,
+        ),
+        "rose-pine" => theme(
+            0x191724, 0x191724, 0x111019, 0xe0def4, 0xc8c5dc, 0x1f1d2e, 0x26233a,
+        ),
+        "rose-pine-dawn" => theme(
+            0xfaf4ed, 0xfaf4ed, 0xfffbf5, 0x464261, 0x797593, 0xf2e9e1, 0xfffaf3,
+        ),
+        "vesper" => theme(
+            0x1a1a1a, 0x1a1a1a, 0x101010, 0xffffff, 0xa0a0a0, 0x232323, 0x282828,
+        ),
+        _ => theme(
+            0x181825, 0x181825, 0x11111b, 0xcdd6f4, 0xa6adc8, 0x1e1e2e, 0x313244,
+        ),
     }
 }
 
-fn light_theme() -> UiTheme {
+fn theme(
+    bg: u32,
+    panel: u32,
+    terminal: u32,
+    text: u32,
+    muted: u32,
+    hover: u32,
+    active: u32,
+) -> UiTheme {
     UiTheme {
-        bg: 0xf5f5f5,
-        panel: 0xf5f5f5,
-        terminal: 0xffffff,
-        text: 0x151515,
-        label: 0x111111,
-        muted: 0x6f6f6f,
-        hover: 0xe8e8e8,
-        active: 0xdedede,
-        border: 0xcfcfcf,
+        bg,
+        panel,
+        terminal,
+        text,
+        label: text,
+        muted,
+        hover,
+        active,
+        border: active,
     }
 }
 
@@ -1238,7 +1452,7 @@ fn kbd_hint(text: &str) -> impl IntoElement {
 }
 
 fn key_row(key: &str, action: &str) -> impl IntoElement {
-    let theme = dark_theme();
+    let theme = herdr_theme("catppuccin");
     div()
         .flex()
         .items_center()
@@ -1302,9 +1516,31 @@ fn main() {
                     MenuItem::action("Toggle Agents", ToggleAgents),
                     MenuItem::action("Toggle Sidebar Layout", ToggleSidebarLayout),
                     MenuItem::separator(),
-                    MenuItem::action("Theme: System", ThemeSystem),
-                    MenuItem::action("Theme: Dark", ThemeDark),
-                    MenuItem::action("Theme: Light", ThemeLight),
+                    MenuItem::submenu(Menu {
+                        name: "Themes".into(),
+                        items: vec![
+                            MenuItem::action("System", ThemeSystem),
+                            MenuItem::separator(),
+                            MenuItem::action("catppuccin", ThemeCatppuccin),
+                            MenuItem::action("catppuccin-latte", ThemeCatppuccinLatte),
+                            MenuItem::action("terminal", ThemeTerminal),
+                            MenuItem::action("tokyo-night", ThemeTokyoNight),
+                            MenuItem::action("tokyo-night-day", ThemeTokyoNightDay),
+                            MenuItem::action("dracula", ThemeDracula),
+                            MenuItem::action("nord", ThemeNord),
+                            MenuItem::action("gruvbox", ThemeGruvbox),
+                            MenuItem::action("gruvbox-light", ThemeGruvboxLight),
+                            MenuItem::action("one-dark", ThemeOneDark),
+                            MenuItem::action("one-light", ThemeOneLight),
+                            MenuItem::action("solarized", ThemeSolarized),
+                            MenuItem::action("solarized-light", ThemeSolarizedLight),
+                            MenuItem::action("kanagawa", ThemeKanagawa),
+                            MenuItem::action("kanagawa-lotus", ThemeKanagawaLotus),
+                            MenuItem::action("rose-pine", ThemeRosePine),
+                            MenuItem::action("rose-pine-dawn", ThemeRosePineDawn),
+                            MenuItem::action("vesper", ThemeVesper),
+                        ],
+                    }),
                 ],
             },
         ]);
