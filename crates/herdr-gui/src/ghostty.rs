@@ -1,5 +1,5 @@
 use libloading::Library;
-use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize};
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use std::{
     env,
     ffi::c_void,
@@ -21,6 +21,8 @@ pub struct GhosttyRuntime {
 pub struct TerminalSession {
     pub input: Sender<Vec<u8>>,
     pub output: Option<Receiver<TerminalFrame>>,
+    resize_tx: Sender<PtySize>,
+    master: Box<dyn MasterPty>,
     killer: Box<dyn ChildKiller + Send + Sync>,
 }
 
@@ -65,6 +67,10 @@ const ROW_CELLS_DATA_GRAPHEMES_LEN: u32 = 3;
 const ROW_CELLS_DATA_GRAPHEMES_BUF: u32 = 4;
 const ROW_CELLS_DATA_BG_COLOR: u32 = 5;
 const ROW_CELLS_DATA_FG_COLOR: u32 = 6;
+const RENDER_STATE_DATA_CURSOR_VISIBLE: u32 = 11;
+const RENDER_STATE_DATA_CURSOR_VIEWPORT_HAS_VALUE: u32 = 14;
+const RENDER_STATE_DATA_CURSOR_VIEWPORT_X: u32 = 15;
+const RENDER_STATE_DATA_CURSOR_VIEWPORT_Y: u32 = 16;
 const CELL_DATA_CODEPOINT: u32 = 1;
 const CELL_DATA_WIDE: u32 = 3;
 const CELL_DATA_HAS_TEXT: u32 = 4;
@@ -90,6 +96,7 @@ struct GhosttyColorRgb {
 type GhosttyTerminalNew =
     unsafe extern "C" fn(*const c_void, *mut GhosttyTerminalHandle, GhosttyTerminalOptions) -> i32;
 type GhosttyTerminalFree = unsafe extern "C" fn(GhosttyTerminalHandle);
+type GhosttyTerminalResize = unsafe extern "C" fn(GhosttyTerminalHandle, u16, u16, u32, u32) -> i32;
 type GhosttyTerminalVtWrite = unsafe extern "C" fn(GhosttyTerminalHandle, *const u8, usize);
 type GhosttyRenderStateNew =
     unsafe extern "C" fn(*const c_void, *mut GhosttyRenderStateHandle) -> i32;
@@ -113,6 +120,7 @@ struct GhosttyApi {
     _library: Library,
     terminal_new: GhosttyTerminalNew,
     terminal_free: GhosttyTerminalFree,
+    terminal_resize: GhosttyTerminalResize,
     terminal_vt_write: GhosttyTerminalVtWrite,
     render_state_new: GhosttyRenderStateNew,
     render_state_free: GhosttyRenderStateFree,
@@ -172,6 +180,7 @@ impl TerminalSession {
         let mut writer = pty.master.take_writer().map_err(|err| err.to_string())?;
         let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
         let (output_tx, output_rx) = mpsc::channel::<TerminalFrame>();
+        let (resize_tx, resize_rx) = mpsc::channel::<PtySize>();
 
         thread::spawn(move || {
             for bytes in input_rx {
@@ -197,6 +206,11 @@ impl TerminalSession {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        for size in resize_rx.try_iter() {
+                            if let Err(err) = terminal.resize(size) {
+                                let _ = output_tx.send(TerminalFrame::message(err));
+                            }
+                        }
                         terminal.write(&buf[..n]);
                         if let Ok(frame) = terminal.frame() {
                             let _ = output_tx.send(frame);
@@ -215,8 +229,21 @@ impl TerminalSession {
         Ok(Self {
             input: input_tx,
             output: Some(output_rx),
+            resize_tx,
+            master: pty.master,
             killer,
         })
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16, pixel_width: u16, pixel_height: u16) {
+        let size = PtySize {
+            rows,
+            cols,
+            pixel_width,
+            pixel_height,
+        };
+        let _ = self.master.resize(size);
+        let _ = self.resize_tx.send(size);
     }
 }
 
@@ -293,6 +320,23 @@ impl GhosttyTerminal {
         }
     }
 
+    pub fn resize(&mut self, size: PtySize) -> Result<(), String> {
+        let result = unsafe {
+            (self.api.terminal_resize)(
+                self.terminal,
+                size.cols,
+                size.rows,
+                size.pixel_width.max(1).into(),
+                size.pixel_height.max(1).into(),
+            )
+        };
+        if result == GHOSTTY_SUCCESS {
+            Ok(())
+        } else {
+            Err(format!("ghostty_terminal_resize failed: {result}"))
+        }
+    }
+
     pub fn frame(&mut self) -> Result<TerminalFrame, String> {
         let result = unsafe { (self.api.render_state_update)(self.render_state, self.terminal) };
         if result != GHOSTTY_SUCCESS {
@@ -311,7 +355,9 @@ impl GhosttyTerminal {
             ));
         }
 
+        let cursor = self.cursor()?;
         let mut lines = Vec::new();
+        let mut y = 0_u16;
         while unsafe { (self.api.row_iterator_next)(self.row_iterator) } {
             let result = unsafe {
                 (self.api.row_get)(
@@ -326,21 +372,66 @@ impl GhosttyTerminal {
                 ));
             }
             let mut line = TerminalLine::default();
+            let mut x = 0_u16;
             while unsafe { (self.api.row_cells_next)(self.row_cells) } {
                 let text = self.cell_text()?;
+                let cursor_here = cursor.is_some_and(|cursor| cursor == (x, y));
+                x = x.saturating_add(1);
                 if text.is_empty() {
                     continue;
                 }
-                let fg = self
-                    .cell_color(ROW_CELLS_DATA_FG_COLOR)?
-                    .unwrap_or(DEFAULT_FG);
-                let bg = self.cell_color(ROW_CELLS_DATA_BG_COLOR)?;
+                let (fg, bg) = if cursor_here {
+                    (0x0a0a0a, Some(0xf4f4f4))
+                } else {
+                    (
+                        self.cell_color(ROW_CELLS_DATA_FG_COLOR)?
+                            .unwrap_or(DEFAULT_FG),
+                        terminal_bg(self.cell_color(ROW_CELLS_DATA_BG_COLOR)?),
+                    )
+                };
                 push_run(&mut line.runs, text, fg, bg);
             }
             trim_line(&mut line);
             lines.push(line);
+            y = y.saturating_add(1);
         }
         Ok(TerminalFrame { lines })
+    }
+
+    fn cursor(&self) -> Result<Option<(u16, u16)>, String> {
+        if !self.render_bool(RENDER_STATE_DATA_CURSOR_VISIBLE)?
+            || !self.render_bool(RENDER_STATE_DATA_CURSOR_VIEWPORT_HAS_VALUE)?
+        {
+            return Ok(None);
+        }
+        Ok(Some((
+            self.render_u16(RENDER_STATE_DATA_CURSOR_VIEWPORT_X)?,
+            self.render_u16(RENDER_STATE_DATA_CURSOR_VIEWPORT_Y)?,
+        )))
+    }
+
+    fn render_bool(&self, data: u32) -> Result<bool, String> {
+        let mut out = false;
+        let result = unsafe {
+            (self.api.render_state_get)(self.render_state, data, (&mut out as *mut bool).cast())
+        };
+        if result == GHOSTTY_SUCCESS {
+            Ok(out)
+        } else {
+            Err(format!("ghostty render bool failed: {result}"))
+        }
+    }
+
+    fn render_u16(&self, data: u32) -> Result<u16, String> {
+        let mut out = 0_u16;
+        let result = unsafe {
+            (self.api.render_state_get)(self.render_state, data, (&mut out as *mut u16).cast())
+        };
+        if result == GHOSTTY_SUCCESS {
+            Ok(out)
+        } else {
+            Err(format!("ghostty render u16 failed: {result}"))
+        }
     }
 
     fn cell_text(&self) -> Result<String, String> {
@@ -478,6 +569,8 @@ impl GhosttyApi {
         let terminal_new = load_symbol::<GhosttyTerminalNew>(&library, b"ghostty_terminal_new\0")?;
         let terminal_free =
             load_symbol::<GhosttyTerminalFree>(&library, b"ghostty_terminal_free\0")?;
+        let terminal_resize =
+            load_symbol::<GhosttyTerminalResize>(&library, b"ghostty_terminal_resize\0")?;
         let terminal_vt_write =
             load_symbol::<GhosttyTerminalVtWrite>(&library, b"ghostty_terminal_vt_write\0")?;
         let render_state_new =
@@ -515,6 +608,7 @@ impl GhosttyApi {
             _library: library,
             terminal_new,
             terminal_free,
+            terminal_resize,
             terminal_vt_write,
             render_state_new,
             render_state_free,
@@ -577,6 +671,20 @@ fn rgb_u32(color: GhosttyColorRgb) -> u32 {
     (u32::from(color.r) << 16) | (u32::from(color.g) << 8) | u32::from(color.b)
 }
 
+fn terminal_bg(color: Option<u32>) -> Option<u32> {
+    let color = color?;
+    let r = (color >> 16) & 0xff;
+    let g = (color >> 8) & 0xff;
+    let b = color & 0xff;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    if max < 100 && max - min < 60 {
+        None
+    } else {
+        Some(color)
+    }
+}
+
 fn load_symbol<T: Copy>(library: &Library, name: &[u8]) -> Result<T, String> {
     unsafe { library.get::<T>(name) }
         .map(|symbol| *symbol)
@@ -615,7 +723,7 @@ fn ghostty_roots() -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{push_run, trim_line, GhosttyRuntime, TerminalLine, TerminalRun};
+    use super::{push_run, terminal_bg, trim_line, GhosttyRuntime, TerminalLine, TerminalRun};
 
     #[test]
     fn detect_should_find_local_ghostty_checkout() {
@@ -639,5 +747,11 @@ mod tests {
                 bg: None,
             },]
         );
+    }
+
+    #[test]
+    fn terminal_bg_drops_neutral_default_backgrounds() {
+        assert_eq!(terminal_bg(Some(0x282c34)), None);
+        assert_eq!(terminal_bg(Some(0x5f1f2a)), Some(0x5f1f2a));
     }
 }
