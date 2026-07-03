@@ -665,6 +665,13 @@ impl GhosttyApi {
 }
 
 impl TerminalFrame {
+    pub fn from_ansi(cols: u16, rows: u16, ansi: &str) -> Result<Self, String> {
+        let api = GhosttyRuntime::detect()?.load_api()?;
+        let mut terminal = GhosttyTerminal::new(api, cols, rows)?;
+        terminal.write(ansi.as_bytes());
+        terminal.frame()
+    }
+
     fn message(text: String) -> Self {
         Self {
             lines: vec![TerminalLine {

@@ -146,6 +146,16 @@ struct AgentList {
 }
 
 #[derive(Debug, Deserialize)]
+struct PaneReadResponse {
+    read: PaneRead,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaneRead {
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ApiResponse<T> {
     result: Option<T>,
     error: Option<ApiError>,
@@ -249,6 +259,19 @@ impl HerdrClient {
     pub fn close_pane(&self, pane_id: &str) -> Result<(), HerdrError> {
         let _: Value = self.call("pane.close", json!({ "pane_id": pane_id }))?;
         Ok(())
+    }
+
+    pub fn read_pane_ansi(&self, pane_id: &str) -> Result<String, HerdrError> {
+        let response: PaneReadResponse = self.call(
+            "pane.read",
+            json!({
+                "pane_id": pane_id,
+                "source": "visible",
+                "format": "ansi",
+                "strip_ansi": false
+            }),
+        )?;
+        Ok(response.read.text)
     }
 
     pub fn focus_workspace(&self, workspace_id: &str) -> Result<(), HerdrError> {
