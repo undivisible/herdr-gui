@@ -110,7 +110,7 @@ impl GhosttyRuntime {
             .find(|root| has_vt(root))
             .map(|root| Self { root })
             .ok_or_else(|| {
-                "libghostty-vt not found. Bundle vendor/ghostty/zig-out/lib/libghostty-vt.dylib or set GHOSTTY_VT_ROOT.".to_string()
+                "libghostty-vt not found. Bundle vendor/ghostty-vt/lib/libghostty-vt.dylib or set GHOSTTY_VT_ROOT.".to_string()
             })
     }
 
@@ -279,10 +279,18 @@ impl GhosttyApi {
     fn load(root: &Path) -> Result<Arc<Self>, String> {
         let path = env::var_os("GHOSTTY_VT_LIB")
             .map(PathBuf::from)
-            .unwrap_or_else(|| root.join("zig-out/lib/libghostty-vt.dylib"));
+            .or_else(|| {
+                [
+                    root.join("lib/libghostty-vt.dylib"),
+                    root.join("zig-out/lib/libghostty-vt.dylib"),
+                ]
+                .into_iter()
+                .find(|path| path.is_file())
+            })
+            .unwrap_or_else(|| root.join("lib/libghostty-vt.dylib"));
         if !path.is_file() {
             return Err(format!(
-                "libghostty-vt dylib not found at {}. The existing .a is not usable for this macOS build; rebuild Ghostty VT as a native dylib or set GHOSTTY_VT_LIB.",
+                "libghostty-vt dylib not found at {}. Bundle vendor/ghostty-vt/lib/libghostty-vt.dylib or set GHOSTTY_VT_LIB.",
                 path.display()
             ));
         }
@@ -352,9 +360,9 @@ fn formatter_options() -> GhosttyFormatterTerminalOptions {
 }
 
 fn has_vt(root: &Path) -> bool {
-    root.join("include/ghostty/vt.h").is_file()
-        && (root.join("zig-out/lib/libghostty-vt.dylib").is_file()
-            || root.join("zig-out/lib/libghostty-vt.a").is_file())
+    root.join("lib/libghostty-vt.dylib").is_file()
+        || root.join("zig-out/lib/libghostty-vt.dylib").is_file()
+        || root.join("zig-out/lib/libghostty-vt.a").is_file()
 }
 
 fn ghostty_roots() -> Vec<PathBuf> {
@@ -371,6 +379,12 @@ fn ghostty_roots() -> Vec<PathBuf> {
             roots.push(contents.join("Resources/ghostty"));
         }
     }
+    roots.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("vendor/ghostty-vt"),
+    );
+    roots.push(PathBuf::from("vendor/ghostty-vt"));
     roots.push(PathBuf::from("vendor/ghostty"));
     roots
 }

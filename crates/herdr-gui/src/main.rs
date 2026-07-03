@@ -9,7 +9,7 @@ use crepuscularity_gpui::{
     WindowBounds,
 };
 use ghostty::{GhosttyRuntime, TerminalSession};
-use herdr::{HerdrClient, HerdrState, Pane};
+use herdr::{HerdrClient, HerdrState, Pane, Tab, Workspace};
 use std::{sync::mpsc::Receiver, time::Duration};
 
 actions!(
@@ -21,7 +21,9 @@ actions!(
         SplitDown,
         FocusRight,
         ResizeRight,
-        ClosePane
+        ClosePane,
+        PreviousTab,
+        NextTab
     ]
 );
 
@@ -107,6 +109,14 @@ impl HerdrGui {
         cx.notify();
     }
 
+    fn previous_tab(&mut self, _: &PreviousTab, _window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_tab_offset(-1, cx);
+    }
+
+    fn next_tab(&mut self, _: &NextTab, _window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_tab_offset(1, cx);
+    }
+
     fn focus_workspace_id(&mut self, workspace_id: String, cx: &mut Context<Self>) {
         self.with_client(|client| client.focus_workspace(&workspace_id));
         self.refresh_state();
@@ -119,6 +129,23 @@ impl HerdrGui {
         self.refresh_state();
         self.attach_focused_terminal(cx);
         cx.notify();
+    }
+
+    fn focus_tab_offset(&mut self, offset: isize, cx: &mut Context<Self>) {
+        let tabs = self.visible_tabs();
+        if tabs.is_empty() {
+            return;
+        }
+        let active_id = self
+            .state
+            .focused_tab_id
+            .as_deref()
+            .or_else(|| self.active_tab().map(|tab| tab.tab_id.as_str()));
+        let active_index = active_id
+            .and_then(|id| tabs.iter().position(|tab| tab.tab_id == id))
+            .unwrap_or(0);
+        let next_index = (active_index as isize + offset).rem_euclid(tabs.len() as isize) as usize;
+        self.focus_tab_id(tabs[next_index].tab_id.clone(), cx);
     }
 
     fn focus_pane_id(&mut self, pane_id: String, cx: &mut Context<Self>) {
@@ -191,6 +218,16 @@ impl HerdrGui {
     }
 
     fn focused_pane(&self) -> Option<&Pane> {
+        if let Some(focused_id) = self.state.focused_pane_id.as_deref() {
+            if let Some(pane) = self
+                .state
+                .panes
+                .iter()
+                .find(|pane| pane.pane_id == focused_id)
+            {
+                return Some(pane);
+            }
+        }
         self.state
             .panes
             .iter()
@@ -221,7 +258,7 @@ impl HerdrGui {
 
 impl Render for HerdrGui {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let panes = self.state.panes.clone();
+        let panes = self.visible_panes();
         let pane_text = self.terminal_text.clone();
 
         div()
@@ -239,6 +276,8 @@ impl Render for HerdrGui {
             .on_action(cx.listener(Self::focus_right))
             .on_action(cx.listener(Self::resize_right))
             .on_action(cx.listener(Self::close_pane))
+            .on_action(cx.listener(Self::previous_tab))
+            .on_action(cx.listener(Self::next_tab))
             .child(self.sidebar(cx))
             .child(
                 div()
@@ -261,13 +300,106 @@ impl Render for HerdrGui {
 }
 
 impl HerdrGui {
+    fn active_workspace(&self) -> Option<&Workspace> {
+        if let Some(id) = self.state.focused_workspace_id.as_deref() {
+            if let Some(workspace) = self
+                .state
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == id)
+            {
+                return Some(workspace);
+            }
+        }
+        self.state
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.focused)
+            .or_else(|| self.state.workspaces.first())
+    }
+
+    fn active_workspace_id(&self) -> Option<&str> {
+        self.state.focused_workspace_id.as_deref().or_else(|| {
+            self.active_workspace()
+                .map(|workspace| workspace.workspace_id.as_str())
+        })
+    }
+
+    fn active_tab(&self) -> Option<&Tab> {
+        if let Some(id) = self.state.focused_tab_id.as_deref() {
+            if let Some(tab) = self.state.tabs.iter().find(|tab| tab.tab_id == id) {
+                return Some(tab);
+            }
+        }
+        self.state
+            .tabs
+            .iter()
+            .find(|tab| tab.focused)
+            .or_else(|| self.state.tabs.first())
+    }
+
+    fn visible_tabs(&self) -> Vec<Tab> {
+        let Some(workspace_id) = self.active_workspace_id() else {
+            return Vec::new();
+        };
+        let mut tabs = self
+            .state
+            .tabs
+            .iter()
+            .filter(|tab| {
+                tab.workspace_id
+                    .as_deref()
+                    .is_none_or(|tab_workspace| tab_workspace == workspace_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if tabs.is_empty() {
+            tabs = self.state.tabs.clone();
+        }
+        tabs
+    }
+
+    fn visible_panes(&self) -> Vec<Pane> {
+        let focused_tab_id = self
+            .state
+            .focused_tab_id
+            .as_deref()
+            .or_else(|| self.active_tab().map(|tab| tab.tab_id.as_str()));
+        let focused_workspace_id = self.active_workspace_id();
+        let mut panes = self
+            .state
+            .panes
+            .iter()
+            .filter(|pane| {
+                focused_tab_id.is_none_or(|tab_id| {
+                    pane.tab_id
+                        .as_deref()
+                        .is_none_or(|pane_tab| pane_tab == tab_id)
+                }) && focused_workspace_id.is_none_or(|workspace_id| {
+                    pane.workspace_id
+                        .as_deref()
+                        .is_none_or(|pane_workspace| pane_workspace == workspace_id)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if panes.is_empty() {
+            panes = self.state.panes.clone();
+        }
+        panes
+    }
+
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let workspace = self.active_workspace();
+        let tab = self.active_tab();
+        let pane_count = self.visible_panes().len();
+
         div()
-            .w(px(228.0))
+            .w(px(210.0))
             .h_full()
             .border_r_1()
             .border_color(rgb(0x343b48))
-            .bg(rgb(0x222832))
+            .bg(rgb(0x1b2028))
             .p_2()
             .flex()
             .flex_col()
@@ -278,13 +410,13 @@ impl HerdrGui {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(section("spaces"))
+                    .child(section("window"))
                     .child(status_dot(&self.status)),
             )
             .child(status_band(&self.status))
-            .children(self.state.workspaces.iter().map(|workspace| {
+            .when_some(workspace, |el, workspace| {
                 let id = workspace.workspace_id.clone();
-                row(
+                el.child(row(
                     workspace
                         .label
                         .as_deref()
@@ -295,25 +427,24 @@ impl HerdrGui {
                         .as_deref()
                         .unwrap_or("unknown")
                         .to_string(),
-                    workspace.focused,
+                    true,
                     cx.listener(move |this, _, _, cx| this.focus_workspace_id(id.clone(), cx)),
-                )
-            }))
-            .child(section("tabs"))
-            .children(self.state.tabs.iter().map(|tab| {
+                ))
+            })
+            .child(section("current tab"))
+            .when_some(tab, |el, tab| {
                 let id = tab.tab_id.clone();
-                row(
+                el.child(row(
                     tab.label.as_deref().unwrap_or(&tab.tab_id).to_string(),
                     tab.agent_status
-                        .as_deref()
-                        .unwrap_or(&tab.tab_id)
-                        .to_string(),
-                    tab.focused,
+                        .clone()
+                        .unwrap_or_else(|| format!("{pane_count} pane{}", plural(pane_count))),
+                    true,
                     cx.listener(move |this, _, _, cx| this.focus_tab_id(id.clone(), cx)),
-                )
-            }))
-            .child(section("panes"))
-            .children(self.state.panes.iter().map(|pane| {
+                ))
+            })
+            .child(section("visible panes"))
+            .children(self.visible_panes().into_iter().map(|pane| {
                 let id = pane.pane_id.clone();
                 row(
                     pane.agent
@@ -491,6 +622,14 @@ fn status_band(text: &str) -> impl IntoElement {
         .child(text.to_string())
 }
 
+fn plural(count: usize) -> &'static str {
+    if count == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
 fn status_dot(text: &str) -> impl IntoElement {
     div()
         .w(px(9.0))
@@ -574,6 +713,8 @@ fn help_overlay() -> impl IntoElement {
         .child(key_row("Cmd Shift ]", "split down"))
         .child(key_row("→", "focus right"))
         .child(key_row("Shift →", "resize right"))
+        .child(key_row("Cmd ←", "previous tab"))
+        .child(key_row("Cmd →", "next tab"))
         .child(key_row("Cmd W", "close pane"))
 }
 
@@ -610,6 +751,8 @@ fn main() {
             KeyBinding::new("right", FocusRight, None),
             KeyBinding::new("shift-right", ResizeRight, None),
             KeyBinding::new("cmd-w", ClosePane, None),
+            KeyBinding::new("cmd-left", PreviousTab, None),
+            KeyBinding::new("cmd-right", NextTab, None),
         ]);
 
         let options = gpui_window_options(

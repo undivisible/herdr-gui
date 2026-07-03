@@ -27,6 +27,12 @@ pub enum HerdrError {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct HerdrState {
+    #[serde(default)]
+    pub focused_workspace_id: Option<String>,
+    #[serde(default)]
+    pub focused_tab_id: Option<String>,
+    #[serde(default)]
+    pub focused_pane_id: Option<String>,
     pub workspaces: Vec<Workspace>,
     pub tabs: Vec<Tab>,
     pub panes: Vec<Pane>,
@@ -42,12 +48,16 @@ pub struct Workspace {
     #[serde(default)]
     pub agent_status: Option<String>,
     #[serde(default)]
+    pub active_tab_id: Option<String>,
+    #[serde(default)]
     pub focused: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Tab {
     pub tab_id: String,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
     #[serde(default)]
@@ -61,6 +71,10 @@ pub struct Pane {
     pub pane_id: String,
     #[serde(default)]
     pub terminal_id: Option<String>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub tab_id: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
     #[serde(default)]
@@ -85,6 +99,24 @@ struct TabList {
 
 #[derive(Debug, Deserialize)]
 struct PaneList {
+    panes: Vec<Pane>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionSnapshotResult {
+    snapshot: SessionSnapshot,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionSnapshot {
+    #[serde(default)]
+    focused_workspace_id: Option<String>,
+    #[serde(default)]
+    focused_tab_id: Option<String>,
+    #[serde(default)]
+    focused_pane_id: Option<String>,
+    workspaces: Vec<Workspace>,
+    tabs: Vec<Tab>,
     panes: Vec<Pane>,
 }
 
@@ -128,10 +160,60 @@ impl HerdrClient {
     }
 
     pub fn state(&self) -> Result<HerdrState, HerdrError> {
+        match self.snapshot_state() {
+            Ok(state) => Ok(state),
+            Err(_) => self.list_state(),
+        }
+    }
+
+    fn snapshot_state(&self) -> Result<HerdrState, HerdrError> {
+        let result: SessionSnapshotResult = self.call("session.snapshot", json!({}))?;
+        Ok(result.snapshot.into())
+    }
+
+    fn list_state(&self) -> Result<HerdrState, HerdrError> {
         let workspaces: WorkspaceList = self.call("workspace.list", json!({}))?;
-        let tabs: TabList = self.call("tab.list", json!({}))?;
-        let panes: PaneList = self.call("pane.list", json!({}))?;
+        let focused_workspace_id = workspaces
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.focused)
+            .map(|workspace| workspace.workspace_id.clone())
+            .or_else(|| {
+                workspaces
+                    .workspaces
+                    .first()
+                    .map(|workspace| workspace.workspace_id.clone())
+            });
+        let tabs: TabList = self.call(
+            "tab.list",
+            focused_workspace_id
+                .as_ref()
+                .map(|workspace_id| json!({ "workspace_id": workspace_id }))
+                .unwrap_or_else(|| json!({})),
+        )?;
+        let focused_tab_id = tabs
+            .tabs
+            .iter()
+            .find(|tab| tab.focused)
+            .map(|tab| tab.tab_id.clone())
+            .or_else(|| tabs.tabs.first().map(|tab| tab.tab_id.clone()));
+        let panes: PaneList = self.call(
+            "pane.list",
+            focused_workspace_id
+                .as_ref()
+                .map(|workspace_id| json!({ "workspace_id": workspace_id }))
+                .unwrap_or_else(|| json!({})),
+        )?;
+        let focused_pane_id = panes
+            .panes
+            .iter()
+            .find(|pane| pane.focused)
+            .map(|pane| pane.pane_id.clone())
+            .or_else(|| panes.panes.first().map(|pane| pane.pane_id.clone()));
         Ok(HerdrState {
+            focused_workspace_id,
+            focused_tab_id,
+            focused_pane_id,
             workspaces: workspaces.workspaces,
             tabs: tabs.tabs,
             panes: panes.panes,
@@ -221,6 +303,19 @@ impl HerdrClient {
     }
 }
 
+impl From<SessionSnapshot> for HerdrState {
+    fn from(snapshot: SessionSnapshot) -> Self {
+        Self {
+            focused_workspace_id: snapshot.focused_workspace_id,
+            focused_tab_id: snapshot.focused_tab_id,
+            focused_pane_id: snapshot.focused_pane_id,
+            workspaces: snapshot.workspaces,
+            tabs: snapshot.tabs,
+            panes: snapshot.panes,
+        }
+    }
+}
+
 fn ensure_herdr_installed() -> Result<(), HerdrError> {
     if command_exists("herdr") {
         return Ok(());
@@ -285,7 +380,9 @@ fn socket_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_exists, socket_path, PaneList, TabList, WorkspaceList};
+    use super::{
+        command_exists, socket_path, PaneList, SessionSnapshotResult, TabList, WorkspaceList,
+    };
 
     #[test]
     fn socket_path_should_default_to_config_dir() {
@@ -312,6 +409,20 @@ mod tests {
         assert_eq!(tabs.tabs[0].tab_id, "w1:t1");
         assert_eq!(panes.panes[0].agent_status.as_deref(), Some("working"));
         assert_eq!(panes.panes[0].terminal_id.as_deref(), Some("term_1"));
+    }
+
+    #[test]
+    fn session_snapshot_should_preserve_focused_window_context() {
+        let snapshot: SessionSnapshotResult = parse_json(
+            r#"{"type":"session_snapshot","snapshot":{"version":"0.6.0","protocol":8,"focused_workspace_id":"1","focused_tab_id":"1:2","focused_pane_id":"1:p3","workspaces":[{"workspace_id":"1","label":"repo","focused":true,"active_tab_id":"1:2"}],"tabs":[{"tab_id":"1:1","workspace_id":"1","label":"build","focused":false},{"tab_id":"1:2","workspace_id":"1","label":"shell","focused":true}],"panes":[{"pane_id":"1:p3","terminal_id":"term_3","workspace_id":"1","tab_id":"1:2","focused":true,"agent_status":"idle"}],"layouts":[],"agents":[]}}"#,
+        );
+        let state = super::HerdrState::from(snapshot.snapshot);
+
+        assert_eq!(state.focused_workspace_id.as_deref(), Some("1"));
+        assert_eq!(state.focused_tab_id.as_deref(), Some("1:2"));
+        assert_eq!(state.focused_pane_id.as_deref(), Some("1:p3"));
+        assert_eq!(state.tabs[1].workspace_id.as_deref(), Some("1"));
+        assert_eq!(state.panes[0].tab_id.as_deref(), Some("1:2"));
     }
 
     fn parse_json<T: serde::de::DeserializeOwned>(json: &str) -> T {

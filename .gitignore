@@ -1,2 +1,3 @@
 /target/
 /vendor/ghostty/
+/vendor/ghostty-vt/lib/libghostty-vt.a
