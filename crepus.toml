@@ -1,0 +1,4 @@
+[app]
+name = "herdr-gui"
+kind = "gpui"
+bin = "herdr-gui"
