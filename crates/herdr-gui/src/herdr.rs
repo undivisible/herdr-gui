@@ -62,6 +62,10 @@ pub struct Tab {
     #[serde(default)]
     pub label: Option<String>,
     #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub terminal_title: Option<String>,
+    #[serde(default)]
     pub agent_status: Option<String>,
     #[serde(default)]
     pub focused: bool,
@@ -78,6 +82,10 @@ pub struct Pane {
     pub tab_id: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub terminal_title: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default)]

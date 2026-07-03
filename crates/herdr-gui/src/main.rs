@@ -37,6 +37,8 @@ actions!(
         ToggleSidebar,
         ToggleAgents,
         ToggleSidebarLayout,
+        NarrowSidebar,
+        WidenSidebar,
         ThemeCatppuccin,
         ThemeCatppuccinLatte,
         ThemeTerminal,
@@ -56,6 +58,8 @@ actions!(
         ThemeRosePineDawn,
         ThemeVesper,
         ThemeSystem,
+        ThemeSystemDark,
+        ThemeSystemLight,
         ReloadHerdrConfig
     ]
 );
@@ -70,6 +74,8 @@ enum SidebarLayout {
 enum ThemeMode {
     Herdr(&'static str),
     System,
+    SystemDark,
+    SystemLight,
 }
 
 #[derive(Clone, Copy)]
@@ -100,6 +106,7 @@ struct HerdrGui {
     sidebar_hovered: bool,
     agents_collapsed: bool,
     sidebar_layout: SidebarLayout,
+    sidebar_width_px: f64,
     theme_mode: ThemeMode,
     scroll_x: f64,
     focus_handle: FocusHandle,
@@ -131,6 +138,7 @@ impl HerdrGui {
             sidebar_hovered: false,
             agents_collapsed: false,
             sidebar_layout: SidebarLayout::Arc,
+            sidebar_width_px: 220.0,
             theme_mode: ThemeMode::Herdr("catppuccin"),
             scroll_x: 0.0,
             focus_handle: cx.focus_handle(),
@@ -170,8 +178,40 @@ impl HerdrGui {
         cx.notify();
     }
 
+    fn narrow_sidebar(&mut self, _: &NarrowSidebar, _window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_width_px = (self.sidebar_width_px - 20.0).max(180.0);
+        self.terminal_size = None;
+        cx.notify();
+    }
+
+    fn widen_sidebar(&mut self, _: &WidenSidebar, _window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_width_px = (self.sidebar_width_px + 20.0).min(340.0);
+        self.terminal_size = None;
+        cx.notify();
+    }
+
     fn theme_system(&mut self, _: &ThemeSystem, _window: &mut Window, cx: &mut Context<Self>) {
         self.theme_mode = ThemeMode::System;
+        cx.notify();
+    }
+
+    fn theme_system_dark(
+        &mut self,
+        _: &ThemeSystemDark,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.theme_mode = ThemeMode::SystemDark;
+        cx.notify();
+    }
+
+    fn theme_system_light(
+        &mut self,
+        _: &ThemeSystemLight,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.theme_mode = ThemeMode::SystemLight;
         cx.notify();
     }
 
@@ -338,6 +378,28 @@ impl HerdrGui {
 
     fn focus_pane_id(&mut self, pane_id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.with_client(|client| client.focus_pane(&pane_id));
+        self.refresh_state();
+        self.attach_focused_terminal(window, cx);
+        cx.notify();
+    }
+
+    fn focus_target(
+        &mut self,
+        workspace_id: Option<String>,
+        tab_id: Option<String>,
+        pane_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(workspace_id) = workspace_id {
+            self.with_client(|client| client.focus_workspace(&workspace_id));
+        }
+        if let Some(tab_id) = tab_id {
+            self.with_client(|client| client.focus_tab(&tab_id));
+        }
+        if let Some(pane_id) = pane_id {
+            self.with_client(|client| client.focus_pane(&pane_id));
+        }
         self.refresh_state();
         self.attach_focused_terminal(window, cx);
         cx.notify();
@@ -628,6 +690,8 @@ impl HerdrGui {
     fn theme(&self, window: &Window) -> UiTheme {
         match self.theme_mode {
             ThemeMode::Herdr(name) => herdr_theme(name),
+            ThemeMode::SystemDark => herdr_theme("catppuccin"),
+            ThemeMode::SystemLight => herdr_theme("catppuccin-latte"),
             ThemeMode::System => match window.appearance() {
                 WindowAppearance::Light | WindowAppearance::VibrantLight => {
                     herdr_theme("catppuccin-latte")
@@ -671,6 +735,8 @@ impl Render for HerdrGui {
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_agents))
             .on_action(cx.listener(Self::toggle_sidebar_layout))
+            .on_action(cx.listener(Self::narrow_sidebar))
+            .on_action(cx.listener(Self::widen_sidebar))
             .on_action(cx.listener(Self::theme_catppuccin))
             .on_action(cx.listener(Self::theme_catppuccin_latte))
             .on_action(cx.listener(Self::theme_terminal))
@@ -690,6 +756,8 @@ impl Render for HerdrGui {
             .on_action(cx.listener(Self::theme_rose_pine_dawn))
             .on_action(cx.listener(Self::theme_vesper))
             .on_action(cx.listener(Self::theme_system))
+            .on_action(cx.listener(Self::theme_system_dark))
+            .on_action(cx.listener(Self::theme_system_light))
             .on_action(cx.listener(Self::reload_herdr_config))
             .on_scroll_wheel(cx.listener(Self::handle_workspace_scroll))
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
@@ -743,6 +811,27 @@ impl HerdrGui {
             .iter()
             .find(|tab| tab.focused)
             .or_else(|| self.state.tabs.first())
+    }
+
+    fn tab_title(&self, tab: &Tab) -> String {
+        tab.terminal_title
+            .as_deref()
+            .or(tab.title.as_deref())
+            .or(tab.label.as_deref())
+            .or_else(|| {
+                self.state
+                    .panes
+                    .iter()
+                    .find(|pane| pane.tab_id.as_deref() == Some(tab.tab_id.as_str()))
+                    .and_then(|pane| {
+                        pane.terminal_title
+                            .as_deref()
+                            .or(pane.title.as_deref())
+                            .or(pane.label.as_deref())
+                    })
+            })
+            .unwrap_or(&tab.tab_id)
+            .to_string()
     }
 
     fn visible_tabs(&self) -> Vec<Tab> {
@@ -800,7 +889,7 @@ impl HerdrGui {
         if self.sidebar_collapsed && !self.sidebar_hovered {
             6.0
         } else {
-            220.0
+            self.sidebar_width_px
         }
     }
 
@@ -808,7 +897,7 @@ impl HerdrGui {
         let size = window.bounds().size;
         let width = (size.width.to_f64() - self.sidebar_width()).max(320.0);
         let height = size.height.to_f64().max(240.0);
-        let cols = (width / 8.0).floor().clamp(40.0, 500.0) as u16;
+        let cols = (width / 7.0).ceil().clamp(40.0, 1000.0) as u16;
         let rows = (height / 18.0).floor().clamp(12.0, 180.0) as u16;
         (cols, rows, width.round() as u16, height.round() as u16)
     }
@@ -874,7 +963,7 @@ impl HerdrGui {
                 let id = tab.tab_id.clone();
                 let close_id = tab.tab_id.clone();
                 tab_row(
-                    tab.label.as_deref().unwrap_or(&tab.tab_id).to_string(),
+                    self.tab_title(&tab),
                     tab.agent_status.unwrap_or_else(|| "tab".to_string()),
                     tab.focused
                         || self
@@ -994,6 +1083,23 @@ fn label(text: &str, color: u32) -> impl IntoElement {
         .child(text.to_string())
 }
 
+fn truncate_label(text: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    let mut chars = text.chars();
+    for _ in 0..max_chars {
+        let Some(ch) = chars.next() else {
+            return text.to_string();
+        };
+        output.push(ch);
+    }
+    if chars.next().is_some() {
+        output.push_str("...");
+        output
+    } else {
+        text.to_string()
+    }
+}
+
 fn small(text: &str, theme: UiTheme) -> impl IntoElement {
     div()
         .text_size(px(11.0))
@@ -1037,8 +1143,8 @@ fn space_switcher(
                 .px_2()
                 .flex()
                 .items_center()
-                .justify_between()
                 .cursor_pointer()
+                .overflow_hidden()
                 .hover(move |style| style.bg(rgb(theme.hover)))
                 .on_mouse_down(
                     MouseButton::Left,
@@ -1046,8 +1152,7 @@ fn space_switcher(
                         this.toggle_spaces(&ToggleSpaces, window, cx)
                     }),
                 )
-                .child(label(name, theme.label))
-                .child(icon("chevron.down", 11.0, theme)),
+                .child(label(&truncate_label(name, 18), theme.label)),
         )
         .child(
             div()
@@ -1147,14 +1252,41 @@ fn workspace_row(
     row(title, detail, focused, theme, on_click).into_any_element()
 }
 
+fn pane_agent_title(pane: &Pane, state: &HerdrState) -> String {
+    pane.agent
+        .as_deref()
+        .or(pane.terminal_title.as_deref())
+        .or(pane.title.as_deref())
+        .or(pane.label.as_deref())
+        .or_else(|| {
+            pane.tab_id.as_deref().and_then(|tab_id| {
+                state
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.tab_id == tab_id)
+                    .and_then(|tab| {
+                        tab.terminal_title
+                            .as_deref()
+                            .or(tab.title.as_deref())
+                            .or(tab.label.as_deref())
+                    })
+            })
+        })
+        .or(pane.terminal_id.as_deref())
+        .unwrap_or(&pane.pane_id)
+        .to_string()
+}
+
 fn pane_agent_row(
     pane: &Pane,
     state: &HerdrState,
     theme: UiTheme,
     cx: &mut Context<HerdrGui>,
 ) -> AnyElement {
-    let id = pane.pane_id.clone();
-    let title = pane.agent.as_deref().unwrap_or(&pane.pane_id).to_string();
+    let workspace_id = pane.workspace_id.clone();
+    let tab_id = pane.tab_id.clone();
+    let pane_id = pane.pane_id.clone();
+    let title = pane_agent_title(pane, state);
     let status = pane
         .agent_status
         .as_deref()
@@ -1165,8 +1297,15 @@ fn pane_agent_row(
             .focused_pane_id
             .as_deref()
             .is_some_and(|focused| focused == pane.pane_id);
-    let on_click =
-        cx.listener(move |this, _, window, cx| this.focus_pane_id(id.clone(), window, cx));
+    let on_click = cx.listener(move |this, _, window, cx| {
+        this.focus_target(
+            workspace_id.clone(),
+            tab_id.clone(),
+            Some(pane_id.clone()),
+            window,
+            cx,
+        )
+    });
 
     agent_row_element(title, status, focused, theme, on_click).into_any_element()
 }
@@ -1178,6 +1317,8 @@ fn agent_row(
     cx: &mut Context<HerdrGui>,
 ) -> AnyElement {
     let pane_id = agent.pane_id.clone();
+    let workspace_id = agent.workspace_id.clone();
+    let tab_id = agent.tab_id.clone();
     let title = agent
         .display_agent
         .as_deref()
@@ -1200,9 +1341,13 @@ fn agent_row(
                 .is_some_and(|focused| focused == pane_id)
         });
     let on_click = cx.listener(move |this, _, window, cx| {
-        if let Some(pane_id) = pane_id.clone() {
-            this.focus_pane_id(pane_id, window, cx);
-        }
+        this.focus_target(
+            workspace_id.clone(),
+            tab_id.clone(),
+            pane_id.clone(),
+            window,
+            cx,
+        );
     });
 
     agent_row_element(title, status, focused, theme, on_click).into_any_element()
@@ -1418,6 +1563,8 @@ fn empty_state(status: &str, theme: UiTheme) -> impl IntoElement {
 
 fn terminal_frame(frame: &TerminalFrame) -> impl IntoElement {
     div()
+        .w_full()
+        .h_full()
         .flex()
         .flex_col()
         .children(frame.lines.iter().map(terminal_line))
@@ -1425,6 +1572,7 @@ fn terminal_frame(frame: &TerminalFrame) -> impl IntoElement {
 
 fn terminal_line(line: &TerminalLine) -> impl IntoElement {
     div()
+        .w_full()
         .h(px(18.0))
         .flex()
         .flex_none()
@@ -1515,11 +1663,20 @@ fn main() {
                     MenuItem::action("Toggle Sidebar", ToggleSidebar),
                     MenuItem::action("Toggle Agents", ToggleAgents),
                     MenuItem::action("Toggle Sidebar Layout", ToggleSidebarLayout),
+                    MenuItem::action("Narrow Sidebar", NarrowSidebar),
+                    MenuItem::action("Widen Sidebar", WidenSidebar),
                     MenuItem::separator(),
                     MenuItem::submenu(Menu {
                         name: "Themes".into(),
                         items: vec![
-                            MenuItem::action("System", ThemeSystem),
+                            MenuItem::submenu(Menu {
+                                name: "System".into(),
+                                items: vec![
+                                    MenuItem::action("Auto", ThemeSystem),
+                                    MenuItem::action("Dark", ThemeSystemDark),
+                                    MenuItem::action("Light", ThemeSystemLight),
+                                ],
+                            }),
                             MenuItem::separator(),
                             MenuItem::action("catppuccin", ThemeCatppuccin),
                             MenuItem::action("catppuccin-latte", ThemeCatppuccinLatte),
@@ -1552,6 +1709,8 @@ fn main() {
             KeyBinding::new("cmd-b", ToggleSidebar, None),
             KeyBinding::new("cmd-shift-a", ToggleAgents, None),
             KeyBinding::new("cmd-shift-l", ToggleSidebarLayout, None),
+            KeyBinding::new("cmd-alt-left", NarrowSidebar, None),
+            KeyBinding::new("cmd-alt-right", WidenSidebar, None),
             KeyBinding::new("cmd-shift-r", ReloadHerdrConfig, None),
             KeyBinding::new("cmd-t", NewTab, None),
             KeyBinding::new("cmd-w", CloseTab, None),
