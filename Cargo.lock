@@ -1086,6 +1086,7 @@ dependencies = [
  "crepuscularity-runtime",
  "crepuscularity_macros",
  "gpui",
+ "gpui-symbols",
  "hdrhistogram",
  "log",
  "pollster 0.4.0",
@@ -2068,6 +2069,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "gpui-symbols"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96928d6fc8d3b8a9b4e4bb5b128e654cf6106203216993f37dbb7ddec9d72e15"
+dependencies = [
+ "gpui",
+ "image",
+ "objc",
+ "sfsymbols",
+ "smallvec",
 ]
 
 [[package]]
@@ -4598,6 +4612,12 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "sfsymbols"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2888368f031c6bb0aee0e02f7adb300fcc9b867f2edc88c757f92952546ddb4"
 
 [[package]]
 name = "sha1_smol"

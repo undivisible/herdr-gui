@@ -22,7 +22,7 @@ unwrap_used = "deny"
 expect_used = "deny"
 
 [dependencies]
-crepuscularity-gpui = { version = "0.5.0", features = ["macos"] }
+crepuscularity-gpui = { version = "0.5.0", features = ["macos", "symbols"] }
 libloading = "0.8"
 portable-pty = "0.9.0"
 serde = { version = "1", features = ["derive"] }

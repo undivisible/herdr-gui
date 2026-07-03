@@ -36,6 +36,7 @@ pub struct HerdrState {
     pub workspaces: Vec<Workspace>,
     pub tabs: Vec<Tab>,
     pub panes: Vec<Pane>,
+    pub agents: Vec<Agent>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -87,6 +88,35 @@ pub struct Pane {
     pub focused: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Agent {
+    pub terminal_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub display_agent: Option<String>,
+    #[serde(default)]
+    pub agent_status: Option<String>,
+    #[serde(default)]
+    pub custom_status: Option<String>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub tab_id: Option<String>,
+    #[serde(default)]
+    pub pane_id: Option<String>,
+    #[serde(default)]
+    pub focused: bool,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub foreground_cwd: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct WorkspaceList {
     workspaces: Vec<Workspace>,
@@ -118,6 +148,8 @@ struct SessionSnapshot {
     workspaces: Vec<Workspace>,
     tabs: Vec<Tab>,
     panes: Vec<Pane>,
+    #[serde(default)]
+    agents: Vec<Agent>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -217,6 +249,7 @@ impl HerdrClient {
             workspaces: workspaces.workspaces,
             tabs: tabs.tabs,
             panes: panes.panes,
+            agents: Vec::new(),
         })
     }
 
@@ -330,6 +363,7 @@ impl From<SessionSnapshot> for HerdrState {
             workspaces: snapshot.workspaces,
             tabs: snapshot.tabs,
             panes: snapshot.panes,
+            agents: snapshot.agents,
         }
     }
 }
@@ -441,6 +475,7 @@ mod tests {
         assert_eq!(state.focused_pane_id.as_deref(), Some("1:p3"));
         assert_eq!(state.tabs[1].workspace_id.as_deref(), Some("1"));
         assert_eq!(state.panes[0].tab_id.as_deref(), Some("1:2"));
+        assert!(state.agents.is_empty());
     }
 
     fn parse_json<T: serde::de::DeserializeOwned>(json: &str) -> T {

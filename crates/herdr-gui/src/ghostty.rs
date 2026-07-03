@@ -678,7 +678,7 @@ fn terminal_bg(color: Option<u32>) -> Option<u32> {
     let b = color & 0xff;
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
-    if max < 100 && max - min < 60 {
+    if max < 120 && max - min < 35 {
         None
     } else {
         Some(color)
@@ -752,6 +752,8 @@ mod tests {
     #[test]
     fn terminal_bg_drops_neutral_default_backgrounds() {
         assert_eq!(terminal_bg(Some(0x282c34)), None);
+        assert_eq!(terminal_bg(Some(0x303743)), None);
         assert_eq!(terminal_bg(Some(0x5f1f2a)), Some(0x5f1f2a));
+        assert_eq!(terminal_bg(Some(0x00aa00)), Some(0x00aa00));
     }
 }
