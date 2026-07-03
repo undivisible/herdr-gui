@@ -6,7 +6,8 @@ use crepuscularity_gpui::prelude::*;
 use crepuscularity_gpui::{
     actions, bounds, div, gpui_window_options, point, px, rgb, size, AnyElement, App, Application,
     Context, FocusHandle, Icon, IntoElement, KeyBinding, Keystroke, Menu, MenuItem, MouseButton,
-    Render, ScrollWheelEvent, SystemMenuType, TitlebarOptions, Window, WindowBounds,
+    MouseMoveEvent, Render, ScrollWheelEvent, SystemMenuType, TitlebarOptions, Window,
+    WindowAppearance, WindowBounds,
 };
 use ghostty::{TerminalFrame, TerminalLine, TerminalRun, TerminalSession};
 use herdr::{Agent, HerdrClient, HerdrState, Pane, Tab, Workspace};
@@ -35,7 +36,11 @@ actions!(
         ToggleSpaces,
         ToggleSidebar,
         ToggleAgents,
-        ToggleSidebarLayout
+        ToggleSidebarLayout,
+        ThemeDark,
+        ThemeLight,
+        ThemeSystem,
+        ReloadHerdrConfig
     ]
 );
 
@@ -43,6 +48,26 @@ actions!(
 enum SidebarLayout {
     Warp,
     Arc,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ThemeMode {
+    Dark,
+    Light,
+    System,
+}
+
+#[derive(Clone, Copy)]
+struct UiTheme {
+    bg: u32,
+    panel: u32,
+    terminal: u32,
+    text: u32,
+    label: u32,
+    muted: u32,
+    hover: u32,
+    active: u32,
+    border: u32,
 }
 
 struct HerdrGui {
@@ -60,6 +85,7 @@ struct HerdrGui {
     sidebar_hovered: bool,
     agents_collapsed: bool,
     sidebar_layout: SidebarLayout,
+    theme_mode: ThemeMode,
     scroll_x: f64,
     focus_handle: FocusHandle,
 }
@@ -90,6 +116,7 @@ impl HerdrGui {
             sidebar_hovered: false,
             agents_collapsed: false,
             sidebar_layout: SidebarLayout::Arc,
+            theme_mode: ThemeMode::Dark,
             scroll_x: 0.0,
             focus_handle: cx.focus_handle(),
         }
@@ -125,6 +152,32 @@ impl HerdrGui {
 
     fn toggle_agents(&mut self, _: &ToggleAgents, _window: &mut Window, cx: &mut Context<Self>) {
         self.agents_collapsed = !self.agents_collapsed;
+        cx.notify();
+    }
+
+    fn theme_dark(&mut self, _: &ThemeDark, _window: &mut Window, cx: &mut Context<Self>) {
+        self.theme_mode = ThemeMode::Dark;
+        cx.notify();
+    }
+
+    fn theme_light(&mut self, _: &ThemeLight, _window: &mut Window, cx: &mut Context<Self>) {
+        self.theme_mode = ThemeMode::Light;
+        cx.notify();
+    }
+
+    fn theme_system(&mut self, _: &ThemeSystem, _window: &mut Window, cx: &mut Context<Self>) {
+        self.theme_mode = ThemeMode::System;
+        cx.notify();
+    }
+
+    fn reload_herdr_config(
+        &mut self,
+        _: &ReloadHerdrConfig,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.with_client(HerdrClient::reload_config);
+        self.refresh_state();
         cx.notify();
     }
 
@@ -425,19 +478,43 @@ impl HerdrGui {
         self.scroll_x = 0.0;
         self.focus_workspace_offset(offset, window, cx);
     }
+
+    fn handle_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.sidebar_collapsed && self.sidebar_hovered && event.position.x.to_f64() > 220.0 {
+            self.sidebar_hovered = false;
+            cx.notify();
+        }
+    }
+
+    fn theme(&self, window: &Window) -> UiTheme {
+        match self.theme_mode {
+            ThemeMode::Dark => dark_theme(),
+            ThemeMode::Light => light_theme(),
+            ThemeMode::System => match window.appearance() {
+                WindowAppearance::Light | WindowAppearance::VibrantLight => light_theme(),
+                WindowAppearance::Dark | WindowAppearance::VibrantDark => dark_theme(),
+            },
+        }
+    }
 }
 
 impl Render for HerdrGui {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.attach_focused_terminal(window, cx);
+        let theme = self.theme(window);
         let panes = self.visible_panes();
         let pane_frame = self.terminal_frame.clone();
 
         div()
             .w_full()
             .h_full()
-            .bg(rgb(0x0b0b0b))
-            .text_color(rgb(0xf2f2f2))
+            .bg(rgb(theme.bg))
+            .text_color(rgb(theme.text))
             .flex()
             .key_context("HerdrGui")
             .track_focus(&self.focus_handle)
@@ -459,15 +536,20 @@ impl Render for HerdrGui {
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_agents))
             .on_action(cx.listener(Self::toggle_sidebar_layout))
+            .on_action(cx.listener(Self::theme_dark))
+            .on_action(cx.listener(Self::theme_light))
+            .on_action(cx.listener(Self::theme_system))
+            .on_action(cx.listener(Self::reload_herdr_config))
             .on_scroll_wheel(cx.listener(Self::handle_workspace_scroll))
-            .child(self.sidebar(cx))
+            .on_mouse_move(cx.listener(Self::handle_mouse_move))
+            .child(self.sidebar(theme, cx))
             .child(
                 div()
                     .flex_1()
                     .h_full()
-                    .bg(rgb(0x080808))
+                    .bg(rgb(theme.terminal))
                     .overflow_hidden()
-                    .child(self.pane_grid(panes, pane_frame, cx))
+                    .child(self.pane_grid(panes, pane_frame, theme, cx))
                     .when(self.show_help, |el| el.child(help_overlay())),
             )
     }
@@ -589,11 +671,11 @@ impl HerdrGui {
             .collect()
     }
 
-    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn sidebar(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .w(px(self.sidebar_width() as f32))
             .h_full()
-            .bg(rgb(0x0b0b0b))
+            .bg(rgb(theme.panel))
             .flex()
             .flex_col()
             .overflow_hidden()
@@ -603,52 +685,49 @@ impl HerdrGui {
                     cx.notify();
                 }
             }))
-            .child(space_switcher(self.active_workspace(), cx))
+            .child(space_switcher(self.active_workspace(), theme, cx))
             .when(self.show_spaces, |el| {
-                el.child(
-                    div().flex().flex_col().gap_2().children(
-                        self.state.workspaces.iter().map(|workspace| {
-                            workspace_row(workspace, self.active_workspace_id(), cx)
-                        }),
-                    ),
-                )
+                el.child(div().flex().flex_col().gap_2().children(
+                    self.state.workspaces.iter().map(|workspace| {
+                        workspace_row(workspace, self.active_workspace_id(), theme, cx)
+                    }),
+                ))
             })
             .when(self.sidebar_layout == SidebarLayout::Warp, |el| {
-                el.child(self.warp_sidebar(cx))
+                el.child(self.warp_sidebar(theme, cx))
             })
             .when(self.sidebar_layout == SidebarLayout::Arc, |el| {
-                el.child(self.arc_sidebar(cx))
+                el.child(self.arc_sidebar(theme, cx))
             })
             .into_any_element()
     }
 
-    fn warp_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn warp_sidebar(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .h_full()
             .flex()
             .flex_col()
             .gap_1()
-            .child(section("sessions"))
+            .child(section("sessions", theme))
             .children(
-                self.state
-                    .workspaces
-                    .iter()
-                    .map(|workspace| workspace_row(workspace, self.active_workspace_id(), cx)),
+                self.state.workspaces.iter().map(|workspace| {
+                    workspace_row(workspace, self.active_workspace_id(), theme, cx)
+                }),
             )
             .child(div().flex_1())
-            .child(agent_header(self.agents_collapsed, cx))
+            .child(agent_header(self.agents_collapsed, theme, cx))
             .when(!self.agents_collapsed, |el| {
-                el.children(self.agent_rows(cx))
+                el.children(self.agent_rows(theme, cx))
             })
     }
 
-    fn arc_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn arc_sidebar(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .h_full()
             .flex()
             .flex_col()
             .gap_1()
-            .child(tab_header(cx))
+            .child(tab_header(theme, cx))
             .children(self.visible_tabs().into_iter().map(|tab| {
                 let id = tab.tab_id.clone();
                 let close_id = tab.tab_id.clone();
@@ -661,6 +740,7 @@ impl HerdrGui {
                             .focused_tab_id
                             .as_deref()
                             .is_some_and(|focused| focused == tab.tab_id),
+                    theme,
                     cx.listener(move |this, _, window, cx| {
                         this.focus_tab_id(id.clone(), window, cx)
                     }),
@@ -673,24 +753,24 @@ impl HerdrGui {
                 )
             }))
             .child(div().flex_1())
-            .child(agent_header(self.agents_collapsed, cx))
+            .child(agent_header(self.agents_collapsed, theme, cx))
             .when(!self.agents_collapsed, |el| {
-                el.children(self.agent_rows(cx))
+                el.children(self.agent_rows(theme, cx))
             })
     }
 
-    fn agent_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn agent_rows(&self, theme: UiTheme, cx: &mut Context<Self>) -> Vec<AnyElement> {
         if self.state.agents.is_empty() {
             return self
                 .agent_panes()
                 .into_iter()
-                .map(|pane| pane_agent_row(&pane, &self.state, cx))
+                .map(|pane| pane_agent_row(&pane, &self.state, theme, cx))
                 .collect();
         }
         self.state
             .agents
             .iter()
-            .map(|agent| agent_row(agent, &self.state, cx))
+            .map(|agent| agent_row(agent, &self.state, theme, cx))
             .collect()
     }
 
@@ -698,6 +778,7 @@ impl HerdrGui {
         &self,
         panes: Vec<Pane>,
         pane_frame: TerminalFrame,
+        theme: UiTheme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         if panes.is_empty() {
@@ -707,7 +788,7 @@ impl HerdrGui {
                 .h_full()
                 .items_center()
                 .justify_center()
-                .child(empty_state(&self.status));
+                .child(empty_state(&self.status, theme));
         }
 
         let pane = panes
@@ -716,14 +797,14 @@ impl HerdrGui {
             .or_else(|| panes.first())
             .cloned();
         let Some(pane) = pane else {
-            return div().flex().flex_1().h_full().bg(rgb(0x080808));
+            return div().flex().flex_1().h_full().bg(rgb(theme.terminal));
         };
         let pane_id = pane.pane_id.clone();
         div()
             .flex()
             .flex_1()
             .h_full()
-            .bg(rgb(0x080808))
+            .bg(rgb(theme.terminal))
             .cursor_pointer()
             .on_mouse_down(
                 MouseButton::Left,
@@ -738,7 +819,7 @@ impl HerdrGui {
                     .text_size(px(12.0))
                     .font_family("Menlo")
                     .line_height(px(18.0))
-                    .text_color(rgb(0xc5ceda))
+                    .text_color(rgb(theme.text))
                     .child(terminal_frame(&pane_frame)),
             )
     }
@@ -752,27 +833,31 @@ fn label(text: &str, color: u32) -> impl IntoElement {
         .child(text.to_string())
 }
 
-fn small(text: &str) -> impl IntoElement {
+fn small(text: &str, theme: UiTheme) -> impl IntoElement {
     div()
         .text_size(px(11.0))
-        .text_color(rgb(0x8a8a8a))
+        .text_color(rgb(theme.muted))
         .child(text.to_string())
 }
 
-fn section(text: &str) -> impl IntoElement {
+fn section(text: &str, theme: UiTheme) -> impl IntoElement {
     div()
         .px_2()
         .pt_1()
         .text_size(px(10.0))
-        .text_color(rgb(0x777777))
+        .text_color(rgb(theme.muted))
         .child(text.to_string())
 }
 
-fn icon(name: &'static str, size: f32) -> impl IntoElement {
-    Icon::new(name).size(px(size)).text_color(0xd0d0d0)
+fn icon(name: &'static str, size: f32, theme: UiTheme) -> impl IntoElement {
+    Icon::new(name).size(px(size)).text_color(theme.label)
 }
 
-fn space_switcher(workspace: Option<&Workspace>, cx: &mut Context<HerdrGui>) -> impl IntoElement {
+fn space_switcher(
+    workspace: Option<&Workspace>,
+    theme: UiTheme,
+    cx: &mut Context<HerdrGui>,
+) -> impl IntoElement {
     let name = workspace
         .and_then(|workspace| workspace.label.as_deref())
         .or_else(|| workspace.map(|workspace| workspace.workspace_id.as_str()))
@@ -793,15 +878,15 @@ fn space_switcher(workspace: Option<&Workspace>, cx: &mut Context<HerdrGui>) -> 
                 .items_center()
                 .justify_between()
                 .cursor_pointer()
-                .hover(|style| style.bg(rgb(0x181818)))
+                .hover(move |style| style.bg(rgb(theme.hover)))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, window, cx| {
                         this.toggle_spaces(&ToggleSpaces, window, cx)
                     }),
                 )
-                .child(label(name, 0xf0f0f0))
-                .child(icon("chevron.down", 11.0)),
+                .child(label(name, theme.label))
+                .child(icon("chevron.down", 11.0, theme)),
         )
         .child(
             div()
@@ -811,24 +896,24 @@ fn space_switcher(workspace: Option<&Workspace>, cx: &mut Context<HerdrGui>) -> 
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
-                .hover(|style| style.bg(rgb(0x181818)))
+                .hover(move |style| style.bg(rgb(theme.hover)))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, window, cx| {
                         this.new_workspace(&NewWorkspace, window, cx)
                     }),
                 )
-                .child(icon("plus", 13.0)),
+                .child(icon("plus", 13.0, theme)),
         )
 }
 
-fn tab_header(cx: &mut Context<HerdrGui>) -> impl IntoElement {
+fn tab_header(theme: UiTheme, cx: &mut Context<HerdrGui>) -> impl IntoElement {
     div()
         .pt_1()
         .flex()
         .items_center()
         .justify_between()
-        .child(section("tabs"))
+        .child(section("tabs", theme))
         .child(
             div()
                 .w(px(22.0))
@@ -837,22 +922,22 @@ fn tab_header(cx: &mut Context<HerdrGui>) -> impl IntoElement {
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
-                .hover(|style| style.bg(rgb(0x181818)))
+                .hover(move |style| style.bg(rgb(theme.hover)))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, window, cx| this.new_tab(&NewTab, window, cx)),
                 )
-                .child(icon("plus", 12.0)),
+                .child(icon("plus", 12.0, theme)),
         )
 }
 
-fn agent_header(collapsed: bool, cx: &mut Context<HerdrGui>) -> impl IntoElement {
+fn agent_header(collapsed: bool, theme: UiTheme, cx: &mut Context<HerdrGui>) -> impl IntoElement {
     div()
         .pt_1()
         .flex()
         .items_center()
         .justify_between()
-        .child(section("agents"))
+        .child(section("agents", theme))
         .child(
             div()
                 .w(px(22.0))
@@ -861,7 +946,7 @@ fn agent_header(collapsed: bool, cx: &mut Context<HerdrGui>) -> impl IntoElement
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
-                .hover(|style| style.bg(rgb(0x181818)))
+                .hover(move |style| style.bg(rgb(theme.hover)))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, window, cx| {
@@ -875,6 +960,7 @@ fn agent_header(collapsed: bool, cx: &mut Context<HerdrGui>) -> impl IntoElement
                         "chevron.up"
                     },
                     11.0,
+                    theme,
                 )),
         )
 }
@@ -882,6 +968,7 @@ fn agent_header(collapsed: bool, cx: &mut Context<HerdrGui>) -> impl IntoElement
 fn workspace_row(
     workspace: &Workspace,
     active_workspace_id: Option<&str>,
+    theme: UiTheme,
     cx: &mut Context<HerdrGui>,
 ) -> AnyElement {
     let id = workspace.workspace_id.clone();
@@ -896,10 +983,15 @@ fn workspace_row(
     let on_click =
         cx.listener(move |this, _, window, cx| this.focus_workspace_id(id.clone(), window, cx));
 
-    row(title, detail, focused, on_click).into_any_element()
+    row(title, detail, focused, theme, on_click).into_any_element()
 }
 
-fn pane_agent_row(pane: &Pane, state: &HerdrState, cx: &mut Context<HerdrGui>) -> AnyElement {
+fn pane_agent_row(
+    pane: &Pane,
+    state: &HerdrState,
+    theme: UiTheme,
+    cx: &mut Context<HerdrGui>,
+) -> AnyElement {
     let id = pane.pane_id.clone();
     let title = pane.agent.as_deref().unwrap_or(&pane.pane_id).to_string();
     let status = pane
@@ -915,10 +1007,15 @@ fn pane_agent_row(pane: &Pane, state: &HerdrState, cx: &mut Context<HerdrGui>) -
     let on_click =
         cx.listener(move |this, _, window, cx| this.focus_pane_id(id.clone(), window, cx));
 
-    agent_row_element(title, status, focused, on_click).into_any_element()
+    agent_row_element(title, status, focused, theme, on_click).into_any_element()
 }
 
-fn agent_row(agent: &Agent, state: &HerdrState, cx: &mut Context<HerdrGui>) -> AnyElement {
+fn agent_row(
+    agent: &Agent,
+    state: &HerdrState,
+    theme: UiTheme,
+    cx: &mut Context<HerdrGui>,
+) -> AnyElement {
     let pane_id = agent.pane_id.clone();
     let title = agent
         .display_agent
@@ -947,13 +1044,14 @@ fn agent_row(agent: &Agent, state: &HerdrState, cx: &mut Context<HerdrGui>) -> A
         }
     });
 
-    agent_row_element(title, status, focused, on_click).into_any_element()
+    agent_row_element(title, status, focused, theme, on_click).into_any_element()
 }
 
 fn agent_row_element(
     title: String,
     status: String,
     focused: bool,
+    theme: UiTheme,
     on_click: impl Fn(&crepuscularity_gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     div()
@@ -963,16 +1061,16 @@ fn agent_row_element(
         .items_center()
         .justify_between()
         .cursor_pointer()
-        .hover(|style| style.bg(rgb(0x181818)))
+        .hover(move |style| style.bg(rgb(theme.hover)))
         .on_mouse_down(MouseButton::Left, on_click)
-        .when(focused, |el| el.bg(rgb(0x202020)))
+        .when(focused, |el| el.bg(rgb(theme.active)))
         .child(
             div()
                 .flex()
                 .flex_col()
                 .gap_0p5()
-                .child(label(&title, 0xf0f0f0))
-                .child(small(&status)),
+                .child(label(&title, theme.label))
+                .child(small(&status, theme)),
         )
         .child(div().w(px(8.0)).h(px(8.0)).bg(rgb(status_color(&status))))
         .into_any_element()
@@ -988,10 +1086,39 @@ fn status_color(status: &str) -> u32 {
     }
 }
 
+fn dark_theme() -> UiTheme {
+    UiTheme {
+        bg: 0x0b0b0b,
+        panel: 0x0b0b0b,
+        terminal: 0x080808,
+        text: 0xf2f2f2,
+        label: 0xf0f0f0,
+        muted: 0x8a8a8a,
+        hover: 0x181818,
+        active: 0x202020,
+        border: 0x303030,
+    }
+}
+
+fn light_theme() -> UiTheme {
+    UiTheme {
+        bg: 0xf5f5f5,
+        panel: 0xf5f5f5,
+        terminal: 0xffffff,
+        text: 0x151515,
+        label: 0x111111,
+        muted: 0x6f6f6f,
+        hover: 0xe8e8e8,
+        active: 0xdedede,
+        border: 0xcfcfcf,
+    }
+}
+
 fn row(
     title: String,
     detail: String,
     focused: bool,
+    theme: UiTheme,
     on_click: impl Fn(&crepuscularity_gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     div()
@@ -1001,17 +1128,18 @@ fn row(
         .flex_col()
         .gap_0p5()
         .cursor_pointer()
-        .hover(|style| style.bg(rgb(0x181818)))
+        .hover(move |style| style.bg(rgb(theme.hover)))
         .on_mouse_down(MouseButton::Left, on_click)
-        .when(focused, |el| el.bg(rgb(0x202020)))
-        .child(label(&title, 0xf0f0f0))
-        .child(small(&detail))
+        .when(focused, |el| el.bg(rgb(theme.active)))
+        .child(label(&title, theme.label))
+        .child(small(&detail, theme))
 }
 
 fn tab_row(
     title: String,
     detail: String,
     focused: bool,
+    theme: UiTheme,
     on_click: impl Fn(&crepuscularity_gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
     on_close: impl Fn(&crepuscularity_gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
@@ -1022,16 +1150,16 @@ fn tab_row(
         .items_center()
         .justify_between()
         .cursor_pointer()
-        .hover(|style| style.bg(rgb(0x181818)))
+        .hover(move |style| style.bg(rgb(theme.hover)))
         .on_mouse_down(MouseButton::Left, on_click)
-        .when(focused, |el| el.bg(rgb(0x202020)))
+        .when(focused, |el| el.bg(rgb(theme.active)))
         .child(
             div()
                 .flex()
                 .flex_col()
                 .gap_0p5()
-                .child(label(&title, 0xf0f0f0))
-                .child(small(&detail)),
+                .child(label(&title, theme.label))
+                .child(small(&detail, theme)),
         )
         .child(
             div()
@@ -1040,36 +1168,36 @@ fn tab_row(
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_color(rgb(0xaaaaaa))
-                .hover(|style| style.text_color(rgb(0xffffff)))
+                .text_color(rgb(theme.muted))
+                .hover(move |style| style.text_color(rgb(theme.text)))
                 .on_mouse_down(MouseButton::Left, on_close)
-                .child(icon("xmark", 10.0)),
+                .child(icon("xmark", 10.0, theme)),
         )
 }
 
-fn empty_state(status: &str) -> impl IntoElement {
+fn empty_state(status: &str, theme: UiTheme) -> impl IntoElement {
     div()
         .w(px(560.0))
         .rounded_lg()
-        .bg(rgb(0x111111))
+        .bg(rgb(theme.panel))
         .border_1()
-        .border_color(rgb(0x303030))
+        .border_color(rgb(theme.border))
         .p_5()
         .flex()
         .flex_col()
         .gap_3()
-        .child(label("No Herdr panes visible", 0xf8fafc))
-        .child(small(status))
+        .child(label("No Herdr panes visible", theme.label))
+        .child(small(status, theme))
         .child(
             div()
                 .rounded_lg()
-                .bg(rgb(0x080808))
+                .bg(rgb(theme.terminal))
                 .border_1()
-                .border_color(rgb(0x222222))
+                .border_color(rgb(theme.border))
                 .p_3()
                 .font_family("Menlo")
                 .text_size(px(12.0))
-                .text_color(rgb(0xb8b8b8))
+                .text_color(rgb(theme.text))
                 .child("Open Herdr in a terminal, create a workspace/pane, then press Refresh."),
         )
 }
@@ -1110,13 +1238,14 @@ fn kbd_hint(text: &str) -> impl IntoElement {
 }
 
 fn key_row(key: &str, action: &str) -> impl IntoElement {
+    let theme = dark_theme();
     div()
         .flex()
         .items_center()
         .justify_between()
         .gap_6()
         .child(kbd_hint(key))
-        .child(small(action))
+        .child(small(action, theme))
 }
 
 fn help_overlay() -> impl IntoElement {
@@ -1159,6 +1288,7 @@ fn main() {
                     MenuItem::action("New Workspace", NewWorkspace),
                     MenuItem::action("New Tab", NewTab),
                     MenuItem::action("Close Tab", CloseTab),
+                    MenuItem::action("Reload Config", ReloadHerdrConfig),
                     MenuItem::action("Previous Workspace", PreviousWorkspace),
                     MenuItem::action("Next Workspace", NextWorkspace),
                 ],
@@ -1171,6 +1301,10 @@ fn main() {
                     MenuItem::action("Toggle Sidebar", ToggleSidebar),
                     MenuItem::action("Toggle Agents", ToggleAgents),
                     MenuItem::action("Toggle Sidebar Layout", ToggleSidebarLayout),
+                    MenuItem::separator(),
+                    MenuItem::action("Theme: System", ThemeSystem),
+                    MenuItem::action("Theme: Dark", ThemeDark),
+                    MenuItem::action("Theme: Light", ThemeLight),
                 ],
             },
         ]);
@@ -1182,6 +1316,7 @@ fn main() {
             KeyBinding::new("cmd-b", ToggleSidebar, None),
             KeyBinding::new("cmd-shift-a", ToggleAgents, None),
             KeyBinding::new("cmd-shift-l", ToggleSidebarLayout, None),
+            KeyBinding::new("cmd-shift-r", ReloadHerdrConfig, None),
             KeyBinding::new("cmd-t", NewTab, None),
             KeyBinding::new("cmd-w", CloseTab, None),
             KeyBinding::new("cmd-]", SplitRight, None),

@@ -333,6 +333,11 @@ impl HerdrClient {
         Ok(())
     }
 
+    pub fn reload_config(&self) -> Result<(), HerdrError> {
+        let _: Value = self.call("server.reload_config", json!({}))?;
+        Ok(())
+    }
+
     fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T, HerdrError> {
         let mut stream = UnixStream::connect(&self.socket_path).map_err(|err| {
             HerdrError::SocketUnavailable(self.socket_path.display().to_string(), err.to_string())

@@ -723,7 +723,10 @@ fn ghostty_roots() -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{push_run, terminal_bg, trim_line, GhosttyRuntime, TerminalLine, TerminalRun};
+    use super::{
+        push_run, terminal_bg, trim_line, GhosttyRuntime, GhosttyTerminal, TerminalFrame,
+        TerminalLine, TerminalRun,
+    };
 
     #[test]
     fn detect_should_find_local_ghostty_checkout() {
@@ -755,5 +758,42 @@ mod tests {
         assert_eq!(terminal_bg(Some(0x303743)), None);
         assert_eq!(terminal_bg(Some(0x5f1f2a)), Some(0x5f1f2a));
         assert_eq!(terminal_bg(Some(0x00aa00)), Some(0x00aa00));
+    }
+
+    #[test]
+    fn ghostty_frame_preserves_ansi_backgrounds() {
+        let Ok(runtime) = GhosttyRuntime::detect() else {
+            return;
+        };
+        let Ok(api) = runtime.load_api() else {
+            return;
+        };
+        let mut terminal = match GhosttyTerminal::new(api, 12, 3) {
+            Ok(terminal) => terminal,
+            Err(err) => panic!("{err}"),
+        };
+        terminal.write(b"\x1b[42mgreen\x1b[0m\r\n\x1b[7mreverse\x1b[0m");
+        let frame = match terminal.frame() {
+            Ok(frame) => frame,
+            Err(err) => panic!("{err}"),
+        };
+
+        assert!(has_background(&frame, "green"));
+        assert!(has_text(&frame, "reverse"));
+    }
+
+    fn has_background(frame: &TerminalFrame, text: &str) -> bool {
+        frame.lines.iter().any(|line| {
+            line.runs
+                .iter()
+                .any(|run| run.text.contains(text) && run.bg.is_some())
+        })
+    }
+
+    fn has_text(frame: &TerminalFrame, text: &str) -> bool {
+        frame
+            .lines
+            .iter()
+            .any(|line| line.runs.iter().any(|run| run.text.contains(text)))
     }
 }
