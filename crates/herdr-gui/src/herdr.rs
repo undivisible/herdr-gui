@@ -17,8 +17,6 @@ pub enum HerdrError {
     InstallFailed(String),
     #[error("herdr socket unavailable at {0}: {1}")]
     SocketUnavailable(String, String),
-    #[error("herdr command failed: {0}")]
-    CommandFailed(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
@@ -28,11 +26,10 @@ pub enum HerdrError {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct Snapshot {
+pub struct HerdrState {
     pub workspaces: Vec<Workspace>,
     pub tabs: Vec<Tab>,
     pub panes: Vec<Pane>,
-    pub pane_text: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -62,6 +59,8 @@ pub struct Tab {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Pane {
     pub pane_id: String,
+    #[serde(default)]
+    pub terminal_id: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
     #[serde(default)]
@@ -128,23 +127,14 @@ impl HerdrClient {
         Ok(())
     }
 
-    pub fn snapshot(&self) -> Result<Snapshot, HerdrError> {
+    pub fn state(&self) -> Result<HerdrState, HerdrError> {
         let workspaces: WorkspaceList = self.call("workspace.list", json!({}))?;
         let tabs: TabList = self.call("tab.list", json!({}))?;
         let panes: PaneList = self.call("pane.list", json!({}))?;
-        let pane_text = panes
-            .panes
-            .iter()
-            .find(|pane| pane.focused)
-            .or_else(|| panes.panes.first())
-            .map(|pane| self.read_pane(&pane.pane_id))
-            .transpose()?
-            .unwrap_or_default();
-        Ok(Snapshot {
+        Ok(HerdrState {
             workspaces: workspaces.workspaces,
             tabs: tabs.tabs,
             panes: panes.panes,
-            pane_text,
         })
     }
 
@@ -169,8 +159,31 @@ impl HerdrClient {
         Ok(())
     }
 
+    pub fn focus_workspace(&self, workspace_id: &str) -> Result<(), HerdrError> {
+        let _: Value = self.call("workspace.focus", json!({ "workspace_id": workspace_id }))?;
+        Ok(())
+    }
+
+    pub fn focus_tab(&self, tab_id: &str) -> Result<(), HerdrError> {
+        let _: Value = self.call("tab.focus", json!({ "tab_id": tab_id }))?;
+        Ok(())
+    }
+
+    pub fn focus_pane(&self, pane_id: &str) -> Result<(), HerdrError> {
+        let _: Value = self.call("pane.focus", json!({ "pane_id": pane_id }))?;
+        Ok(())
+    }
+
     pub fn send_key(&self, pane_id: &str, key: &str) -> Result<(), HerdrError> {
         let _: Value = self.call("pane.send_keys", json!({ "pane_id": pane_id, "keys": key }))?;
+        Ok(())
+    }
+
+    pub fn send_text(&self, pane_id: &str, text: &str) -> Result<(), HerdrError> {
+        let _: Value = self.call(
+            "pane.send_text",
+            json!({ "pane_id": pane_id, "text": text }),
+        )?;
         Ok(())
     }
 
@@ -185,21 +198,6 @@ impl HerdrClient {
     pub fn focus_right(&self) -> Result<(), HerdrError> {
         let _: Value = self.call("pane.focus_direction", json!({ "direction": "right" }))?;
         Ok(())
-    }
-
-    fn read_pane(&self, pane_id: &str) -> Result<String, HerdrError> {
-        let output = Command::new("herdr")
-            .args([
-                "pane", "read", pane_id, "--source", "recent", "--lines", "80",
-            ])
-            .output()?;
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-        } else {
-            Err(HerdrError::CommandFailed(
-                String::from_utf8_lossy(&output.stderr).into_owned(),
-            ))
-        }
     }
 
     fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T, HerdrError> {
@@ -307,12 +305,13 @@ mod tests {
         );
         let tabs: TabList = parse_json(r#"{"type":"tab_list","tabs":[{"tab_id":"w1:t1"}]}"#);
         let panes: PaneList = parse_json(
-            r#"{"type":"pane_list","panes":[{"pane_id":"w1:p1","agent_status":"working"}]}"#,
+            r#"{"type":"pane_list","panes":[{"pane_id":"w1:p1","terminal_id":"term_1","agent_status":"working"}]}"#,
         );
 
         assert_eq!(workspaces.workspaces[0].workspace_id, "w1");
         assert_eq!(tabs.tabs[0].tab_id, "w1:t1");
         assert_eq!(panes.panes[0].agent_status.as_deref(), Some("working"));
+        assert_eq!(panes.panes[0].terminal_id.as_deref(), Some("term_1"));
     }
 
     fn parse_json<T: serde::de::DeserializeOwned>(json: &str) -> T {

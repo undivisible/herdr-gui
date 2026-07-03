@@ -5,10 +5,12 @@ use crepuscularity_gpui as gpui;
 use crepuscularity_gpui::prelude::*;
 use crepuscularity_gpui::{
     actions, bounds, div, gpui_window_options, point, px, rgb, size, App, Application, Context,
-    FocusHandle, IntoElement, KeyBinding, Render, SharedString, Window, WindowBounds,
+    FocusHandle, IntoElement, KeyBinding, Keystroke, MouseButton, Render, SharedString, Window,
+    WindowBounds,
 };
-use ghostty::GhosttyRuntime;
-use herdr::{HerdrClient, Pane, Snapshot};
+use ghostty::{GhosttyRuntime, TerminalSession};
+use herdr::{HerdrClient, HerdrState, Pane};
+use std::{sync::mpsc::Receiver, time::Duration};
 
 actions!(
     herdr_gui,
@@ -19,15 +21,17 @@ actions!(
         SplitDown,
         FocusRight,
         ResizeRight,
-        SendEnter,
         ClosePane
     ]
 );
 
 struct HerdrGui {
     client: Option<HerdrClient>,
-    ghostty: Result<GhosttyRuntime, String>,
-    snapshot: Snapshot,
+    ghostty_status: String,
+    terminal: Option<TerminalSession>,
+    terminal_target: Option<String>,
+    terminal_text: String,
+    state: HerdrState,
     status: String,
     show_help: bool,
     focus_handle: FocusHandle,
@@ -35,22 +39,30 @@ struct HerdrGui {
 
 impl HerdrGui {
     fn new(cx: &mut Context<Self>) -> Self {
-        let ghostty = GhosttyRuntime::detect();
-        let (client, snapshot, status) = match HerdrClient::bootstrap() {
-            Ok(client) => match client.snapshot() {
-                Ok(snapshot) => (Some(client), snapshot, "connected".to_string()),
-                Err(err) => (Some(client), Snapshot::default(), err.to_string()),
-            },
-            Err(err) => (None, Snapshot::default(), err.to_string()),
+        let ghostty_status = match GhosttyRuntime::detect() {
+            Ok(runtime) => format!("Ghostty VT · {}", runtime.root.display()),
+            Err(err) => err,
         };
-        Self {
+        let (client, state, status) = match HerdrClient::bootstrap() {
+            Ok(client) => match client.state() {
+                Ok(state) => (Some(client), state, "connected".to_string()),
+                Err(err) => (Some(client), HerdrState::default(), err.to_string()),
+            },
+            Err(err) => (None, HerdrState::default(), err.to_string()),
+        };
+        let mut app = Self {
             client,
-            ghostty,
-            snapshot,
+            ghostty_status,
+            terminal: None,
+            terminal_target: None,
+            terminal_text: String::new(),
+            state,
             status,
             show_help: false,
             focus_handle: cx.focus_handle(),
-        }
+        };
+        app.attach_focused_terminal(cx);
+        app
     }
 
     fn toggle_help(&mut self, _: &ToggleHelp, _window: &mut Window, cx: &mut Context<Self>) {
@@ -59,54 +71,101 @@ impl HerdrGui {
     }
 
     fn refresh(&mut self, _: &Refresh, _window: &mut Window, cx: &mut Context<Self>) {
-        self.refresh_snapshot();
+        self.refresh_state();
+        self.attach_focused_terminal(cx);
         cx.notify();
     }
 
     fn split_right(&mut self, _: &SplitRight, _window: &mut Window, cx: &mut Context<Self>) {
         self.with_first_pane(|client, pane| client.split_right(&pane.pane_id));
-        self.refresh_snapshot();
+        self.refresh_state();
         cx.notify();
     }
 
     fn split_down(&mut self, _: &SplitDown, _window: &mut Window, cx: &mut Context<Self>) {
         self.with_first_pane(|client, pane| client.split_down(&pane.pane_id));
-        self.refresh_snapshot();
+        self.refresh_state();
         cx.notify();
     }
 
     fn focus_right(&mut self, _: &FocusRight, _window: &mut Window, cx: &mut Context<Self>) {
         self.with_client(HerdrClient::focus_right);
-        self.refresh_snapshot();
+        self.refresh_state();
+        self.attach_focused_terminal(cx);
         cx.notify();
     }
 
     fn resize_right(&mut self, _: &ResizeRight, _window: &mut Window, cx: &mut Context<Self>) {
         self.with_first_pane(|client, pane| client.resize_right(&pane.pane_id));
-        self.refresh_snapshot();
-        cx.notify();
-    }
-
-    fn send_enter(&mut self, _: &SendEnter, _window: &mut Window, cx: &mut Context<Self>) {
-        self.with_first_pane(|client, pane| client.send_key(&pane.pane_id, "enter"));
-        self.refresh_snapshot();
+        self.refresh_state();
         cx.notify();
     }
 
     fn close_pane(&mut self, _: &ClosePane, _window: &mut Window, cx: &mut Context<Self>) {
         self.with_first_pane(|client, pane| client.close_pane(&pane.pane_id));
-        self.refresh_snapshot();
+        self.refresh_state();
         cx.notify();
     }
 
-    fn refresh_snapshot(&mut self) {
+    fn focus_workspace_id(&mut self, workspace_id: String, cx: &mut Context<Self>) {
+        self.with_client(|client| client.focus_workspace(&workspace_id));
+        self.refresh_state();
+        self.attach_focused_terminal(cx);
+        cx.notify();
+    }
+
+    fn focus_tab_id(&mut self, tab_id: String, cx: &mut Context<Self>) {
+        self.with_client(|client| client.focus_tab(&tab_id));
+        self.refresh_state();
+        self.attach_focused_terminal(cx);
+        cx.notify();
+    }
+
+    fn focus_pane_id(&mut self, pane_id: String, cx: &mut Context<Self>) {
+        self.with_client(|client| client.focus_pane(&pane_id));
+        self.refresh_state();
+        self.attach_focused_terminal(cx);
+        cx.notify();
+    }
+
+    fn refresh_state(&mut self) {
         if let Some(client) = &self.client {
-            match client.snapshot() {
-                Ok(snapshot) => {
-                    self.snapshot = snapshot;
+            match client.state() {
+                Ok(state) => {
+                    self.state = state;
                     self.status = "connected".to_string();
                 }
                 Err(err) => self.status = err.to_string(),
+            }
+        }
+    }
+
+    fn attach_focused_terminal(&mut self, cx: &mut Context<Self>) {
+        let target = self
+            .focused_pane()
+            .and_then(|pane| pane.terminal_id.clone())
+            .or_else(|| self.focused_pane().map(|pane| pane.pane_id.clone()));
+        if target.is_none() || target == self.terminal_target {
+            return;
+        }
+        let target = match target {
+            Some(target) => target,
+            None => return,
+        };
+        match TerminalSession::attach(&target, 120, 40) {
+            Ok(mut session) => {
+                if let Some(receiver) = session.output.take() {
+                    self.terminal = Some(session);
+                    self.terminal_target = Some(target);
+                    self.status = "connected".to_string();
+                    poll_terminal(receiver, cx);
+                }
+            }
+            Err(err) => {
+                self.terminal = None;
+                self.terminal_target = None;
+                self.terminal_text = err.clone();
+                self.status = err;
             }
         }
     }
@@ -123,9 +182,37 @@ impl HerdrGui {
         &mut self,
         f: impl FnOnce(&HerdrClient, &Pane) -> Result<(), herdr::HerdrError>,
     ) {
-        let pane = self.snapshot.panes.first().cloned();
+        let pane = self.focused_pane().cloned();
         if let (Some(client), Some(pane)) = (&self.client, pane) {
             if let Err(err) = f(client, &pane) {
+                self.status = err.to_string();
+            }
+        }
+    }
+
+    fn focused_pane(&self) -> Option<&Pane> {
+        self.state
+            .panes
+            .iter()
+            .find(|pane| pane.focused)
+            .or_else(|| self.state.panes.first())
+    }
+
+    fn handle_keystroke(&mut self, key: &Keystroke) {
+        let Some(bytes) = terminal_bytes(key) else {
+            return;
+        };
+        if let Some(terminal) = &self.terminal {
+            if terminal.input.send(bytes).is_err() {
+                self.status = "terminal input disconnected".to_string();
+            }
+        } else if let (Some(client), Some(pane)) = (&self.client, self.focused_pane().cloned()) {
+            let result = if let Some(text) = key.key_char.as_deref() {
+                client.send_text(&pane.pane_id, text)
+            } else {
+                client.send_key(&pane.pane_id, key_name(key))
+            };
+            if let Err(err) = result {
                 self.status = err.to_string();
             }
         }
@@ -134,22 +221,14 @@ impl HerdrGui {
 
 impl Render for HerdrGui {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let ghostty_status = match &self.ghostty {
-            Ok(runtime) => format!("Ghostty VT · {}", runtime.root.display()),
-            Err(err) => err.clone(),
-        };
-        let panes = self.snapshot.panes.clone();
-        let pane_text = if self.ghostty.is_ok() {
-            self.snapshot.pane_text.clone()
-        } else {
-            ghostty_status.clone()
-        };
+        let panes = self.state.panes.clone();
+        let pane_text = self.terminal_text.clone();
 
         div()
             .w_full()
             .h_full()
-            .bg(rgb(0x07080d))
-            .text_color(rgb(0xf4f6fb))
+            .bg(rgb(0x1f242e))
+            .text_color(rgb(0xd7dde8))
             .flex()
             .key_context("HerdrGui")
             .track_focus(&self.focus_handle)
@@ -159,7 +238,6 @@ impl Render for HerdrGui {
             .on_action(cx.listener(Self::split_down))
             .on_action(cx.listener(Self::focus_right))
             .on_action(cx.listener(Self::resize_right))
-            .on_action(cx.listener(Self::send_enter))
             .on_action(cx.listener(Self::close_pane))
             .child(self.sidebar(cx))
             .child(
@@ -168,14 +246,14 @@ impl Render for HerdrGui {
                     .flex_col()
                     .flex_1()
                     .h_full()
-                    .bg(rgb(0x0a0d14))
-                    .child(self.toolbar(ghostty_status))
+                    .bg(rgb(0x252b35))
+                    .child(self.toolbar())
                     .child(
                         div()
                             .flex()
                             .flex_1()
                             .overflow_hidden()
-                            .child(self.pane_grid(panes, pane_text))
+                            .child(self.pane_grid(panes, pane_text, cx))
                             .when(self.show_help, |el| el.child(help_overlay())),
                     ),
             )
@@ -183,29 +261,30 @@ impl Render for HerdrGui {
 }
 
 impl HerdrGui {
-    fn sidebar(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .w(px(236.0))
+            .w(px(228.0))
             .h_full()
             .border_r_1()
-            .border_color(rgb(0x202633))
-            .bg(rgb(0x0d1118))
-            .p_3()
+            .border_color(rgb(0x343b48))
+            .bg(rgb(0x222832))
+            .p_2()
             .flex()
             .flex_col()
-            .gap_3()
+            .gap_2()
             .child(
                 div()
+                    .h(px(26.0))
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(label("Sessions", 0xf8fafc))
+                    .child(section("spaces"))
                     .child(status_dot(&self.status)),
             )
             .child(status_band(&self.status))
-            .child(section("Workspaces"))
-            .children(self.snapshot.workspaces.iter().map(|workspace| {
-                item(
+            .children(self.state.workspaces.iter().map(|workspace| {
+                let id = workspace.workspace_id.clone();
+                row(
                     workspace
                         .label
                         .as_deref()
@@ -217,35 +296,67 @@ impl HerdrGui {
                         .unwrap_or("unknown")
                         .to_string(),
                     workspace.focused,
+                    cx.listener(move |this, _, _, cx| this.focus_workspace_id(id.clone(), cx)),
                 )
             }))
-            .child(section("Tabs"))
-            .children(self.snapshot.tabs.iter().map(|tab| {
-                item(
+            .child(section("tabs"))
+            .children(self.state.tabs.iter().map(|tab| {
+                let id = tab.tab_id.clone();
+                row(
                     tab.label.as_deref().unwrap_or(&tab.tab_id).to_string(),
                     tab.agent_status
                         .as_deref()
                         .unwrap_or(&tab.tab_id)
                         .to_string(),
                     tab.focused,
+                    cx.listener(move |this, _, _, cx| this.focus_tab_id(id.clone(), cx)),
+                )
+            }))
+            .child(section("panes"))
+            .children(self.state.panes.iter().map(|pane| {
+                let id = pane.pane_id.clone();
+                row(
+                    pane.agent
+                        .as_deref()
+                        .or(pane.label.as_deref())
+                        .unwrap_or(&pane.pane_id)
+                        .to_string(),
+                    pane.agent_status
+                        .as_deref()
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    pane.focused,
+                    cx.listener(move |this, _, _, cx| this.focus_pane_id(id.clone(), cx)),
                 )
             }))
     }
 
-    fn toolbar(&self, ghostty_status: String) -> impl IntoElement {
+    fn toolbar(&self) -> impl IntoElement {
         div()
-            .h(px(42.0))
+            .h(px(34.0))
             .border_b_1()
-            .border_color(rgb(0x202633))
+            .border_color(rgb(0x343b48))
             .px_4()
             .flex()
             .items_center()
             .justify_between()
-            .child(kbd_hint("F1 help"))
-            .child(small(&ghostty_status))
+            .child(small("herdr"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(small(&self.ghostty_status))
+                    .child(kbd_hint("F1")),
+            )
     }
 
-    fn pane_grid(&self, panes: Vec<Pane>, pane_text: String) -> impl IntoElement {
+    fn pane_grid(
+        &self,
+        panes: Vec<Pane>,
+        pane_text: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         if panes.is_empty() {
             return div()
                 .flex()
@@ -260,34 +371,41 @@ impl HerdrGui {
             .flex()
             .flex_1()
             .h_full()
-            .p_5()
-            .gap_4()
+            .p_3()
+            .gap_3()
             .children(panes.into_iter().map(|pane| {
+                let pane_id = pane.pane_id.clone();
                 div()
                     .flex_1()
                     .h_full()
-                    .bg(rgb(0x080a0f))
+                    .bg(rgb(0x151922))
                     .border_1()
                     .border_color(if pane.focused {
-                        rgb(0x6ea8ff)
+                        rgb(0x5f86d9)
                     } else {
-                        rgb(0x2a3240)
+                        rgb(0x303846)
                     })
-                    .rounded_xl()
+                    .rounded_lg()
                     .flex()
                     .flex_col()
+                    .cursor_pointer()
+                    .hover(|style| style.border_color(rgb(0x6f7d94)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.focus_pane_id(pane_id.clone(), cx)),
+                    )
                     .child(
                         div()
-                            .h(px(42.0))
-                            .px_4()
+                            .h(px(32.0))
+                            .px_3()
                             .flex()
                             .items_center()
                             .justify_between()
                             .border_b_1()
-                            .border_color(rgb(0x202633))
+                            .border_color(rgb(0x303846))
                             .child(label(
-                                pane.agent.as_deref().unwrap_or(&pane.pane_id),
-                                0xf8fafc,
+                                pane.terminal_id.as_deref().unwrap_or(&pane.pane_id),
+                                0xd7dde8,
                             ))
                             .child(status(pane.agent_status.as_deref().unwrap_or("unknown"))),
                     )
@@ -295,12 +413,16 @@ impl HerdrGui {
                         div()
                             .flex_1()
                             .overflow_hidden()
-                            .p_4()
+                            .p_3()
                             .text_size(px(12.0))
                             .font_family("Menlo")
                             .line_height(px(18.0))
-                            .text_color(rgb(0xcbd5e1))
-                            .child(SharedString::from(pane_text.clone())),
+                            .text_color(rgb(0xc5ceda))
+                            .child(SharedString::from(if pane.focused {
+                                pane_text.clone()
+                            } else {
+                                String::new()
+                            })),
                     )
             }))
     }
@@ -329,35 +451,35 @@ fn section(text: &str) -> impl IntoElement {
         .child(text.to_string())
 }
 
-fn item(title: String, detail: String, focused: bool) -> impl IntoElement {
+fn row(
+    title: String,
+    detail: String,
+    focused: bool,
+    on_click: impl Fn(&crepuscularity_gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
     div()
         .rounded_md()
         .bg(if focused {
-            rgb(0x172033)
+            rgb(0x303847)
         } else {
-            rgb(0x111722)
-        })
-        .border_1()
-        .border_color(if focused {
-            rgb(0x6ea8ff)
-        } else {
-            rgb(0x222a38)
+            rgb(0x242b36)
         })
         .px_3()
         .py_2()
         .flex()
         .flex_col()
         .gap_0p5()
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(0x343c4b)))
+        .on_mouse_down(MouseButton::Left, on_click)
         .child(label(&title, 0xe2e8f0))
         .child(small(&detail))
 }
 
 fn status_band(text: &str) -> impl IntoElement {
     div()
-        .rounded_lg()
-        .bg(rgb(0x111722))
-        .border_1()
-        .border_color(rgb(0x222a38))
+        .rounded_md()
+        .bg(rgb(0x1d232d))
         .px_3()
         .py_2()
         .text_size(px(12.0))
@@ -384,10 +506,10 @@ fn status_dot(text: &str) -> impl IntoElement {
 fn empty_state(status: &str) -> impl IntoElement {
     div()
         .w(px(560.0))
-        .rounded_xl()
-        .bg(rgb(0x111722))
+        .rounded_lg()
+        .bg(rgb(0x242b36))
         .border_1()
-        .border_color(rgb(0x293241))
+        .border_color(rgb(0x343b48))
         .p_5()
         .flex()
         .flex_col()
@@ -410,10 +532,10 @@ fn empty_state(status: &str) -> impl IntoElement {
 
 fn kbd_hint(text: &str) -> impl IntoElement {
     div()
-        .rounded_md()
-        .bg(rgb(0x111722))
+        .rounded_sm()
+        .bg(rgb(0x303847))
         .border_1()
-        .border_color(rgb(0x222a38))
+        .border_color(rgb(0x475266))
         .px_2()
         .py_1()
         .text_size(px(11.0))
@@ -447,13 +569,12 @@ fn help_overlay() -> impl IntoElement {
         .gap_2()
         .child(label("Keys", 0xf8fafc))
         .child(key_row("F1", "toggle help"))
-        .child(key_row("R", "refresh"))
-        .child(key_row("V", "split right"))
-        .child(key_row("H", "split down"))
+        .child(key_row("Cmd R", "refresh"))
+        .child(key_row("Cmd ]", "split right"))
+        .child(key_row("Cmd Shift ]", "split down"))
         .child(key_row("→", "focus right"))
         .child(key_row("Shift →", "resize right"))
-        .child(key_row("Enter", "send enter"))
-        .child(key_row("X", "close pane"))
+        .child(key_row("Cmd W", "close pane"))
 }
 
 fn status(text: &str) -> impl IntoElement {
@@ -483,13 +604,12 @@ fn main() {
     Application::new().run(|cx: &mut App| {
         cx.bind_keys([
             KeyBinding::new("f1", ToggleHelp, None),
-            KeyBinding::new("r", Refresh, None),
-            KeyBinding::new("v", SplitRight, None),
-            KeyBinding::new("h", SplitDown, None),
+            KeyBinding::new("cmd-r", Refresh, None),
+            KeyBinding::new("cmd-]", SplitRight, None),
+            KeyBinding::new("cmd-shift-]", SplitDown, None),
             KeyBinding::new("right", FocusRight, None),
             KeyBinding::new("shift-right", ResizeRight, None),
-            KeyBinding::new("enter", SendEnter, None),
-            KeyBinding::new("x", ClosePane, None),
+            KeyBinding::new("cmd-w", ClosePane, None),
         ]);
 
         let options = gpui_window_options(
@@ -501,7 +621,79 @@ fn main() {
             ))),
             Some(size(px(920.0), px(600.0))),
         );
-        let _ = cx.open_window(options, |_window, cx| cx.new(HerdrGui::new));
+        let window = cx.open_window(options, |_window, cx| cx.new(HerdrGui::new));
+        if let Ok(window) = window {
+            let view = window.update(cx, |_, _, cx| cx.entity());
+            if let Ok(view) = view {
+                cx.observe_keystrokes(move |event, _, cx| {
+                    view.update(cx, |view, cx| {
+                        view.handle_keystroke(&event.keystroke);
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+        }
         cx.activate(true);
     });
+}
+
+fn poll_terminal(receiver: Receiver<String>, cx: &mut Context<HerdrGui>) {
+    cx.spawn(async move |this, cx| loop {
+        cx.background_executor()
+            .timer(Duration::from_millis(33))
+            .await;
+        let mut latest = None;
+        while let Ok(text) = receiver.try_recv() {
+            latest = Some(text);
+        }
+        if let Some(text) = latest {
+            if this
+                .update(cx, |view, cx| {
+                    view.terminal_text = text;
+                    cx.notify();
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+    .detach();
+}
+
+fn terminal_bytes(key: &Keystroke) -> Option<Vec<u8>> {
+    if key.modifiers.platform {
+        return None;
+    }
+    if key.modifiers.control {
+        let text = key.key_char.as_deref().or(Some(key.key.as_str()))?;
+        let byte = text.as_bytes().first().copied()?;
+        return Some(vec![byte & 0x1f]);
+    }
+    match key.key.as_str() {
+        "enter" => Some(b"\r".to_vec()),
+        "backspace" => Some(vec![0x7f]),
+        "tab" => Some(b"\t".to_vec()),
+        "escape" => Some(vec![0x1b]),
+        "up" => Some(b"\x1b[A".to_vec()),
+        "down" => Some(b"\x1b[B".to_vec()),
+        "right" => Some(b"\x1b[C".to_vec()),
+        "left" => Some(b"\x1b[D".to_vec()),
+        _ => key.key_char.as_ref().map(|text| text.as_bytes().to_vec()),
+    }
+}
+
+fn key_name(key: &Keystroke) -> &str {
+    match key.key.as_str() {
+        "enter" => "enter",
+        "backspace" => "backspace",
+        "tab" => "tab",
+        "escape" => "escape",
+        "up" => "up",
+        "down" => "down",
+        "right" => "right",
+        "left" => "left",
+        _ => key.key.as_str(),
+    }
 }

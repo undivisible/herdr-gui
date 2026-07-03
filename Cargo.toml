@@ -22,7 +22,9 @@ unwrap_used = "deny"
 expect_used = "deny"
 
 [dependencies]
-crepuscularity-gpui = { path = "/Users/undivisible/projects/crepuscularity/crates/crepuscularity-gpui", features = ["macos"] }
+crepuscularity-gpui = { version = "0.5.0", features = ["macos"] }
+libloading = "0.8"
+portable-pty = "0.9.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
