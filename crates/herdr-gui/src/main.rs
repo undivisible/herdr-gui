@@ -463,12 +463,11 @@ impl HerdrGui {
                             }
                         }
                     }
-                    let min_weight = frame_weight(&self.terminal_frame);
                     self.terminal = Some(session);
                     self.terminal_target = Some(target.clone());
                     self.terminal_size = Some(size);
                     self.status = "connected".to_string();
-                    poll_terminal(receiver, token, target, min_weight, cx);
+                    poll_terminal(receiver, token, target, cx);
                 }
             }
             Err(err) => {
@@ -1004,7 +1003,7 @@ impl HerdrGui {
             0.0
         };
         let height = (size.height.to_f64() - top_tabs_height).max(240.0);
-        let cols = (width / 7.5).floor().clamp(40.0, 500.0) as u16;
+        let cols = (width / 7.2).floor().clamp(40.0, 500.0) as u16;
         let rows = (height / 18.0).floor().clamp(12.0, 180.0) as u16;
         (cols, rows, width.round() as u16, height.round() as u16)
     }
@@ -1184,7 +1183,7 @@ impl HerdrGui {
                     .font_family("Menlo")
                     .line_height(px(18.0))
                     .text_color(rgb(theme.text))
-                    .child(terminal_frame(&pane_frame)),
+                    .child(terminal_frame(&pane_frame, theme.terminal)),
             )
     }
 }
@@ -1809,7 +1808,6 @@ fn poll_terminal(
     receiver: Receiver<TerminalFrame>,
     token: u64,
     target: String,
-    min_weight: usize,
     cx: &mut Context<HerdrGui>,
 ) {
     cx.spawn(async move |this, cx| loop {
@@ -1834,9 +1832,7 @@ fn poll_terminal(
                     if view.terminal_token != token {
                         return;
                     }
-                    if min_weight > 0 && frame_weight(&frame) < min_weight {
-                        return;
-                    }
+
                     view.terminal_frames.insert(target.clone(), frame.clone());
                     view.terminal_frame = frame;
                     cx.notify();
@@ -1862,13 +1858,4 @@ fn poll_terminal(
         }
     })
     .detach();
-}
-
-fn frame_weight(frame: &TerminalFrame) -> usize {
-    frame
-        .lines
-        .iter()
-        .flat_map(|line| line.runs.iter())
-        .map(|run| run.text.len())
-        .sum()
 }

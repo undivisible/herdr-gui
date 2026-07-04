@@ -251,6 +251,9 @@ impl TerminalSession {
             pixel_height,
         };
         let _ = self.master.resize(size);
+        if let Ok(mut terminal) = self.terminal.lock() {
+            let _ = terminal.resize(size);
+        }
         let _ = self.resize_tx.send(size);
     }
 
@@ -423,7 +426,6 @@ impl GhosttyTerminal {
                 };
                 push_run(&mut line.runs, text, fg, bg);
             }
-            trim_line(&mut line);
             lines.push(line);
             y = y.saturating_add(1);
         }
@@ -695,6 +697,7 @@ fn push_run(runs: &mut Vec<TerminalRun>, text: String, fg: u32, bg: Option<u32>)
     runs.push(TerminalRun { text, fg, bg });
 }
 
+#[allow(dead_code)]
 fn trim_line(line: &mut TerminalLine) {
     while line
         .runs
