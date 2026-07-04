@@ -112,6 +112,8 @@ struct HerdrGui {
     sidebar_layout: SidebarLayout,
     sidebar_resizing: bool,
     sidebar_width_px: f64,
+    sidebar_width_start: f64,
+    sidebar_width_target: f64,
     theme_mode: ThemeMode,
     swipe_progress: f64,
     focus_handle: FocusHandle,
@@ -146,6 +148,8 @@ impl HerdrGui {
             sidebar_layout: SidebarLayout::Arc,
             sidebar_resizing: false,
             sidebar_width_px: 220.0,
+            sidebar_width_start: 220.0,
+            sidebar_width_target: 220.0,
             theme_mode: ThemeMode::Herdr("catppuccin"),
             swipe_progress: 0.0,
             focus_handle: cx.focus_handle(),
@@ -176,7 +180,18 @@ impl HerdrGui {
     }
 
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, _window: &mut Window, cx: &mut Context<Self>) {
-        self.sidebar_collapsed = !self.sidebar_collapsed;
+        self.transition_sidebar_width(|this| this.sidebar_collapsed = !this.sidebar_collapsed, cx);
+    }
+
+    fn transition_sidebar_width<F>(&mut self, f: F, cx: &mut Context<Self>)
+    where
+        F: FnOnce(&mut Self),
+    {
+        let old_width = self.sidebar_width();
+        f(self);
+        let new_width = self.sidebar_width();
+        self.sidebar_width_start = old_width;
+        self.sidebar_width_target = new_width;
         cx.notify();
     }
 
@@ -660,13 +675,14 @@ impl HerdrGui {
         if self.sidebar_resizing && event.dragging() {
             let width = event.position.x.to_f64();
             self.sidebar_width_px = width.clamp(180.0, 360.0);
+            self.sidebar_width_start = self.sidebar_width_px;
+            self.sidebar_width_target = self.sidebar_width_px;
             self.terminal_size = None;
             cx.notify();
             return;
         }
         if self.sidebar_collapsed && self.sidebar_hovered && event.position.x.to_f64() > 220.0 {
-            self.sidebar_hovered = false;
-            cx.notify();
+            self.transition_sidebar_width(|this| this.sidebar_hovered = false, cx);
         }
     }
 
@@ -921,8 +937,10 @@ impl HerdrGui {
     }
 
     fn sidebar(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .w(px(self.sidebar_width() as f32))
+        let start = self.sidebar_width_start;
+        let target = self.sidebar_width_target;
+        let id = gpui::ElementId::Name(format!("sidebar-{:.0}-to-{:.0}", start, target).into());
+        let el = div()
             .h_full()
             .bg(rgb(theme.panel))
             .flex()
@@ -930,8 +948,7 @@ impl HerdrGui {
             .overflow_hidden()
             .on_mouse_move(cx.listener(|this, _, _, cx| {
                 if this.sidebar_collapsed && !this.sidebar_hovered {
-                    this.sidebar_hovered = true;
-                    cx.notify();
+                    this.transition_sidebar_width(|this| this.sidebar_hovered = true, cx);
                 }
             }))
             .child(space_switcher(self.active_workspace(), theme, cx))
@@ -947,8 +964,15 @@ impl HerdrGui {
             })
             .when(self.sidebar_layout == SidebarLayout::Arc, |el| {
                 el.child(self.right_workspace_sidebar(theme, cx))
-            })
-            .into_any_element()
+            });
+        animation::width(
+            el,
+            id,
+            Duration::from_millis(250),
+            start as f32,
+            target as f32,
+        )
+        .into_any_element()
     }
 
     fn warp_sidebar(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {

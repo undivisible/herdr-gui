@@ -1066,8 +1066,6 @@ dependencies = [
 [[package]]
 name = "crepuscularity-core"
 version = "0.4.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66ea24bd35840578f98f7cabc94c84e6198b60344a3913796e3f128577d3707a"
 dependencies = [
  "notify",
  "sha2 0.11.0",
@@ -1079,8 +1077,6 @@ dependencies = [
 [[package]]
 name = "crepuscularity-gpui"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80fcec197fd2fadc5c8969baf1264f2e2070233cff87542d00c35a40c54242e6"
 dependencies = [
  "crepuscularity-core",
  "crepuscularity-runtime",
@@ -1097,8 +1093,6 @@ dependencies = [
 [[package]]
 name = "crepuscularity-runtime"
 version = "0.4.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66c47ad20a50c47738a69c5fa3752d4b0a2ac7a46838a30ab763527befcd604b"
 dependencies = [
  "crepuscularity-core",
  "gpui",
@@ -1111,8 +1105,6 @@ dependencies = [
 [[package]]
 name = "crepuscularity_macros"
 version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9ea0d92edd5239d4bc5c96b657902faab9645952ddf74e894ef5e9431105100"
 dependencies = [
  "crepuscularity-core",
  "proc-macro2",
