@@ -1,10 +1,7 @@
-use libloading::Library;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use std::{
-    env,
     ffi::c_void,
     io::Read,
-    path::{Path, PathBuf},
     ptr,
     sync::{
         mpsc::{self, Receiver, Sender},
@@ -13,11 +10,8 @@ use std::{
     thread,
 };
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GhosttyRuntime {
-    pub root: PathBuf,
-    dylib_path: PathBuf,
-}
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GhosttyRuntime;
 
 pub struct TerminalSession {
     pub output: Option<Receiver<TerminalFrame>>,
@@ -62,6 +56,8 @@ type GhosttyCell = u64;
 
 const GHOSTTY_SUCCESS: GhosttyResult = 0;
 const GHOSTTY_INVALID_VALUE: GhosttyResult = -2;
+const GHOSTTY_NO_VALUE: GhosttyResult = -4;
+const GHOSTTY_TERMINAL_DATA_COLOR_BACKGROUND_DEFAULT: u32 = 23;
 const RENDER_STATE_DATA_ROW_ITERATOR: u32 = 4;
 const RENDER_STATE_ROW_DATA_CELLS: u32 = 3;
 const ROW_CELLS_DATA_RAW: u32 = 1;
@@ -120,13 +116,72 @@ type GhosttyRowCellsNext = unsafe extern "C" fn(GhosttyRowCellsHandle) -> bool;
 type GhosttyRowCellsGet = unsafe extern "C" fn(GhosttyRowCellsHandle, u32, *mut c_void) -> i32;
 type GhosttyCellGet = unsafe extern "C" fn(GhosttyCell, u32, *mut c_void) -> i32;
 
+extern "C" {
+    fn ghostty_terminal_new(
+        config: *const c_void,
+        terminal: *mut GhosttyTerminalHandle,
+        options: GhosttyTerminalOptions,
+    ) -> i32;
+    fn ghostty_terminal_free(terminal: GhosttyTerminalHandle);
+    fn ghostty_terminal_resize(
+        terminal: GhosttyTerminalHandle,
+        cols: u16,
+        rows: u16,
+        cell_width: u32,
+        cell_height: u32,
+    ) -> i32;
+    fn ghostty_terminal_vt_write(terminal: GhosttyTerminalHandle, data: *const u8, len: usize);
+    fn ghostty_terminal_scroll_viewport(
+        terminal: GhosttyTerminalHandle,
+        behavior: GhosttyScrollViewport,
+    );
+    fn ghostty_render_state_new(
+        config: *const c_void,
+        render_state: *mut GhosttyRenderStateHandle,
+    ) -> i32;
+    fn ghostty_render_state_free(render_state: GhosttyRenderStateHandle);
+    fn ghostty_render_state_update(
+        render_state: GhosttyRenderStateHandle,
+        terminal: GhosttyTerminalHandle,
+    ) -> i32;
+    fn ghostty_render_state_get(
+        render_state: GhosttyRenderStateHandle,
+        data: u32,
+        out: *mut c_void,
+    ) -> i32;
+    fn ghostty_render_state_row_iterator_new(
+        config: *const c_void,
+        row_iterator: *mut GhosttyRowIteratorHandle,
+    ) -> i32;
+    fn ghostty_render_state_row_iterator_free(row_iterator: GhosttyRowIteratorHandle);
+    fn ghostty_render_state_row_iterator_next(row_iterator: GhosttyRowIteratorHandle) -> bool;
+    fn ghostty_render_state_row_get(
+        row_iterator: GhosttyRowIteratorHandle,
+        data: u32,
+        out: *mut c_void,
+    ) -> i32;
+    fn ghostty_render_state_row_cells_new(
+        config: *const c_void,
+        row_cells: *mut GhosttyRowCellsHandle,
+    ) -> i32;
+    fn ghostty_render_state_row_cells_free(row_cells: GhosttyRowCellsHandle);
+    fn ghostty_render_state_row_cells_next(row_cells: GhosttyRowCellsHandle) -> bool;
+    fn ghostty_render_state_row_cells_get(
+        row_cells: GhosttyRowCellsHandle,
+        data: u32,
+        out: *mut c_void,
+    ) -> i32;
+    fn ghostty_cell_get(cell: GhosttyCell, data: u32, out: *mut c_void) -> i32;
+    fn ghostty_terminal_get(terminal: GhosttyTerminalHandle, data: u32, out: *mut c_void) -> i32;
+}
+
 struct GhosttyApi {
-    _library: Library,
     terminal_new: GhosttyTerminalNew,
     terminal_free: GhosttyTerminalFree,
     terminal_resize: GhosttyTerminalResize,
     terminal_vt_write: GhosttyTerminalVtWrite,
     terminal_scroll_viewport: GhosttyTerminalScrollViewport,
+    terminal_get: unsafe extern "C" fn(GhosttyTerminalHandle, u32, *mut c_void) -> i32,
     render_state_new: GhosttyRenderStateNew,
     render_state_free: GhosttyRenderStateFree,
     render_state_update: GhosttyRenderStateUpdate,
@@ -160,30 +215,11 @@ const GHOSTTY_SCROLL_VIEWPORT_DELTA: u32 = 2;
 
 impl GhosttyRuntime {
     pub fn detect() -> Result<Self, String> {
-        // GHOSTTY_VT_LIB overrides all search paths.
-        if let Some(dylib) = env::var_os("GHOSTTY_VT_LIB").map(PathBuf::from) {
-            if dylib.is_file() {
-                let root = dylib.parent().unwrap_or(&dylib).to_path_buf();
-                return Ok(Self {
-                    root,
-                    dylib_path: dylib,
-                });
-            }
-        }
-        ghostty_roots()
-            .into_iter()
-            .filter_map(|root| {
-                let dylib_path = find_dylib_in_root(&root)?;
-                Some(Self { root, dylib_path })
-            })
-            .next()
-            .ok_or_else(|| {
-                "libghostty-vt not found. Bundle vendor/ghostty-vt/lib/libghostty-vt.dylib or set GHOSTTY_VT_ROOT/GHOSTTY_VT_LIB.".to_string()
-            })
+        Ok(Self)
     }
 
     fn load_api(&self) -> Result<Arc<GhosttyApi>, String> {
-        GhosttyApi::load(&self.dylib_path)
+        GhosttyApi::load()
     }
 }
 
@@ -385,6 +421,24 @@ impl GhosttyTerminal {
         }
     }
 
+    fn default_bg(&self) -> Result<Option<u32>, String> {
+        let mut color = GhosttyColorRgb::default();
+        let result = unsafe {
+            (self.api.terminal_get)(
+                self.terminal,
+                GHOSTTY_TERMINAL_DATA_COLOR_BACKGROUND_DEFAULT,
+                (&mut color as *mut GhosttyColorRgb).cast(),
+            )
+        };
+        if result == GHOSTTY_NO_VALUE {
+            return Ok(None);
+        }
+        if result != GHOSTTY_SUCCESS {
+            return Err(format!("ghostty_terminal_get default bg failed: {result}"));
+        }
+        Ok(Some(rgb_u32(color.r, color.g, color.b)))
+    }
+
     pub fn frame(&mut self) -> Result<TerminalFrame, String> {
         let result = unsafe { (self.api.render_state_update)(self.render_state, self.terminal) };
         if result != GHOSTTY_SUCCESS {
@@ -404,6 +458,7 @@ impl GhosttyTerminal {
         }
 
         let cursor = self.cursor()?;
+        let default_bg = self.default_bg()?;
         let mut lines = Vec::new();
         let mut y = 0_u16;
         while unsafe { (self.api.row_iterator_next)(self.row_iterator) } {
@@ -434,7 +489,7 @@ impl GhosttyTerminal {
                     (
                         self.cell_color(ROW_CELLS_DATA_FG_COLOR)?
                             .unwrap_or(DEFAULT_FG),
-                        terminal_bg(self.cell_color(ROW_CELLS_DATA_BG_COLOR)?),
+                        terminal_bg(self.cell_color(ROW_CELLS_DATA_BG_COLOR)?, default_bg),
                     )
                 };
                 push_run(&mut line.runs, text, fg, bg);
@@ -592,76 +647,27 @@ unsafe impl Send for GhosttyApi {}
 unsafe impl Sync for GhosttyApi {}
 
 impl GhosttyApi {
-    fn load(dylib_path: &Path) -> Result<Arc<Self>, String> {
-        if !dylib_path.is_file() {
-            return Err(format!(
-                "libghostty-vt dylib not found at {}. Bundle vendor/ghostty-vt/lib/libghostty-vt.dylib or set GHOSTTY_VT_LIB.",
-                dylib_path.display()
-            ));
-        }
-        let library = unsafe { Library::new(dylib_path) }.map_err(|err| err.to_string())?;
-        let terminal_new = load_symbol::<GhosttyTerminalNew>(&library, b"ghostty_terminal_new\0")?;
-        let terminal_free =
-            load_symbol::<GhosttyTerminalFree>(&library, b"ghostty_terminal_free\0")?;
-        let terminal_resize =
-            load_symbol::<GhosttyTerminalResize>(&library, b"ghostty_terminal_resize\0")?;
-        let terminal_vt_write =
-            load_symbol::<GhosttyTerminalVtWrite>(&library, b"ghostty_terminal_vt_write\0")?;
-        let terminal_scroll_viewport = load_symbol::<GhosttyTerminalScrollViewport>(
-            &library,
-            b"ghostty_terminal_scroll_viewport\0",
-        )?;
-        let render_state_new =
-            load_symbol::<GhosttyRenderStateNew>(&library, b"ghostty_render_state_new\0")?;
-        let render_state_free =
-            load_symbol::<GhosttyRenderStateFree>(&library, b"ghostty_render_state_free\0")?;
-        let render_state_update =
-            load_symbol::<GhosttyRenderStateUpdate>(&library, b"ghostty_render_state_update\0")?;
-        let render_state_get =
-            load_symbol::<GhosttyRenderStateGet>(&library, b"ghostty_render_state_get\0")?;
-        let row_iterator_new = load_symbol::<GhosttyRowIteratorNew>(
-            &library,
-            b"ghostty_render_state_row_iterator_new\0",
-        )?;
-        let row_iterator_free = load_symbol::<GhosttyRowIteratorFree>(
-            &library,
-            b"ghostty_render_state_row_iterator_free\0",
-        )?;
-        let row_iterator_next = load_symbol::<GhosttyRowIteratorNext>(
-            &library,
-            b"ghostty_render_state_row_iterator_next\0",
-        )?;
-        let row_get = load_symbol::<GhosttyRowGet>(&library, b"ghostty_render_state_row_get\0")?;
-        let row_cells_new =
-            load_symbol::<GhosttyRowCellsNew>(&library, b"ghostty_render_state_row_cells_new\0")?;
-        let row_cells_free =
-            load_symbol::<GhosttyRowCellsFree>(&library, b"ghostty_render_state_row_cells_free\0")?;
-        let row_cells_next =
-            load_symbol::<GhosttyRowCellsNext>(&library, b"ghostty_render_state_row_cells_next\0")?;
-        let row_cells_get =
-            load_symbol::<GhosttyRowCellsGet>(&library, b"ghostty_render_state_row_cells_get\0")?;
-        let cell_get = load_symbol::<GhosttyCellGet>(&library, b"ghostty_cell_get\0")?;
-
+    fn load() -> Result<Arc<Self>, String> {
         Ok(Arc::new(Self {
-            _library: library,
-            terminal_new,
-            terminal_free,
-            terminal_resize,
-            terminal_vt_write,
-            terminal_scroll_viewport,
-            render_state_new,
-            render_state_free,
-            render_state_update,
-            render_state_get,
-            row_iterator_new,
-            row_iterator_free,
-            row_iterator_next,
-            row_get,
-            row_cells_new,
-            row_cells_free,
-            row_cells_next,
-            row_cells_get,
-            cell_get,
+            terminal_new: ghostty_terminal_new,
+            terminal_free: ghostty_terminal_free,
+            terminal_resize: ghostty_terminal_resize,
+            terminal_vt_write: ghostty_terminal_vt_write,
+            terminal_scroll_viewport: ghostty_terminal_scroll_viewport,
+            terminal_get: ghostty_terminal_get,
+            render_state_new: ghostty_render_state_new,
+            render_state_free: ghostty_render_state_free,
+            render_state_update: ghostty_render_state_update,
+            render_state_get: ghostty_render_state_get,
+            row_iterator_new: ghostty_render_state_row_iterator_new,
+            row_iterator_free: ghostty_render_state_row_iterator_free,
+            row_iterator_next: ghostty_render_state_row_iterator_next,
+            row_get: ghostty_render_state_row_get,
+            row_cells_new: ghostty_render_state_row_cells_new,
+            row_cells_free: ghostty_render_state_row_cells_free,
+            row_cells_next: ghostty_render_state_row_cells_next,
+            row_cells_get: ghostty_render_state_row_cells_get,
+            cell_get: ghostty_cell_get,
         }))
     }
 }
@@ -702,8 +708,11 @@ fn rgb_u32(r: u8, g: u8, b: u8) -> u32 {
     (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
 }
 
-fn terminal_bg(color: Option<u32>) -> Option<u32> {
+fn terminal_bg(color: Option<u32>, default_bg: Option<u32>) -> Option<u32> {
     let color = color?;
+    if default_bg == Some(color) {
+        return None;
+    }
     let r = (color >> 16) & 0xff;
     let g = (color >> 8) & 0xff;
     let b = color & 0xff;
@@ -714,45 +723,6 @@ fn terminal_bg(color: Option<u32>) -> Option<u32> {
     } else {
         Some(color)
     }
-}
-
-fn load_symbol<T: Copy>(library: &Library, name: &[u8]) -> Result<T, String> {
-    unsafe { library.get::<T>(name) }
-        .map(|symbol| *symbol)
-        .map_err(|err| err.to_string())
-}
-
-fn find_dylib_in_root(root: &Path) -> Option<PathBuf> {
-    [
-        root.join("lib/libghostty-vt.dylib"),
-        root.join("zig-out/lib/libghostty-vt.dylib"),
-    ]
-    .into_iter()
-    .find(|p| p.is_file())
-}
-
-fn ghostty_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(root) = env::var_os("GHOSTTY_VT_ROOT").map(PathBuf::from) {
-        roots.push(root);
-    }
-    if let Ok(exe) = env::current_exe() {
-        if let Some(contents) = exe.ancestors().find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name == "Contents")
-        }) {
-            roots.push(contents.join("Resources/ghostty"));
-        }
-    }
-    roots.push(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("vendor/ghostty-vt"),
-    );
-    roots.push(PathBuf::from("vendor/ghostty-vt"));
-    roots.push(PathBuf::from("vendor/ghostty"));
-    roots
 }
 
 #[cfg(test)]
@@ -779,11 +749,18 @@ mod tests {
     }
 
     #[test]
+    fn terminal_bg_drops_default_background() {
+        assert_eq!(terminal_bg(Some(0x282c34), Some(0x282c34)), None);
+        assert_eq!(terminal_bg(Some(0x5f1f2a), Some(0x282c34)), Some(0x5f1f2a));
+        assert_eq!(terminal_bg(Some(0x00aa00), Some(0x1e1e1e)), Some(0x00aa00));
+    }
+
+    #[test]
     fn terminal_bg_drops_neutral_default_backgrounds() {
-        assert_eq!(terminal_bg(Some(0x282c34)), None);
-        assert_eq!(terminal_bg(Some(0x303743)), None);
-        assert_eq!(terminal_bg(Some(0x5f1f2a)), Some(0x5f1f2a));
-        assert_eq!(terminal_bg(Some(0x00aa00)), Some(0x00aa00));
+        assert_eq!(terminal_bg(Some(0x282c34), None), None);
+        assert_eq!(terminal_bg(Some(0x303743), None), None);
+        assert_eq!(terminal_bg(Some(0x5f1f2a), None), Some(0x5f1f2a));
+        assert_eq!(terminal_bg(Some(0x00aa00), None), Some(0x00aa00));
     }
 
     #[test]
