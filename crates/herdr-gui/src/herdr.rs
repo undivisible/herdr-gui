@@ -313,7 +313,10 @@ impl HerdrClient {
     }
 
     pub fn send_key(&self, pane_id: &str, key: &str) -> Result<(), HerdrError> {
-        let _: Value = self.call("pane.send_keys", json!({ "pane_id": pane_id, "keys": key }))?;
+        let _: Value = self.call(
+            "pane.send_keys",
+            json!({ "pane_id": pane_id, "keys": [key] }),
+        )?;
         Ok(())
     }
 

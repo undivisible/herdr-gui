@@ -563,10 +563,14 @@ impl HerdrGui {
 
     fn handle_keystroke(&mut self, key: &Keystroke) {
         if let (Some(client), Some(pane)) = (&self.client, self.focused_pane().cloned()) {
-            let result = if let Some(text) = key.key_char.as_deref() {
+            let result = if key.modifiers.alt {
+                // ponytail: alt+key sends as named key, not composed text.
+                // Terminal expects ESC+letter, not composed Unicode (e.g., ß for alt+s).
+                client.send_key(&pane.pane_id, &key_name(key))
+            } else if let Some(text) = key.key_char.as_deref() {
                 client.send_text(&pane.pane_id, text)
             } else {
-                client.send_key(&pane.pane_id, key_name(key))
+                client.send_key(&pane.pane_id, &key_name(key))
             };
             if let Err(err) = result {
                 self.status = err.to_string();
