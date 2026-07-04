@@ -18,6 +18,7 @@ use help::help_overlay;
 use herdr::{Agent, HerdrClient, HerdrState, Pane, Tab, Workspace};
 use input::key_name;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::{
     sync::mpsc::{Receiver, TryRecvError},
     time::Duration,
@@ -91,8 +92,8 @@ struct HerdrGui {
     terminal_target: Option<String>,
     terminal_size: Option<TerminalSize>,
     terminal_token: u64,
-    terminal_frame: TerminalFrame,
-    terminal_frames: HashMap<String, TerminalFrame>,
+    terminal_frame: Arc<TerminalFrame>,
+    terminal_frames: HashMap<String, Arc<TerminalFrame>>,
     state: HerdrState,
     status: String,
     show_help: bool,
@@ -126,7 +127,7 @@ impl HerdrGui {
             terminal_target: None,
             terminal_size: None,
             terminal_token: 0,
-            terminal_frame: TerminalFrame::default(),
+            terminal_frame: Arc::new(TerminalFrame::default()),
             terminal_frames: HashMap::new(),
             state,
             status,
@@ -458,7 +459,7 @@ impl HerdrGui {
                         if let (Some(client), Some(pane)) = (&self.client, pane.as_ref()) {
                             if let Ok(ansi) = client.read_pane_ansi(&pane.pane_id) {
                                 if let Ok(frame) = TerminalFrame::from_ansi(size.0, size.1, &ansi) {
-                                    self.terminal_frame = frame;
+                                    self.terminal_frame = Arc::new(frame);
                                 }
                             }
                         }
@@ -474,7 +475,7 @@ impl HerdrGui {
                 self.terminal = None;
                 self.terminal_target = None;
                 self.terminal_size = None;
-                self.terminal_frame = TerminalFrame {
+                self.terminal_frame = Arc::new(TerminalFrame {
                     lines: vec![TerminalLine {
                         runs: vec![TerminalRun {
                             text: err.clone(),
@@ -482,7 +483,7 @@ impl HerdrGui {
                             bg: None,
                         }],
                     }],
-                };
+                });
                 self.status = err;
             }
         }
@@ -848,7 +849,7 @@ impl HerdrGui {
     fn terminal_area(
         &self,
         panes: Vec<Pane>,
-        pane_frame: TerminalFrame,
+        pane_frame: Arc<TerminalFrame>,
         theme: UiTheme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -1140,7 +1141,7 @@ impl HerdrGui {
     fn pane_grid(
         &self,
         panes: Vec<Pane>,
-        pane_frame: TerminalFrame,
+        pane_frame: Arc<TerminalFrame>,
         theme: UiTheme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -1183,7 +1184,7 @@ impl HerdrGui {
                     .font_family("Menlo")
                     .line_height(px(18.0))
                     .text_color(rgb(theme.text))
-                    .child(terminal_frame(&pane_frame, theme.terminal)),
+                    .child(terminal_frame(pane_frame.as_ref(), theme.terminal)),
             )
     }
 }
@@ -1833,7 +1834,9 @@ fn poll_terminal(
                         return;
                     }
 
-                    view.terminal_frames.insert(target.clone(), frame.clone());
+                    let frame = Arc::new(frame);
+                    view.terminal_frames
+                        .insert(target.clone(), Arc::clone(&frame));
                     view.terminal_frame = frame;
                     cx.notify();
                 })
