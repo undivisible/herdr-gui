@@ -113,7 +113,6 @@ struct HerdrGui {
     sidebar_resizing: bool,
     sidebar_width_px: f64,
     theme_mode: ThemeMode,
-    scroll_x: f64,
     swipe_progress: f64,
     focus_handle: FocusHandle,
 }
@@ -148,7 +147,6 @@ impl HerdrGui {
             sidebar_resizing: false,
             sidebar_width_px: 220.0,
             theme_mode: ThemeMode::Herdr("catppuccin"),
-            scroll_x: 0.0,
             swipe_progress: 0.0,
             focus_handle: cx.focus_handle(),
         }
@@ -571,9 +569,26 @@ impl HerdrGui {
 
     fn handle_keystroke(&mut self, key: &Keystroke) {
         if let (Some(client), Some(pane)) = (&self.client, self.focused_pane().cloned()) {
-            let result = if key.modifiers.alt {
-                // ponytail: alt+key sends as named key, not composed text.
-                // Terminal expects ESC+letter, not composed Unicode (e.g., ß for alt+s).
+            // NAMED keys always send as key events, not text.
+            // Enter as text=\n gets misinterpreted by the terminal (e.g. as shift+enter).
+            let is_named = matches!(
+                key.key.as_str(),
+                "enter"
+                    | "backspace"
+                    | "tab"
+                    | "escape"
+                    | "up"
+                    | "down"
+                    | "left"
+                    | "right"
+                    | "delete"
+                    | "home"
+                    | "end"
+                    | "pageup"
+                    | "pagedown"
+                    | "insert"
+            );
+            let result = if key.modifiers.alt || is_named {
                 client.send_key(&pane.pane_id, &key_name(key))
             } else if let Some(text) = key.key_char.as_deref() {
                 client.send_text(&pane.pane_id, text)
@@ -589,30 +604,19 @@ impl HerdrGui {
     fn handle_workspace_scroll(
         &mut self,
         event: &ScrollWheelEvent,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Only vertical scroll — terminal scroll.
+        // Horizontal scroll is ignored (user request: "terminal shouldnt scroll horizontally").
         let delta = event.delta.pixel_delta(px(18.0));
-        if delta.x.abs() <= delta.y.abs() {
-            let rows = (delta.y.to_f64() / 18.0).round() as isize;
-            if rows != 0 {
-                if let Some(terminal) = &self.terminal {
-                    terminal.scroll(-rows);
-                    cx.notify();
-                }
+        let rows = (delta.y.to_f64() / 18.0).round() as isize;
+        if rows != 0 {
+            if let Some(terminal) = &self.terminal {
+                terminal.scroll(-rows);
+                cx.notify();
             }
-            return;
         }
-        self.scroll_x += delta.x.to_f64();
-        self.swipe_progress = (self.scroll_x / 80.0).clamp(-1.0, 1.0);
-        cx.notify();
-        if self.scroll_x.abs() < 80.0 {
-            return;
-        }
-        let offset = if self.scroll_x < 0.0 { 1 } else { -1 };
-        self.scroll_x = 0.0;
-        self.swipe_progress = 0.0;
-        self.focus_workspace_offset(offset, window, cx);
     }
 
     fn set_theme(&mut self, name: &'static str, cx: &mut Context<Self>) {
@@ -650,15 +654,11 @@ impl HerdrGui {
     fn handle_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.sidebar_resizing && event.dragging() {
-            let window_width = window.bounds().size.width.to_f64();
-            let width = match self.sidebar_layout {
-                SidebarLayout::Warp => event.position.x.to_f64(),
-                SidebarLayout::Arc => window_width - event.position.x.to_f64(),
-            };
+            let width = event.position.x.to_f64();
             self.sidebar_width_px = width.clamp(180.0, 360.0);
             self.terminal_size = None;
             cx.notify();
@@ -750,16 +750,9 @@ impl Render for HerdrGui {
             .on_scroll_wheel(cx.listener(Self::handle_workspace_scroll))
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
-            .when(self.sidebar_layout == SidebarLayout::Warp, |el| {
-                el.child(self.sidebar(theme, cx))
-                    .child(resize_handle(theme, cx))
-                    .child(self.terminal_area(panes.clone(), pane_frame.clone(), theme, cx))
-            })
-            .when(self.sidebar_layout == SidebarLayout::Arc, |el| {
-                el.child(self.terminal_area(panes, pane_frame, theme, cx))
-                    .child(resize_handle(theme, cx))
-                    .child(self.sidebar(theme, cx))
-            })
+            .child(self.sidebar(theme, cx))
+            .child(resize_handle(theme, cx))
+            .child(self.terminal_area(panes, pane_frame, theme, cx))
     }
 }
 
@@ -1034,25 +1027,75 @@ impl HerdrGui {
     }
 
     fn agent_rows(&self, theme: UiTheme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        fn project_name(cwd: Option<&str>) -> String {
+            cwd.and_then(|c| std::path::Path::new(c).file_name())
+                .and_then(|s| s.to_str())
+                .unwrap_or("~")
+                .to_string()
+        }
+        // Collect all agent items (agents + panes-with-agents)
+        struct AgentItem {
+            agent: Agent,
+            project: String,
+        }
         let mut seen: std::collections::HashSet<&str> = self
             .state
             .agents
             .iter()
             .filter_map(|a| a.pane_id.as_deref())
             .collect();
-        let mut rows: Vec<_> = self
+        let mut items: Vec<AgentItem> = self
             .state
             .agents
             .iter()
-            .map(|agent| agent_row(agent, &self.state, theme, cx))
+            .map(|a| AgentItem {
+                agent: a.clone(),
+                project: project_name(a.cwd.as_deref()),
+            })
             .collect();
-        rows.extend(self.state.panes.iter().filter_map(|pane| {
+        for pane in &self.state.panes {
             if pane.agent.is_some() && seen.insert(pane.pane_id.as_str()) {
-                Some(agent_row(&Agent::from_pane(pane), &self.state, theme, cx))
-            } else {
-                None
+                let agent = Agent::from_pane(pane);
+                let project = project_name(agent.cwd.as_deref());
+                items.push(AgentItem { agent, project });
             }
-        }));
+        }
+        // Count per project for numbering
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for item in &items {
+            *counts.entry(item.project.clone()).or_insert(0) += 1;
+        }
+        let mut current: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut rows = Vec::new();
+        for item in &items {
+            let n = {
+                let c = current.entry(item.project.clone()).or_insert(0);
+                *c += 1;
+                *c
+            };
+            let total = counts[&item.project];
+            let title = if total > 1 {
+                format!("{} \u{00b7} {}", item.project, n)
+            } else {
+                item.project.clone()
+            };
+            let subtitle = item
+                .agent
+                .agent
+                .as_deref()
+                .or(item.agent.name.as_deref())
+                .unwrap_or("agent")
+                .to_string();
+            rows.push(agent_row(
+                &item.agent,
+                &self.state,
+                theme,
+                cx,
+                title,
+                subtitle,
+            ));
+        }
         rows
     }
 
@@ -1191,7 +1234,7 @@ fn space_switcher(
         .unwrap_or("space");
     div()
         .w_full()
-        .h(px(34.0))
+        .h(px(38.0))
         .flex()
         .items_center()
         .pl(px(82.0))
@@ -1464,28 +1507,16 @@ fn agent_row(
     state: &HerdrState,
     theme: UiTheme,
     cx: &mut Context<HerdrGui>,
+    title: String,
+    subtitle: String,
 ) -> AnyElement {
     let pane_id = agent.pane_id.clone();
     let workspace_id = agent.workspace_id.clone();
     let tab_id = agent.tab_id.clone();
-    let title = agent
-        .display_agent
-        .as_deref()
-        .or(agent.agent.as_deref())
-        .or(agent.name.as_deref())
-        .or(agent.title.as_deref())
-        .unwrap_or(&agent.terminal_id)
-        .to_string();
-    let status = agent
-        .custom_status
-        .as_deref()
-        .or(agent.agent_status.as_deref())
-        .unwrap_or("unknown")
-        .to_string();
     let status_key = agent
         .agent_status
         .as_deref()
-        .unwrap_or(status.as_str())
+        .unwrap_or("unknown")
         .to_string();
     let focused = agent.focused
         || pane_id.as_deref().is_some_and(|pane_id| {
@@ -1504,12 +1535,12 @@ fn agent_row(
         );
     });
 
-    agent_row_element(title, status, status_key, focused, theme, on_click).into_any_element()
+    agent_row_element(title, subtitle, status_key, focused, theme, on_click).into_any_element()
 }
 
 fn agent_row_element(
     title: String,
-    status: String,
+    subtitle: String,
     status_key: String,
     focused: bool,
     theme: UiTheme,
@@ -1535,9 +1566,14 @@ fn agent_row_element(
                 .flex_col()
                 .gap_0p5()
                 .child(label(&title, theme.label))
-                .child(small(&status, theme)),
+                .child(small(&subtitle, theme)),
         )
-        .child(div().w(px(8.0)).h(px(8.0)).bg(rgb(status_color(&status))))
+        .child(
+            div()
+                .w(px(8.0))
+                .h(px(8.0))
+                .bg(rgb(status_color(&status_key))),
+        )
         .into_any_element()
 }
 
