@@ -72,6 +72,14 @@ actions!(
     ]
 );
 
+macro_rules! set_theme {
+    ($name:ident, $action:ty, $theme:literal) => {
+        fn $name(&mut self, _: &$action, _window: &mut Window, cx: &mut Context<Self>) {
+            self.set_theme($theme, cx);
+        }
+    };
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum SidebarLayout {
     Warp,
@@ -612,122 +620,32 @@ impl HerdrGui {
         cx.notify();
     }
 
-    fn theme_catppuccin(
-        &mut self,
-        _: &ThemeCatppuccin,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.set_theme("catppuccin", cx);
-    }
-
-    fn theme_catppuccin_latte(
-        &mut self,
-        _: &ThemeCatppuccinLatte,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.set_theme("catppuccin-latte", cx);
-    }
-
-    fn theme_terminal(&mut self, _: &ThemeTerminal, _window: &mut Window, cx: &mut Context<Self>) {
-        self.set_theme("terminal", cx);
-    }
-
-    fn theme_tokyo_night(
-        &mut self,
-        _: &ThemeTokyoNight,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.set_theme("tokyo-night", cx);
-    }
-
-    fn theme_tokyo_night_day(
-        &mut self,
-        _: &ThemeTokyoNightDay,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.set_theme("tokyo-night-day", cx);
-    }
-
-    fn theme_dracula(&mut self, _: &ThemeDracula, _window: &mut Window, cx: &mut Context<Self>) {
-        self.set_theme("dracula", cx);
-    }
-
-    fn theme_nord(&mut self, _: &ThemeNord, _window: &mut Window, cx: &mut Context<Self>) {
-        self.set_theme("nord", cx);
-    }
-
-    fn theme_gruvbox(&mut self, _: &ThemeGruvbox, _window: &mut Window, cx: &mut Context<Self>) {
-        self.set_theme("gruvbox", cx);
-    }
-
-    fn theme_gruvbox_light(
-        &mut self,
-        _: &ThemeGruvboxLight,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.set_theme("gruvbox-light", cx);
-    }
-
-    fn theme_one_dark(&mut self, _: &ThemeOneDark, _window: &mut Window, cx: &mut Context<Self>) {
-        self.set_theme("one-dark", cx);
-    }
-
-    fn theme_one_light(&mut self, _: &ThemeOneLight, _window: &mut Window, cx: &mut Context<Self>) {
-        self.set_theme("one-light", cx);
-    }
-
-    fn theme_solarized(
-        &mut self,
-        _: &ThemeSolarized,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.set_theme("solarized", cx);
-    }
-
-    fn theme_solarized_light(
-        &mut self,
-        _: &ThemeSolarizedLight,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.set_theme("solarized-light", cx);
-    }
-
-    fn theme_kanagawa(&mut self, _: &ThemeKanagawa, _window: &mut Window, cx: &mut Context<Self>) {
-        self.set_theme("kanagawa", cx);
-    }
-
-    fn theme_kanagawa_lotus(
-        &mut self,
-        _: &ThemeKanagawaLotus,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.set_theme("kanagawa-lotus", cx);
-    }
-
-    fn theme_rose_pine(&mut self, _: &ThemeRosePine, _window: &mut Window, cx: &mut Context<Self>) {
-        self.set_theme("rose-pine", cx);
-    }
-
-    fn theme_rose_pine_dawn(
-        &mut self,
-        _: &ThemeRosePineDawn,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.set_theme("rose-pine-dawn", cx);
-    }
-
-    fn theme_vesper(&mut self, _: &ThemeVesper, _window: &mut Window, cx: &mut Context<Self>) {
-        self.set_theme("vesper", cx);
-    }
+    set_theme!(theme_catppuccin, ThemeCatppuccin, "catppuccin");
+    set_theme!(
+        theme_catppuccin_latte,
+        ThemeCatppuccinLatte,
+        "catppuccin-latte"
+    );
+    set_theme!(theme_terminal, ThemeTerminal, "terminal");
+    set_theme!(theme_tokyo_night, ThemeTokyoNight, "tokyo-night");
+    set_theme!(theme_tokyo_night_day, ThemeTokyoNightDay, "tokyo-night-day");
+    set_theme!(theme_dracula, ThemeDracula, "dracula");
+    set_theme!(theme_nord, ThemeNord, "nord");
+    set_theme!(theme_gruvbox, ThemeGruvbox, "gruvbox");
+    set_theme!(theme_gruvbox_light, ThemeGruvboxLight, "gruvbox-light");
+    set_theme!(theme_one_dark, ThemeOneDark, "one-dark");
+    set_theme!(theme_one_light, ThemeOneLight, "one-light");
+    set_theme!(theme_solarized, ThemeSolarized, "solarized");
+    set_theme!(
+        theme_solarized_light,
+        ThemeSolarizedLight,
+        "solarized-light"
+    );
+    set_theme!(theme_kanagawa, ThemeKanagawa, "kanagawa");
+    set_theme!(theme_kanagawa_lotus, ThemeKanagawaLotus, "kanagawa-lotus");
+    set_theme!(theme_rose_pine, ThemeRosePine, "rose-pine");
+    set_theme!(theme_rose_pine_dawn, ThemeRosePineDawn, "rose-pine-dawn");
+    set_theme!(theme_vesper, ThemeVesper, "vesper");
 
     fn handle_mouse_move(
         &mut self,
@@ -1116,21 +1034,21 @@ impl HerdrGui {
     }
 
     fn agent_rows(&self, theme: UiTheme, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let mut seen = self
+        let mut seen: std::collections::HashSet<&str> = self
             .state
             .agents
             .iter()
-            .filter_map(|agent| agent.pane_id.as_deref())
-            .collect::<std::collections::HashSet<_>>();
-        let mut rows = self
+            .filter_map(|a| a.pane_id.as_deref())
+            .collect();
+        let mut rows: Vec<_> = self
             .state
             .agents
             .iter()
             .map(|agent| agent_row(agent, &self.state, theme, cx))
-            .collect::<Vec<_>>();
+            .collect();
         rows.extend(self.state.panes.iter().filter_map(|pane| {
             if pane.agent.is_some() && seen.insert(pane.pane_id.as_str()) {
-                Some(pane_agent_row(pane, &self.state, theme, cx))
+                Some(agent_row(&Agent::from_pane(pane), &self.state, theme, cx))
             } else {
                 None
             }
@@ -1539,45 +1457,6 @@ fn tab_sidebar_row(
                 .child(icon("xmark", 9.0, theme)),
         )
         .into_any_element()
-}
-
-fn pane_agent_row(
-    pane: &Pane,
-    state: &HerdrState,
-    theme: UiTheme,
-    cx: &mut Context<HerdrGui>,
-) -> AnyElement {
-    let workspace_id = pane.workspace_id.clone();
-    let tab_id = pane.tab_id.clone();
-    let pane_id = pane.pane_id.clone();
-    let title = pane
-        .agent
-        .as_deref()
-        .or(pane.title.as_deref())
-        .or(pane.label.as_deref())
-        .unwrap_or(&pane.pane_id)
-        .to_string();
-    let status = pane
-        .agent_status
-        .as_deref()
-        .unwrap_or("unknown")
-        .to_string();
-    let focused = pane.focused
-        || state
-            .focused_pane_id
-            .as_deref()
-            .is_some_and(|focused| focused == pane.pane_id);
-    let on_click = cx.listener(move |this, _, window, cx| {
-        this.focus_target(
-            workspace_id.clone(),
-            tab_id.clone(),
-            Some(pane_id.clone()),
-            window,
-            cx,
-        )
-    });
-
-    agent_row_element(title, status.clone(), status, focused, theme, on_click).into_any_element()
 }
 
 fn agent_row(

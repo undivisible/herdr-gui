@@ -96,7 +96,7 @@ pub struct Pane {
     pub focused: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Agent {
     pub terminal_id: String,
     #[serde(default)]
@@ -123,6 +123,25 @@ pub struct Agent {
     pub cwd: Option<String>,
     #[serde(default)]
     pub foreground_cwd: Option<String>,
+}
+
+impl Agent {
+    pub fn from_pane(pane: &Pane) -> Self {
+        Self {
+            terminal_id: pane.terminal_id.clone().unwrap_or_default(),
+            agent: pane.agent.clone(),
+            name: pane.agent.clone(),
+            title: pane.title.clone(),
+            display_agent: pane.agent.clone(),
+            agent_status: pane.agent_status.clone(),
+            workspace_id: pane.workspace_id.clone(),
+            tab_id: pane.tab_id.clone(),
+            pane_id: Some(pane.pane_id.clone()),
+            focused: pane.focused,
+            cwd: pane.cwd.clone(),
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -195,10 +214,6 @@ impl HerdrClient {
     }
 
     pub fn state(&self) -> Result<HerdrState, HerdrError> {
-        self.list_state()
-    }
-
-    fn list_state(&self) -> Result<HerdrState, HerdrError> {
         let workspaces: WorkspaceList = self.call("workspace.list", json!({}))?;
         let focused_workspace_id = workspaces
             .workspaces

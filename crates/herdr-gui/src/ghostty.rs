@@ -16,6 +16,7 @@ use std::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GhosttyRuntime {
     pub root: PathBuf,
+    dylib_path: PathBuf,
 }
 
 pub struct TerminalSession {
@@ -159,23 +160,37 @@ const GHOSTTY_SCROLL_VIEWPORT_DELTA: u32 = 2;
 
 impl GhosttyRuntime {
     pub fn detect() -> Result<Self, String> {
+        // GHOSTTY_VT_LIB overrides all search paths.
+        if let Some(dylib) = env::var_os("GHOSTTY_VT_LIB").map(PathBuf::from) {
+            if dylib.is_file() {
+                let root = dylib.parent().unwrap_or(&dylib).to_path_buf();
+                return Ok(Self {
+                    root,
+                    dylib_path: dylib,
+                });
+            }
+        }
         ghostty_roots()
             .into_iter()
-            .find(|root| has_vt(root))
-            .map(|root| Self { root })
+            .filter_map(|root| {
+                let dylib_path = find_dylib_in_root(&root)?;
+                Some(Self { root, dylib_path })
+            })
+            .next()
             .ok_or_else(|| {
-                "libghostty-vt not found. Bundle vendor/ghostty-vt/lib/libghostty-vt.dylib or set GHOSTTY_VT_ROOT.".to_string()
+                "libghostty-vt not found. Bundle vendor/ghostty-vt/lib/libghostty-vt.dylib or set GHOSTTY_VT_ROOT/GHOSTTY_VT_LIB.".to_string()
             })
     }
 
     fn load_api(&self) -> Result<Arc<GhosttyApi>, String> {
-        GhosttyApi::load(&self.root)
+        GhosttyApi::load(&self.dylib_path)
     }
 }
 
 impl TerminalSession {
     pub fn attach(terminal_id: &str, cols: u16, rows: u16) -> Result<Self, String> {
-        let api = GhosttyRuntime::detect()?.load_api()?;
+        let runtime = GhosttyRuntime::detect()?;
+        let api = runtime.load_api()?;
         let pty = native_pty_system()
             .openpty(PtySize {
                 rows,
@@ -294,9 +309,7 @@ impl GhosttyTerminal {
         let mut render_state = ptr::null_mut();
         let result = unsafe { (api.render_state_new)(ptr::null(), &mut render_state) };
         if result != GHOSTTY_SUCCESS {
-            unsafe {
-                (api.terminal_free)(terminal);
-            }
+            unsafe { (api.terminal_free)(terminal) };
             return Err(format!("ghostty_render_state_new failed: {result}"));
         }
 
@@ -556,7 +569,7 @@ impl GhosttyTerminal {
             )
         };
         match result {
-            GHOSTTY_SUCCESS => Ok(Some(rgb_u32(color))),
+            GHOSTTY_SUCCESS => Ok(Some(rgb_u32(color.r, color.g, color.b))),
             GHOSTTY_INVALID_VALUE => Ok(None),
             other => Err(format!("ghostty row cell color failed: {other}")),
         }
@@ -575,31 +588,18 @@ impl Drop for GhosttyTerminal {
 }
 
 unsafe impl Send for GhosttyTerminal {}
-
 unsafe impl Send for GhosttyApi {}
-
 unsafe impl Sync for GhosttyApi {}
 
 impl GhosttyApi {
-    fn load(root: &Path) -> Result<Arc<Self>, String> {
-        let path = env::var_os("GHOSTTY_VT_LIB")
-            .map(PathBuf::from)
-            .or_else(|| {
-                [
-                    root.join("lib/libghostty-vt.dylib"),
-                    root.join("zig-out/lib/libghostty-vt.dylib"),
-                ]
-                .into_iter()
-                .find(|path| path.is_file())
-            })
-            .unwrap_or_else(|| root.join("lib/libghostty-vt.dylib"));
-        if !path.is_file() {
+    fn load(dylib_path: &Path) -> Result<Arc<Self>, String> {
+        if !dylib_path.is_file() {
             return Err(format!(
                 "libghostty-vt dylib not found at {}. Bundle vendor/ghostty-vt/lib/libghostty-vt.dylib or set GHOSTTY_VT_LIB.",
-                path.display()
+                dylib_path.display()
             ));
         }
-        let library = unsafe { Library::new(&path) }.map_err(|err| err.to_string())?;
+        let library = unsafe { Library::new(dylib_path) }.map_err(|err| err.to_string())?;
         let terminal_new = load_symbol::<GhosttyTerminalNew>(&library, b"ghostty_terminal_new\0")?;
         let terminal_free =
             load_symbol::<GhosttyTerminalFree>(&library, b"ghostty_terminal_free\0")?;
@@ -668,7 +668,8 @@ impl GhosttyApi {
 
 impl TerminalFrame {
     pub fn from_ansi(cols: u16, rows: u16, ansi: &str) -> Result<Self, String> {
-        let api = GhosttyRuntime::detect()?.load_api()?;
+        let runtime = GhosttyRuntime::detect()?;
+        let api = runtime.load_api()?;
         let mut terminal = GhosttyTerminal::new(api, cols, rows)?;
         terminal.write(ansi.as_bytes());
         terminal.frame()
@@ -697,25 +698,8 @@ fn push_run(runs: &mut Vec<TerminalRun>, text: String, fg: u32, bg: Option<u32>)
     runs.push(TerminalRun { text, fg, bg });
 }
 
-#[allow(dead_code)]
-fn trim_line(line: &mut TerminalLine) {
-    while line
-        .runs
-        .last()
-        .is_some_and(|run| run.bg.is_none() && run.text.chars().all(|ch| ch == ' '))
-    {
-        line.runs.pop();
-    }
-    if let Some(last) = line.runs.last_mut() {
-        if last.bg.is_none() {
-            let trimmed = last.text.trim_end_matches(' ').len();
-            last.text.truncate(trimmed);
-        }
-    }
-}
-
-fn rgb_u32(color: GhosttyColorRgb) -> u32 {
-    (u32::from(color.r) << 16) | (u32::from(color.g) << 8) | u32::from(color.b)
+fn rgb_u32(r: u8, g: u8, b: u8) -> u32 {
+    (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
 }
 
 fn terminal_bg(color: Option<u32>) -> Option<u32> {
@@ -738,10 +722,13 @@ fn load_symbol<T: Copy>(library: &Library, name: &[u8]) -> Result<T, String> {
         .map_err(|err| err.to_string())
 }
 
-fn has_vt(root: &Path) -> bool {
-    root.join("lib/libghostty-vt.dylib").is_file()
-        || root.join("zig-out/lib/libghostty-vt.dylib").is_file()
-        || root.join("zig-out/lib/libghostty-vt.a").is_file()
+fn find_dylib_in_root(root: &Path) -> Option<PathBuf> {
+    [
+        root.join("lib/libghostty-vt.dylib"),
+        root.join("zig-out/lib/libghostty-vt.dylib"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())
 }
 
 fn ghostty_roots() -> Vec<PathBuf> {
@@ -771,8 +758,7 @@ fn ghostty_roots() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        push_run, terminal_bg, trim_line, GhosttyRuntime, GhosttyTerminal, TerminalFrame,
-        TerminalLine, TerminalRun,
+        push_run, terminal_bg, GhosttyRuntime, GhosttyTerminal, TerminalFrame, TerminalLine,
     };
 
     #[test]
@@ -782,21 +768,14 @@ mod tests {
     }
 
     #[test]
-    fn terminal_runs_merge_and_trim_plain_trailing_spaces() {
+    fn terminal_runs_merge_adjacent_same_style() {
         let mut line = TerminalLine::default();
         push_run(&mut line.runs, "a".to_string(), 0x111111, None);
-        push_run(&mut line.runs, " b  ".to_string(), 0x111111, None);
-        push_run(&mut line.runs, "  ".to_string(), 0x222222, None);
-        trim_line(&mut line);
-
-        assert_eq!(
-            line.runs,
-            vec![TerminalRun {
-                text: "a b".to_string(),
-                fg: 0x111111,
-                bg: None,
-            },]
-        );
+        push_run(&mut line.runs, "b".to_string(), 0x111111, None);
+        push_run(&mut line.runs, "c".to_string(), 0x222222, None);
+        assert_eq!(line.runs.len(), 2);
+        assert_eq!(line.runs[0].text, "ab");
+        assert_eq!(line.runs[1].text, "c");
     }
 
     #[test]
