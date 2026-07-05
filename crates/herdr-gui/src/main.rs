@@ -20,7 +20,6 @@ use ghostty::{TerminalFrame, TerminalLine, TerminalRun, TerminalSession};
 use help::help_overlay;
 use herdr::{Agent, HerdrClient, HerdrState, Pane, Tab, Workspace};
 use input::key_name;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::{
     sync::mpsc::{Receiver, TryRecvError},
@@ -105,7 +104,6 @@ struct HerdrGui {
     terminal_size: Option<TerminalSize>,
     terminal_token: u64,
     terminal_frame: Arc<TerminalFrame>,
-    terminal_frames: HashMap<String, Arc<TerminalFrame>>,
     state: HerdrState,
     status: String,
     show_help: bool,
@@ -124,6 +122,21 @@ struct HerdrGui {
     focus_handle: FocusHandle,
     settings: settings::Settings,
 }
+
+const SIDEBAR_MIN_WIDTH: f64 = 180.0;
+const SIDEBAR_MAX_WIDTH: f64 = 360.0;
+const SIDEBAR_COLLAPSED_WIDTH: f64 = 6.0;
+const TERMINAL_MIN_WIDTH: f64 = 320.0;
+const TERMINAL_MIN_HEIGHT: f64 = 240.0;
+const TERMINAL_CELL_WIDTH: f64 = 7.2;
+const TERMINAL_CELL_HEIGHT: f64 = 18.0;
+const TERMINAL_MIN_COLS: f64 = 40.0;
+const TERMINAL_MAX_COLS: f64 = 500.0;
+const TERMINAL_MIN_ROWS: f64 = 12.0;
+const TERMINAL_MAX_ROWS: f64 = 180.0;
+const RESIZE_HANDLE_WIDTH: f64 = 4.0;
+const TOP_TAB_BAR_HEIGHT: f64 = 34.0;
+const TRAFFIC_LIGHT_PADDING: f64 = 40.0;
 
 type TerminalSize = (u16, u16, u16, u16);
 
@@ -147,7 +160,9 @@ impl HerdrGui {
             "system-light" => ThemeMode::SystemLight,
             name => ThemeMode::Herdr(name.to_string()),
         };
-        let sidebar_width = settings.sidebar_width.clamp(180.0, 360.0);
+        let sidebar_width = settings
+            .sidebar_width
+            .clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
         Self {
             client,
             terminal: None,
@@ -155,7 +170,6 @@ impl HerdrGui {
             terminal_size: None,
             terminal_token: 0,
             terminal_frame: Arc::new(TerminalFrame::default()),
-            terminal_frames: HashMap::new(),
             state,
             status,
             show_help: false,
@@ -516,11 +530,7 @@ impl HerdrGui {
                 if let Some(receiver) = session.output.take() {
                     self.terminal_token = self.terminal_token.wrapping_add(1);
                     let token = self.terminal_token;
-                    self.terminal_frame = self
-                        .terminal_frames
-                        .get(&target)
-                        .cloned()
-                        .unwrap_or_default();
+                    self.terminal_frame = Arc::new(TerminalFrame::default());
                     if self.terminal_frame.lines.is_empty() {
                         if let (Some(client), Some(pane)) = (&self.client, pane.as_ref()) {
                             if let Ok(ansi) = client.read_pane_ansi(&pane.pane_id) {
@@ -586,18 +596,6 @@ impl HerdrGui {
         if target_was_visible && visible.len() <= 1 {
             self.with_client(|client| client.close_workspace(&workspace_id));
             self.refresh_state();
-        }
-    }
-
-    fn apply_terminal_frame(&mut self, token: u64, target: &str, frame: TerminalFrame) {
-        if self.terminal_token != token {
-            return;
-        }
-        if !frame.lines.is_empty() {
-            let frame = Arc::new(frame);
-            self.terminal_frames
-                .insert(target.to_string(), Arc::clone(&frame));
-            self.terminal_frame = frame;
         }
     }
 
@@ -746,7 +744,7 @@ impl HerdrGui {
     ) {
         if self.sidebar_resizing && event.dragging() {
             let width = event.position.x.to_f64();
-            self.sidebar_width_px = width.clamp(180.0, 360.0);
+            self.sidebar_width_px = width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
             self.sidebar_width_start = self.sidebar_width_px;
             self.sidebar_width_target = self.sidebar_width_px;
             self.terminal_size = None;
@@ -824,7 +822,6 @@ impl HerdrGui {
 
 impl Render for HerdrGui {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.attach_focused_terminal(window, cx);
         let theme = self.theme(window);
         let panes = self.visible_panes();
         let pane_frame = self.terminal_frame.clone();
@@ -1020,7 +1017,7 @@ impl HerdrGui {
 
     fn sidebar_width(&self) -> f64 {
         if self.sidebar_collapsed && !self.sidebar_hovered {
-            6.0
+            SIDEBAR_COLLAPSED_WIDTH
         } else {
             self.sidebar_width_px
         }
@@ -1028,15 +1025,20 @@ impl HerdrGui {
 
     fn terminal_size(&self, window: &Window) -> TerminalSize {
         let size = window.bounds().size;
-        let width = (size.width.to_f64() - self.sidebar_width() - 4.0).max(320.0);
+        let width = (size.width.to_f64() - self.sidebar_width() - RESIZE_HANDLE_WIDTH)
+            .max(TERMINAL_MIN_WIDTH);
         let top_tabs_height = if self.sidebar_layout == SidebarLayout::Arc {
-            34.0
+            TOP_TAB_BAR_HEIGHT
         } else {
             0.0
         };
-        let height = (size.height.to_f64() - top_tabs_height).max(240.0);
-        let cols = (width / 7.2).floor().clamp(40.0, 500.0) as u16;
-        let rows = (height / 18.0).floor().clamp(12.0, 180.0) as u16;
+        let height = (size.height.to_f64() - top_tabs_height).max(TERMINAL_MIN_HEIGHT);
+        let cols = (width / TERMINAL_CELL_WIDTH)
+            .floor()
+            .clamp(TERMINAL_MIN_COLS, TERMINAL_MAX_COLS) as u16;
+        let rows = (height / TERMINAL_CELL_HEIGHT)
+            .floor()
+            .clamp(TERMINAL_MIN_ROWS, TERMINAL_MAX_ROWS) as u16;
         (cols, rows, width.round() as u16, height.round() as u16)
     }
 
@@ -1047,7 +1049,7 @@ impl HerdrGui {
         let el = div()
             .h_full()
             .when(self.sidebar_layout == SidebarLayout::Arc, |el| {
-                el.pt(px(40.0))
+                el.pt(px(TRAFFIC_LIGHT_PADDING as f32))
             })
             .bg(rgb(theme.panel))
             .flex()
@@ -1131,7 +1133,13 @@ impl HerdrGui {
             .flex()
             .flex_col()
             .gap_1()
-            .child(section("spaces", theme))
+            .child(ui_text(
+                "spaces",
+                10,
+                theme.muted,
+                false,
+                "px-2 h-[18px] flex items-center",
+            ))
             .children(
                 self.state.workspaces.iter().map(|workspace| {
                     workspace_row(workspace, self.active_workspace_id(), theme, cx)
@@ -1157,7 +1165,7 @@ impl HerdrGui {
     fn top_tabs(&self, tabs: Vec<Tab>, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .w_full()
-            .h(px(34.0))
+            .h(px(TOP_TAB_BAR_HEIGHT as f32))
             .flex()
             .items_center()
             .gap_1()
@@ -1328,14 +1336,14 @@ impl HerdrGui {
     }
 }
 
-fn label(text: &str, color: u32) -> AnyElement {
-    crepus_render(
-        "div text-[14px] font-semibold text-{color}\n    \"{text}\"",
-        [
-            ("color", TemplateValue::Str(format!("{:06x}", color))),
-            ("text", TemplateValue::Str(text.to_string())),
-        ],
-    )
+fn ui_text(text: &str, size: u32, color: u32, bold: bool, classes: &str) -> AnyElement {
+    let weight = if bold { "font-semibold " } else { "" };
+    let template = if classes.is_empty() {
+        format!("div {weight}text-[{size}px] text-{color:06x}\n    \"{text}\"")
+    } else {
+        format!("div {classes} {weight}text-[{size}px] text-{color:06x}\n    \"{text}\"")
+    };
+    crepus_render(&template, [("text", TemplateValue::Str(text.to_string()))])
 }
 
 fn truncate_label(text: &str, max_chars: usize) -> String {
@@ -1355,72 +1363,11 @@ fn truncate_label(text: &str, max_chars: usize) -> String {
     }
 }
 
-fn small(text: &str, theme: UiTheme) -> AnyElement {
-    crepus_render(
-        "div text-[11px] text-{theme.muted}\n    \"{text}\"",
-        [
-            ("theme", TemplateValue::Scope(theme_ctx(theme))),
-            ("text", TemplateValue::Str(text.to_string())),
-        ],
-    )
-}
-
-fn section(text: &str, theme: UiTheme) -> AnyElement {
-    crepus_render(
-        "div px-2 h-[18px] flex items-center text-[10px] text-{theme.muted}\n    \"{text}\"",
-        [
-            ("theme", TemplateValue::Scope(theme_ctx(theme))),
-            ("text", TemplateValue::Str(text.to_string())),
-        ],
-    )
-}
-
 fn icon(name: &'static str, size: f32, theme: UiTheme) -> impl IntoElement {
     Icon::new(name)
         .size(px(size))
         .text_color(theme.label)
         .weight(SymbolWeight::Semibold)
-}
-
-fn theme_ctx(theme: UiTheme) -> TemplateContext {
-    let mut ctx = TemplateContext::default();
-    ctx.vars.insert(
-        "bg".to_string(),
-        TemplateValue::Str(format!("{:06x}", theme.bg)),
-    );
-    ctx.vars.insert(
-        "panel".to_string(),
-        TemplateValue::Str(format!("{:06x}", theme.panel)),
-    );
-    ctx.vars.insert(
-        "terminal".to_string(),
-        TemplateValue::Str(format!("{:06x}", theme.terminal)),
-    );
-    ctx.vars.insert(
-        "text".to_string(),
-        TemplateValue::Str(format!("{:06x}", theme.text)),
-    );
-    ctx.vars.insert(
-        "label".to_string(),
-        TemplateValue::Str(format!("{:06x}", theme.label)),
-    );
-    ctx.vars.insert(
-        "muted".to_string(),
-        TemplateValue::Str(format!("{:06x}", theme.muted)),
-    );
-    ctx.vars.insert(
-        "hover".to_string(),
-        TemplateValue::Str(format!("{:06x}", theme.hover)),
-    );
-    ctx.vars.insert(
-        "active".to_string(),
-        TemplateValue::Str(format!("{:06x}", theme.active)),
-    );
-    ctx.vars.insert(
-        "border".to_string(),
-        TemplateValue::Str(format!("{:06x}", theme.border)),
-    );
-    ctx
 }
 
 fn crepus_render(
@@ -1580,8 +1527,8 @@ fn workspace_row(
                 .flex()
                 .flex_col()
                 .gap_0p5()
-                .child(label(&title, theme.label))
-                .child(small(&detail, theme)),
+                .child(ui_text(&title, 14, theme.label, true, ""))
+                .child(ui_text(&detail, 11, theme.muted, false, "")),
         )
         .child(
             div()
@@ -1640,8 +1587,8 @@ fn tab_sidebar_row(
                 .flex()
                 .flex_col()
                 .gap_0p5()
-                .child(label(&title, theme.label))
-                .child(small(&detail, theme)),
+                .child(ui_text(&title, 14, theme.label, true, ""))
+                .child(ui_text(&detail, 11, theme.muted, false, "")),
         )
         .child(
             div()
@@ -1730,8 +1677,8 @@ fn agent_row_element(
                 .flex()
                 .flex_col()
                 .gap_0p5()
-                .child(label(&title, theme.label))
-                .child(small(&subtitle, theme)),
+                .child(ui_text(&title, 14, theme.label, true, ""))
+                .child(ui_text(&subtitle, 11, theme.muted, false, "")),
         )
         .child(
             div()
@@ -1848,6 +1795,9 @@ fn main() {
         });
         let window = cx.open_window(options, |_window, cx| cx.new(HerdrGui::new));
         if let Ok(window) = window {
+            let _ = window.update(cx, |view, window, cx| {
+                view.attach_focused_terminal(window, cx)
+            });
             let view = window.update(cx, |_, _, cx| cx.entity());
             if let Ok(view) = view {
                 cx.observe_keystrokes(move |event, _, cx| {
@@ -1888,7 +1838,9 @@ fn poll_terminal(
         if let Some(frame) = latest {
             if this
                 .update(cx, |view, cx| {
-                    view.apply_terminal_frame(token, &target, frame);
+                    if view.terminal_token == token && !frame.lines.is_empty() {
+                        view.terminal_frame = Arc::new(frame);
+                    }
                     cx.notify();
                 })
                 .is_err()

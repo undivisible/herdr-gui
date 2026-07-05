@@ -15,7 +15,6 @@ pub struct GhosttyRuntime;
 
 pub struct TerminalSession {
     pub output: Option<Receiver<TerminalFrame>>,
-    resize_tx: Sender<PtySize>,
     output_tx: Sender<TerminalFrame>,
     terminal: Arc<Mutex<GhosttyTerminal>>,
     master: Box<dyn MasterPty>,
@@ -245,7 +244,6 @@ impl TerminalSession {
         drop(pty.slave);
 
         let (output_tx, output_rx) = mpsc::channel::<TerminalFrame>();
-        let (resize_tx, resize_rx) = mpsc::channel::<PtySize>();
         let terminal = Arc::new(Mutex::new(GhosttyTerminal::new(api, cols, rows)?));
 
         let terminal_for_reader = terminal.clone();
@@ -337,13 +335,6 @@ impl TerminalSession {
                             || accumulated.len() >= BATCH_LIMIT
                             || last_send.elapsed() >= Duration::from_millis(MAX_BATCH_MS))
                     {
-                        for size in resize_rx.try_iter() {
-                            if let Ok(mut terminal) = terminal_for_reader.lock() {
-                                if let Err(err) = terminal.resize(size) {
-                                    let _ = output_tx_for_reader.send(TerminalFrame::message(err));
-                                }
-                            }
-                        }
                         if let Ok(mut terminal) = terminal_for_reader.lock() {
                             terminal.write(&accumulated);
                             if let Ok(frame) = terminal.frame() {
@@ -370,14 +361,6 @@ impl TerminalSession {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            for size in resize_rx.try_iter() {
-                                if let Ok(mut terminal) = terminal_for_reader.lock() {
-                                    if let Err(err) = terminal.resize(size) {
-                                        let _ =
-                                            output_tx_for_reader.send(TerminalFrame::message(err));
-                                    }
-                                }
-                            }
                             if let Ok(mut terminal) = terminal_for_reader.lock() {
                                 terminal.write(&buf[..n]);
                                 if let Ok(frame) = terminal.frame() {
@@ -399,7 +382,6 @@ impl TerminalSession {
 
         Ok(Self {
             output: Some(output_rx),
-            resize_tx,
             output_tx,
             terminal,
             master: pty.master,
@@ -421,7 +403,6 @@ impl TerminalSession {
                 let _ = self.output_tx.send(frame);
             }
         }
-        let _ = self.resize_tx.send(size);
     }
 
     pub fn scroll(&self, rows: isize) {

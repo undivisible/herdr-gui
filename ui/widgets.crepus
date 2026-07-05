@@ -15,12 +15,12 @@ div #swipe-hint absolute bottom-0 left-0 h-[2px] w-[{_width}px] bg-white opacity
 
 --- TabHeader
 div h-[22px] flex items-center justify-between
-    {section("tabs", theme)}
+    {ui_text("tabs", 10, theme.muted, false, "px-2 h-[18px] flex items-center")}
     div #new-tab-btn w-[22px] h-[22px] flex items-center justify-center cursor-pointer hover:bg-{theme.hover} @mousedown=new_tab_mouse
         {icon("plus", 12.0, theme)}
 
 --- AgentHeader
 div h-[22px] flex items-center justify-between
-    {section("agents", theme)}
+    {ui_text("agents", 10, theme.muted, false, "px-2 h-[18px] flex items-center")}
     div #toggle-agents-btn w-[22px] h-[22px] flex items-center justify-center cursor-pointer hover:bg-{theme.hover} @mousedown=toggle_agents_mouse
         {icon(chevron_icon, 11.0, theme)}
