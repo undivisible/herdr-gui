@@ -951,7 +951,9 @@ impl HerdrGui {
                     this.transition_sidebar_width(|this| this.sidebar_hovered = true, cx);
                 }
             }))
-            .child(space_switcher(self.active_workspace(), theme, cx))
+            .when(self.sidebar_layout != SidebarLayout::Arc, |el| {
+                el.child(space_switcher(self.active_workspace(), theme, cx))
+            })
             .when(self.show_spaces, |el| {
                 el.child(div().flex().flex_col().gap_2().children(
                     self.state.workspaces.iter().map(|workspace| {
@@ -1020,16 +1022,18 @@ impl HerdrGui {
     fn top_tabs(&self, tabs: Vec<Tab>, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .h(px(34.0))
+            .px_1()
             .flex()
             .items_center()
+            .gap_1()
             .bg(rgb(theme.panel))
             .overflow_hidden()
-            .child(tab_header(theme, cx))
-            .children(tabs.into_iter().map(|tab| {
+            .children(tabs.into_iter().enumerate().map(|(index, tab)| {
+                let number = index + 1;
                 let id = tab.tab_id.clone();
                 let close_id = tab.tab_id.clone();
                 tab_chip(
-                    self.tab_title(&tab),
+                    number.to_string(),
                     tab.focused
                         || self
                             .state
@@ -1048,6 +1052,21 @@ impl HerdrGui {
                     }),
                 )
             }))
+            .child(
+                div()
+                    .h(px(28.0))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(rgb(theme.hover)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| this.new_tab(&NewTab, window, cx)),
+                    )
+                    .child(icon("plus", 12.0, theme)),
+            )
     }
 
     fn agent_rows(&self, theme: UiTheme, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -1346,27 +1365,21 @@ fn tab_chip(
 }
 
 fn tab_header(theme: UiTheme, cx: &mut Context<HerdrGui>) -> impl IntoElement {
-    div()
-        .pt_1()
-        .flex()
-        .items_center()
-        .justify_between()
-        .child(section("tabs", theme))
-        .child(
-            div()
-                .w(px(22.0))
-                .h(px(22.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .hover(move |style| style.bg(rgb(theme.hover)))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| this.new_tab(&NewTab, window, cx)),
-                )
-                .child(icon("plus", 12.0, theme)),
-        )
+    div().pt_1().flex().items_center().justify_end().child(
+        div()
+            .w(px(22.0))
+            .h(px(22.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(move |style| style.bg(rgb(theme.hover)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.new_tab(&NewTab, window, cx)),
+            )
+            .child(icon("plus", 12.0, theme)),
+    )
 }
 
 fn agent_header(collapsed: bool, theme: UiTheme, cx: &mut Context<HerdrGui>) -> impl IntoElement {
