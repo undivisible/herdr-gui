@@ -333,8 +333,14 @@ impl TerminalSession {
                         last_send = Instant::now();
                     }
                 }
-                let _ = child.kill();
-                let _ = child.wait();
+                // Exit immediately when the PTY closes so the main thread sees
+                // the disconnect and can switch to the previous terminal. The
+                // child cleanup is deferred to a separate thread so this one
+                // never blocks on a slow shell exit.
+                thread::spawn(move || {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                });
             });
         }
         #[cfg(not(unix))]

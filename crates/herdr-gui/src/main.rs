@@ -11,9 +11,9 @@ use crepuscularity_gpui as gpui;
 use crepuscularity_gpui::prelude::*;
 use crepuscularity_gpui::{
     actions, bounce, bounds, div, gpui_window_options, linear, point, px, rgb, size, AnyElement,
-    App, Application, Context, FocusHandle, Icon, IntoElement, KeyBinding, Keystroke, Menu,
-    MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollWheelEvent,
-    SystemMenuType, TitlebarOptions, Window, WindowAppearance, WindowBounds,
+    AnyWindowHandle, App, Application, Context, FocusHandle, Icon, IntoElement, KeyBinding,
+    Keystroke, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render,
+    ScrollWheelEvent, SystemMenuType, TitlebarOptions, Window, WindowAppearance, WindowBounds,
 };
 use crepuscularity_runtime::render_nodes;
 use ghostty::{TerminalFrame, TerminalLine, TerminalRun, TerminalSession};
@@ -229,7 +229,13 @@ impl HerdrGui {
     }
 
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, _window: &mut Window, cx: &mut Context<Self>) {
-        self.transition_sidebar_width(|this| this.sidebar_collapsed = !this.sidebar_collapsed, cx);
+        self.transition_sidebar_width(
+            |this| {
+                this.sidebar_animation.hovered = false;
+                this.sidebar_collapsed = !this.sidebar_collapsed;
+            },
+            cx,
+        );
     }
 
     fn transition_sidebar_width<F>(&mut self, f: F, cx: &mut Context<Self>)
@@ -561,7 +567,9 @@ impl HerdrGui {
                     self.terminal_target = Some(target.clone());
                     self.terminal_size = Some(size);
                     self.status = "connected".to_string();
-                    poll_terminal(receiver, token, target, cx);
+                    if let Some(window) = cx.active_window() {
+                        poll_terminal(receiver, token, target, window, cx);
+                    }
                 }
             }
             Err(err) => {
@@ -716,7 +724,8 @@ impl HerdrGui {
         cx: &mut Context<Self>,
     ) {
         let delta = event.delta.pixel_delta(px(18.0));
-        if delta.x.abs() > delta.y.abs() {
+        let horizontal = delta.x.abs() > delta.y.abs() + px(20.0);
+        if horizontal {
             self.scroll_x += delta.x.to_f64();
             self.swipe_progress = (self.scroll_x / 80.0).clamp(-1.0, 1.0);
             cx.notify();
@@ -729,14 +738,16 @@ impl HerdrGui {
             self.focus_workspace_offset(offset, window, cx);
             return;
         }
-        let rows = (delta.y.to_f64() / 18.0).round() as isize;
-        if rows != 0 {
-            if let Some(terminal) = self.terminal.as_mut() {
-                if let Ok(frame) = terminal.scroll(-rows) {
-                    self.terminal_frame = Arc::new(frame);
-                }
-                cx.notify();
+        let rows = if delta.y.to_f64() > 0.0 {
+            (delta.y.to_f64() / 18.0).round().max(1.0) as isize
+        } else {
+            -(delta.y.to_f64().abs() / 18.0).round().max(1.0) as isize
+        };
+        if let Some(terminal) = self.terminal.as_mut() {
+            if let Ok(frame) = terminal.scroll(-rows) {
+                self.terminal_frame = Arc::new(frame);
             }
+            cx.notify();
         }
     }
 
@@ -1407,9 +1418,9 @@ impl HerdrGui {
 fn ui_text(text: &str, size: u32, color: u32, bold: bool, classes: &str) -> AnyElement {
     let weight = if bold { "font-semibold " } else { "" };
     let template = if classes.is_empty() {
-        format!("div {weight}text-[{size}px] text-{color:06x}\n    \"{text}\"")
+        format!("div {weight}text-[{size}px] text-[#{color:06x}]\n    \"{text}\"")
     } else {
-        format!("div {classes} {weight}text-[{size}px] text-{color:06x}\n    \"{text}\"")
+        format!("div {classes} {weight}text-[{size}px] text-[#{color:06x}]\n    \"{text}\"")
     };
     crepus_render(&template, [("text", TemplateValue::Str(text.to_string()))])
 }
@@ -1884,6 +1895,7 @@ fn poll_terminal(
     receiver: Receiver<Vec<u8>>,
     token: u64,
     target: String,
+    window: AnyWindowHandle,
     cx: &mut Context<HerdrGui>,
 ) {
     cx.spawn(async move |this, cx| loop {
@@ -1921,12 +1933,18 @@ fn poll_terminal(
         if disconnected {
             let _ = this.update(cx, |view, cx| {
                 if view.terminal_token == token {
+                    view.terminal = None;
                     view.terminal_target = None;
                     view.terminal_size = None;
                     view.refresh_state();
                     view.close_workspace_after_terminal_exit(&target);
                 }
                 cx.notify();
+            });
+            let _ = cx.update_window(window, |_, window, cx| {
+                let _ = this.update(cx, |view, cx| {
+                    view.attach_focused_terminal(window, cx);
+                });
             });
             break;
         }
