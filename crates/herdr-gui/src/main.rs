@@ -659,6 +659,7 @@ impl HerdrGui {
         }
     }
 
+    #[allow(dead_code)]
     fn handle_workspace_scroll(
         &mut self,
         event: &ScrollWheelEvent,
@@ -711,6 +712,7 @@ impl HerdrGui {
     set_theme!(theme_vesper, ThemeVesper, "vesper");
     set_theme!(theme_oled, ThemeOled, "oled");
 
+    #[allow(dead_code)]
     fn handle_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
@@ -731,6 +733,7 @@ impl HerdrGui {
         }
     }
 
+    #[allow(dead_code)]
     fn handle_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if self.sidebar_resizing {
             self.sidebar_resizing = false;
@@ -762,7 +765,10 @@ impl Render for HerdrGui {
         let pane_frame = self.terminal_frame.clone();
 
         let root = view! {r#"
-            div #herdr-root w-full h-full flex overflow-hidden font-['Inter']
+            div #herdr-root w-full h-full flex overflow-hidden font-['Inter'] text-[14px] text-{theme.text} bg-{theme.bg}
+                @scroll=handle_workspace_scroll
+                @mousemove=handle_mouse_move
+                @mouseup=handle_mouse_up
                 {self.sidebar(theme, cx)}
                 {resize_handle(theme, cx)}
                 {self.terminal_area(panes, pane_frame, theme, cx)}
@@ -811,11 +817,6 @@ impl Render for HerdrGui {
             .on_action(cx.listener(Self::theme_system_dark))
             .on_action(cx.listener(Self::theme_system_light))
             .on_action(cx.listener(Self::reload_herdr_config))
-            .on_scroll_wheel(cx.listener(Self::handle_workspace_scroll))
-            .on_mouse_move(cx.listener(Self::handle_mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
-            .bg(rgb(theme.bg))
-            .text_color(rgb(theme.text))
     }
 }
 
@@ -839,7 +840,7 @@ impl HerdrGui {
         let show_help = self.show_help;
 
         view! {r#"
-            div #terminal-area flex-1 h-full overflow-hidden flex flex-col font-['Inter']
+            div #terminal-area flex-1 h-full overflow-hidden flex flex-col font-['Inter'] bg-{theme.terminal}
                 if {show_top_tabs}
                     {self.top_tabs(tabs, theme, cx)}
                 {pane_container}
@@ -848,7 +849,6 @@ impl HerdrGui {
                 if {show_help}
                     {help_overlay()}
         "#}
-        .bg(rgb(theme.terminal))
     }
 
     fn active_workspace(&self) -> Option<&Workspace> {
@@ -1725,14 +1725,14 @@ fn agent_row_element(
         .into_any_element()
 }
 
-fn empty_state(status: &str, _theme: UiTheme) -> impl IntoElement {
+fn empty_state(status: &str, theme: UiTheme) -> impl IntoElement {
     view! {r#"
-        div #empty-state w-[560px] rounded-lg bg-black border border-white/20 p-5 flex flex-col gap-3
-            div text-white
+        div #empty-state w-[560px] rounded-lg bg-{theme.panel} border border-{theme.border} p-5 flex flex-col gap-3
+            div text-{theme.label}
                 "No Herdr panes visible"
-            div text-white/60
+            div text-{theme.muted}
                 "{status}"
-            div rounded-lg bg-black border border-white/20 p-3 font-mono text-[12px] text-white
+            div rounded-lg bg-{theme.terminal} border border-{theme.border} p-3 font-mono text-[12px] text-{theme.text}
                 "Open Herdr in a terminal, create a workspace/pane, then press Refresh."
     "#}
 }
