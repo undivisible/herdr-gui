@@ -10,10 +10,10 @@ use crepuscularity_core::{parse_template, TemplateContext, TemplateValue};
 use crepuscularity_gpui as gpui;
 use crepuscularity_gpui::prelude::*;
 use crepuscularity_gpui::{
-    actions, bounds, div, gpui_window_options, point, px, rgb, size, AnyElement, App, Application,
-    Context, FocusHandle, Icon, IntoElement, KeyBinding, Keystroke, Menu, MenuItem, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollWheelEvent, SystemMenuType,
-    TitlebarOptions, Window, WindowAppearance, WindowBounds,
+    actions, bounce, bounds, div, gpui_window_options, linear, point, px, rgb, size, AnyElement,
+    App, Application, Context, FocusHandle, Icon, IntoElement, KeyBinding, Keystroke, Menu,
+    MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollWheelEvent,
+    SystemMenuType, TitlebarOptions, Window, WindowAppearance, WindowBounds,
 };
 use crepuscularity_runtime::render_nodes;
 use ghostty::{TerminalFrame, TerminalLine, TerminalRun, TerminalSession};
@@ -120,6 +120,7 @@ struct HerdrGui {
     sidebar_width_target: f64,
     theme_mode: ThemeMode,
     swipe_progress: f64,
+    scroll_x: f64,
     focus_handle: FocusHandle,
     settings: settings::Settings,
 }
@@ -169,6 +170,7 @@ impl HerdrGui {
             sidebar_width_target: sidebar_width,
             theme_mode,
             swipe_progress: 0.0,
+            scroll_x: 0.0,
             focus_handle: cx.focus_handle(),
             settings,
         }
@@ -663,12 +665,23 @@ impl HerdrGui {
     fn handle_workspace_scroll(
         &mut self,
         event: &ScrollWheelEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Only vertical scroll — terminal scroll.
-        // Horizontal scroll is ignored (user request: "terminal shouldnt scroll horizontally").
         let delta = event.delta.pixel_delta(px(18.0));
+        if delta.x.abs() > delta.y.abs() {
+            self.scroll_x += delta.x.to_f64();
+            self.swipe_progress = (self.scroll_x / 80.0).clamp(-1.0, 1.0);
+            cx.notify();
+            if self.scroll_x.abs() < 80.0 {
+                return;
+            }
+            let offset = if self.scroll_x < 0.0 { 1 } else { -1 };
+            self.scroll_x = 0.0;
+            self.swipe_progress = 0.0;
+            self.focus_workspace_offset(offset, window, cx);
+            return;
+        }
         let rows = (delta.y.to_f64() / 18.0).round() as isize;
         if rows != 0 {
             if let Some(terminal) = &self.terminal {
@@ -872,7 +885,7 @@ impl HerdrGui {
         let show_help = self.show_help;
 
         view! {r#"
-            div #terminal-area flex-1 h-full overflow-hidden flex flex-col font-['Inter'] bg-{theme.terminal}
+            div #terminal-area flex-1 h-full overflow-hidden flex flex-col bg-{theme.terminal}
                 if {show_top_tabs}
                     {self.top_tabs(tabs, theme, cx)}
                 {pane_container}
@@ -1037,10 +1050,18 @@ impl HerdrGui {
                 el.child(space_switcher(self.active_workspace(), theme, cx))
             })
             .when(self.show_spaces, |el| {
-                el.child(div().flex().flex_col().gap_2().children(
-                    self.state.workspaces.iter().map(|workspace| {
-                        workspace_row(workspace, self.active_workspace_id(), theme, cx)
-                    }),
+                el.child(animation::opacity(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .children(self.state.workspaces.iter().map(|workspace| {
+                            workspace_row(workspace, self.active_workspace_id(), theme, cx)
+                        })),
+                    "spaces-dropdown",
+                    Duration::from_millis(200),
+                    0.0,
+                    1.0,
                 ))
             })
             .when(self.sidebar_layout == SidebarLayout::Warp, |el| {
@@ -1078,7 +1099,17 @@ impl HerdrGui {
             .child(div().flex_1())
             .child(self.agent_header(self.agents_collapsed, theme, cx))
             .when(!self.agents_collapsed, |el| {
-                el.children(self.agent_rows(theme, cx))
+                el.child(animation::opacity(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .children(self.agent_rows(theme, cx)),
+                    "agents-dropdown",
+                    Duration::from_millis(200),
+                    0.0,
+                    1.0,
+                ))
             })
     }
 
@@ -1097,7 +1128,17 @@ impl HerdrGui {
             .child(div().h(px(1.0)).bg(rgb(theme.border)))
             .child(self.agent_header(self.agents_collapsed, theme, cx))
             .when(!self.agents_collapsed, |el| {
-                el.children(self.agent_rows(theme, cx))
+                el.child(animation::opacity(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .children(self.agent_rows(theme, cx)),
+                    "agents-dropdown-right",
+                    Duration::from_millis(200),
+                    0.0,
+                    1.0,
+                ))
             })
     }
 
@@ -1323,7 +1364,10 @@ fn section(text: &str, theme: UiTheme) -> AnyElement {
 }
 
 fn icon(name: &'static str, size: f32, theme: UiTheme) -> impl IntoElement {
-    Icon::new(name).size(px(size)).text_color(theme.label)
+    Icon::new(name)
+        .size(px(size))
+        .text_color(theme.label)
+        .weight(SymbolWeight::Semibold)
 }
 
 fn theme_ctx(theme: UiTheme) -> TemplateContext {
@@ -1381,7 +1425,13 @@ fn crepus_render(
 
 fn swipe_hint(progress: f64, _theme: UiTheme) -> impl IntoElement {
     let _width = (progress.abs() * 80.0).max(8.0) as f32;
-    view_file!("ui/widgets.crepus#SwipeHint")
+    view_file!("ui/widgets.crepus#SwipeHint").with_animation(
+        "swipe-hint-pulse",
+        Animation::new(Duration::from_millis(800))
+            .repeat()
+            .with_easing(bounce(linear)),
+        |el, delta| el.opacity(0.35 + 0.2 * delta),
+    )
 }
 
 fn space_switcher(
