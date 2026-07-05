@@ -44,7 +44,7 @@ impl Settings {
     }
 }
 
-fn settings_dir() -> PathBuf {
+pub fn settings_dir() -> PathBuf {
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .map(PathBuf::from)
