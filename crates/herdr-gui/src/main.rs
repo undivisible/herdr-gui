@@ -760,11 +760,6 @@ impl HerdrGui {
         self.toggle_agents(&ToggleAgents, window, cx);
     }
 
-    fn resize_handle(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
-        let _ = cx;
-        view_file!("ui/resize_handle.crepus").hover(move |style| style.bg(rgb(theme.hover)))
-    }
-
     fn tab_header(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
         let _ = cx;
         view_file!("ui/tab_header.crepus")
@@ -807,7 +802,7 @@ impl Render for HerdrGui {
         let panes = self.visible_panes();
         let pane_frame = self.terminal_frame.clone();
 
-        let root = view_file!("ui/main.crepus");
+        let root = view_file!("ui/ui.crepus");
 
         root.key_context("HerdrGui")
             .track_focus(&self.focus_handle)

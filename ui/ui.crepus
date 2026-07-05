@@ -3,5 +3,5 @@ div #herdr-root w-full h-full flex overflow-hidden font-['Inter'] text-[14px] te
     @mousemove=handle_mouse_move
     @mouseup=handle_mouse_up
     {self.sidebar(theme, cx)}
-    {self.resize_handle(theme, cx)}
+    include "resize_handle.crepus"
     {self.terminal_area(panes, pane_frame, theme, cx)}
