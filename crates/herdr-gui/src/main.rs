@@ -1363,14 +1363,11 @@ fn resize_handle(theme: UiTheme, cx: &mut Context<HerdrGui>) -> impl IntoElement
         )
 }
 
-fn swipe_hint(progress: f64, theme: UiTheme) -> AnyElement {
+fn swipe_hint(progress: f64, _theme: UiTheme) -> AnyElement {
     let width = (progress.abs() * 80.0).max(8.0) as f32;
     crepus_render(
-        "div absolute bottom-0 left-0 h-[2px] w-[{width}px] bg-{theme.label} opacity-35",
-        [
-            ("theme", TemplateValue::Scope(theme_ctx(theme))),
-            ("width", TemplateValue::Float(width as f64)),
-        ],
+        "div #swipe-hint absolute bottom-0 left-0 h-[2px] w-[{width}px] bg-white opacity-35",
+        [("width", TemplateValue::Float(width as f64))],
     )
 }
 
@@ -1722,22 +1719,16 @@ fn agent_row_element(
         .into_any_element()
 }
 
-fn empty_state(status: &str, theme: UiTheme) -> AnyElement {
-    crepus_render(
-        r#"
-        div w-[560px] rounded-lg bg-{theme.panel} border border-{theme.border} p-5 flex flex-col gap-3
-            div text-{theme.label}
+fn empty_state(status: &str, _theme: UiTheme) -> impl IntoElement {
+    view! {r#"
+        div #empty-state w-[560px] rounded-lg bg-black border border-white/20 p-5 flex flex-col gap-3
+            div text-white
                 "No Herdr panes visible"
-            div text-{theme.muted}
+            div text-white/60
                 "{status}"
-            div rounded-lg bg-{theme.terminal} border border-{theme.border} p-3 font-mono text-[12px] text-{theme.text}
+            div rounded-lg bg-black border border-white/20 p-3 font-mono text-[12px] text-white
                 "Open Herdr in a terminal, create a workspace/pane, then press Refresh."
-        "#,
-        [
-            ("theme", TemplateValue::Scope(theme_ctx(theme))),
-            ("status", TemplateValue::Str(status.to_string())),
-        ],
-    )
+    "#}
 }
 
 fn main() {
