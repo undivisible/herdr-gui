@@ -6,6 +6,7 @@ mod settings;
 mod terminal_view;
 mod theme;
 
+use crepuscularity_core::{parse_template, TemplateContext, TemplateValue};
 use crepuscularity_gpui as gpui;
 use crepuscularity_gpui::prelude::*;
 use crepuscularity_gpui::{
@@ -14,6 +15,7 @@ use crepuscularity_gpui::{
     MouseMoveEvent, MouseUpEvent, Render, ScrollWheelEvent, SystemMenuType, TitlebarOptions,
     Window, WindowAppearance, WindowBounds,
 };
+use crepuscularity_runtime::render_nodes;
 use ghostty::{TerminalFrame, TerminalLine, TerminalRun, TerminalSession};
 use help::help_overlay;
 use herdr::{Agent, HerdrClient, HerdrState, Pane, Tab, Workspace};
@@ -1241,12 +1243,14 @@ impl HerdrGui {
     }
 }
 
-fn label(text: &str, color: u32) -> impl IntoElement {
-    div()
-        .text_size(px(14.0))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(color))
-        .child(text.to_string())
+fn label(text: &str, color: u32) -> AnyElement {
+    crepus_render(
+        "div text-[14px] font-semibold text-{color}\n    \"{text}\"",
+        [
+            ("color", TemplateValue::Str(format!("{:06x}", color))),
+            ("text", TemplateValue::Str(text.to_string())),
+        ],
+    )
 }
 
 fn truncate_label(text: &str, max_chars: usize) -> String {
@@ -1266,24 +1270,81 @@ fn truncate_label(text: &str, max_chars: usize) -> String {
     }
 }
 
-fn small(text: &str, theme: UiTheme) -> impl IntoElement {
-    div()
-        .text_size(px(11.0))
-        .text_color(rgb(theme.muted))
-        .child(text.to_string())
+fn small(text: &str, theme: UiTheme) -> AnyElement {
+    crepus_render(
+        "div text-[11px] text-{theme.muted}\n    \"{text}\"",
+        [
+            ("theme", TemplateValue::Scope(theme_ctx(theme))),
+            ("text", TemplateValue::Str(text.to_string())),
+        ],
+    )
 }
 
-fn section(text: &str, theme: UiTheme) -> impl IntoElement {
-    div()
-        .px_2()
-        .pt_1()
-        .text_size(px(10.0))
-        .text_color(rgb(theme.muted))
-        .child(text.to_string())
+fn section(text: &str, theme: UiTheme) -> AnyElement {
+    crepus_render(
+        "div px-2 pt-1 text-[10px] text-{theme.muted}\n    \"{text}\"",
+        [
+            ("theme", TemplateValue::Scope(theme_ctx(theme))),
+            ("text", TemplateValue::Str(text.to_string())),
+        ],
+    )
 }
 
 fn icon(name: &'static str, size: f32, theme: UiTheme) -> impl IntoElement {
     Icon::new(name).size(px(size)).text_color(theme.label)
+}
+
+fn theme_ctx(theme: UiTheme) -> TemplateContext {
+    let mut ctx = TemplateContext::default();
+    ctx.vars.insert(
+        "bg".to_string(),
+        TemplateValue::Str(format!("{:06x}", theme.bg)),
+    );
+    ctx.vars.insert(
+        "panel".to_string(),
+        TemplateValue::Str(format!("{:06x}", theme.panel)),
+    );
+    ctx.vars.insert(
+        "terminal".to_string(),
+        TemplateValue::Str(format!("{:06x}", theme.terminal)),
+    );
+    ctx.vars.insert(
+        "text".to_string(),
+        TemplateValue::Str(format!("{:06x}", theme.text)),
+    );
+    ctx.vars.insert(
+        "label".to_string(),
+        TemplateValue::Str(format!("{:06x}", theme.label)),
+    );
+    ctx.vars.insert(
+        "muted".to_string(),
+        TemplateValue::Str(format!("{:06x}", theme.muted)),
+    );
+    ctx.vars.insert(
+        "hover".to_string(),
+        TemplateValue::Str(format!("{:06x}", theme.hover)),
+    );
+    ctx.vars.insert(
+        "active".to_string(),
+        TemplateValue::Str(format!("{:06x}", theme.active)),
+    );
+    ctx.vars.insert(
+        "border".to_string(),
+        TemplateValue::Str(format!("{:06x}", theme.border)),
+    );
+    ctx
+}
+
+fn crepus_render(
+    template: &str,
+    vars: impl IntoIterator<Item = (&'static str, TemplateValue)>,
+) -> AnyElement {
+    let mut ctx = TemplateContext::default();
+    for (key, value) in vars {
+        ctx.vars.insert(key.to_string(), value);
+    }
+    let nodes = parse_template(template).unwrap_or_default();
+    render_nodes(&nodes, &ctx)
 }
 
 fn resize_handle(theme: UiTheme, cx: &mut Context<HerdrGui>) -> impl IntoElement {
@@ -1302,16 +1363,15 @@ fn resize_handle(theme: UiTheme, cx: &mut Context<HerdrGui>) -> impl IntoElement
         )
 }
 
-fn swipe_hint(progress: f64, theme: UiTheme) -> impl IntoElement {
+fn swipe_hint(progress: f64, theme: UiTheme) -> AnyElement {
     let width = (progress.abs() * 80.0).max(8.0) as f32;
-    div()
-        .absolute()
-        .bottom(px(0.0))
-        .left(px(0.0))
-        .h(px(2.0))
-        .w(px(width))
-        .bg(rgb(theme.label))
-        .opacity(0.35)
+    crepus_render(
+        "div absolute bottom-0 left-0 h-[2px] w-[{width}px] bg-{theme.label} opacity-35",
+        [
+            ("theme", TemplateValue::Scope(theme_ctx(theme))),
+            ("width", TemplateValue::Float(width as f64)),
+        ],
+    )
 }
 
 fn space_switcher(
@@ -1662,31 +1722,22 @@ fn agent_row_element(
         .into_any_element()
 }
 
-fn empty_state(status: &str, theme: UiTheme) -> impl IntoElement {
-    div()
-        .w(px(560.0))
-        .rounded_lg()
-        .bg(rgb(theme.panel))
-        .border_1()
-        .border_color(rgb(theme.border))
-        .p_5()
-        .flex()
-        .flex_col()
-        .gap_3()
-        .child(label("No Herdr panes visible", theme.label))
-        .child(small(status, theme))
-        .child(
-            div()
-                .rounded_lg()
-                .bg(rgb(theme.terminal))
-                .border_1()
-                .border_color(rgb(theme.border))
-                .p_3()
-                .font_family("Menlo")
-                .text_size(px(12.0))
-                .text_color(rgb(theme.text))
-                .child("Open Herdr in a terminal, create a workspace/pane, then press Refresh."),
-        )
+fn empty_state(status: &str, theme: UiTheme) -> AnyElement {
+    crepus_render(
+        r#"
+        div w-[560px] rounded-lg bg-{theme.panel} border border-{theme.border} p-5 flex flex-col gap-3
+            div text-{theme.label}
+                "No Herdr panes visible"
+            div text-{theme.muted}
+                "{status}"
+            div rounded-lg bg-{theme.terminal} border border-{theme.border} p-3 font-mono text-[12px] text-{theme.text}
+                "Open Herdr in a terminal, create a workspace/pane, then press Refresh."
+        "#,
+        [
+            ("theme", TemplateValue::Scope(theme_ctx(theme))),
+            ("status", TemplateValue::Str(status.to_string())),
+        ],
+    )
 }
 
 fn main() {
