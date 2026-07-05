@@ -13,8 +13,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release
-      - run: mkdir -p dist && cp target/release/herdr-gui dist/herdr-gui
-      - uses: actions/upload-artifact@v4
+      - run: |
+          mkdir -p dist
+          tar -czf dist/herdr-gui-macos-aarch64.tar.gz -C target/release herdr-gui
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
         with:
-          name: herdr-gui-macos
-          path: dist/herdr-gui
+          files: dist/herdr-gui-macos-aarch64.tar.gz
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
