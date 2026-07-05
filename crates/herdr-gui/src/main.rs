@@ -12,8 +12,8 @@ use crepuscularity_gpui::prelude::*;
 use crepuscularity_gpui::{
     actions, bounds, div, gpui_window_options, point, px, rgb, size, AnyElement, App, Application,
     Context, FocusHandle, Icon, IntoElement, KeyBinding, Keystroke, Menu, MenuItem, MouseButton,
-    MouseMoveEvent, MouseUpEvent, Render, ScrollWheelEvent, SystemMenuType, TitlebarOptions,
-    Window, WindowAppearance, WindowBounds,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollWheelEvent, SystemMenuType,
+    TitlebarOptions, Window, WindowAppearance, WindowBounds,
 };
 use crepuscularity_runtime::render_nodes;
 use ghostty::{TerminalFrame, TerminalLine, TerminalRun, TerminalSession};
@@ -742,6 +742,19 @@ impl HerdrGui {
         }
     }
 
+    fn start_resize(&mut self, _: &MouseDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_resizing = true;
+        cx.notify();
+    }
+
+    fn resize_handle(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
+        let _ = cx;
+        view! {r#"
+            div #resize-handle w-[4px] h-full flex-none cursor-col-resize @mousedown=start_resize
+        "#}
+        .hover(move |style| style.bg(rgb(theme.hover)))
+    }
+
     fn theme(&self, window: &Window) -> UiTheme {
         match &self.theme_mode {
             ThemeMode::Herdr(name) => herdr_theme(name),
@@ -770,7 +783,7 @@ impl Render for HerdrGui {
                 @mousemove=handle_mouse_move
                 @mouseup=handle_mouse_up
                 {self.sidebar(theme, cx)}
-                {resize_handle(theme, cx)}
+                {self.resize_handle(theme, cx)}
                 {self.terminal_area(panes, pane_frame, theme, cx)}
         "#};
 
@@ -1345,22 +1358,6 @@ fn crepus_render(
     }
     let nodes = parse_template(template).unwrap_or_default();
     render_nodes(&nodes, &ctx)
-}
-
-fn resize_handle(theme: UiTheme, cx: &mut Context<HerdrGui>) -> impl IntoElement {
-    div()
-        .w(px(4.0))
-        .h_full()
-        .flex_none()
-        .cursor_col_resize()
-        .hover(move |style| style.bg(rgb(theme.hover)))
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                this.sidebar_resizing = true;
-                cx.notify();
-            }),
-        )
 }
 
 fn swipe_hint(progress: f64, _theme: UiTheme) -> AnyElement {
