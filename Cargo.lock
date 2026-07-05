@@ -2482,6 +2482,7 @@ dependencies = [
  "crepuscularity-gpui",
  "crepuscularity-runtime",
  "gpui",
+ "libc",
  "portable-pty",
  "serde",
  "serde_json",

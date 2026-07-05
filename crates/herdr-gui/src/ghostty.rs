@@ -1,7 +1,6 @@
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use std::{
     ffi::c_void,
-    io::Read,
     ptr,
     sync::{
         mpsc::{self, Receiver, Sender},
@@ -244,22 +243,72 @@ impl TerminalSession {
         let killer = child.clone_killer();
         drop(pty.slave);
 
-        let mut reader = pty
-            .master
-            .try_clone_reader()
-            .map_err(|err| err.to_string())?;
         let (output_tx, output_rx) = mpsc::channel::<TerminalFrame>();
         let (resize_tx, resize_rx) = mpsc::channel::<PtySize>();
         let terminal = Arc::new(Mutex::new(GhosttyTerminal::new(api, cols, rows)?));
 
         let terminal_for_reader = terminal.clone();
         let output_tx_for_reader = output_tx.clone();
-        thread::spawn(move || {
-            let mut buf = [0_u8; 8192];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
+        #[cfg(unix)]
+        {
+            let fd = pty
+                .master
+                .as_raw_fd()
+                .ok_or("pty master fd not available")?;
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+            if flags < 0 {
+                return Err(format!(
+                    "fcntl F_GETFL failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+                return Err(format!(
+                    "fcntl F_SETFL failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+
+            thread::spawn(move || {
+                let mut buf = [0_u8; 8192];
+                let mut accumulated = Vec::new();
+                let mut done = false;
+                while !done {
+                    let mut fds = libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let ret = unsafe { libc::poll(&mut fds, 1, 16) };
+                    if ret < 0 {
+                        let _ = output_tx_for_reader.send(TerminalFrame::message(
+                            std::io::Error::last_os_error().to_string(),
+                        ));
+                        break;
+                    }
+                    if ret > 0 && (fds.revents & libc::POLLIN) != 0 {
+                        loop {
+                            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+                            if n < 0 {
+                                let err = std::io::Error::last_os_error();
+                                if err.raw_os_error() == Some(libc::EAGAIN)
+                                    || err.raw_os_error() == Some(libc::EWOULDBLOCK)
+                                {
+                                    break;
+                                }
+                                let _ = output_tx_for_reader
+                                    .send(TerminalFrame::message(err.to_string()));
+                                done = true;
+                                break;
+                            } else if n == 0 {
+                                done = true;
+                                break;
+                            } else {
+                                accumulated.extend_from_slice(&buf[..n as usize]);
+                            }
+                        }
+                    }
+                    if !accumulated.is_empty() {
                         for size in resize_rx.try_iter() {
                             if let Ok(mut terminal) = terminal_for_reader.lock() {
                                 if let Err(err) = terminal.resize(size) {
@@ -268,21 +317,56 @@ impl TerminalSession {
                             }
                         }
                         if let Ok(mut terminal) = terminal_for_reader.lock() {
-                            terminal.write(&buf[..n]);
+                            terminal.write(&accumulated);
                             if let Ok(frame) = terminal.frame() {
                                 let _ = output_tx_for_reader.send(frame);
                             }
                         }
-                    }
-                    Err(err) => {
-                        let _ = output_tx_for_reader.send(TerminalFrame::message(err.to_string()));
-                        break;
+                        accumulated.clear();
                     }
                 }
-            }
-            let _ = child.kill();
-            let _ = child.wait();
-        });
+                let _ = child.kill();
+                let _ = child.wait();
+            });
+        }
+        #[cfg(not(unix))]
+        {
+            let mut reader = pty
+                .master
+                .try_clone_reader()
+                .map_err(|err| err.to_string())?;
+            thread::spawn(move || {
+                let mut buf = [0_u8; 8192];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            for size in resize_rx.try_iter() {
+                                if let Ok(mut terminal) = terminal_for_reader.lock() {
+                                    if let Err(err) = terminal.resize(size) {
+                                        let _ =
+                                            output_tx_for_reader.send(TerminalFrame::message(err));
+                                    }
+                                }
+                            }
+                            if let Ok(mut terminal) = terminal_for_reader.lock() {
+                                terminal.write(&buf[..n]);
+                                if let Ok(frame) = terminal.frame() {
+                                    let _ = output_tx_for_reader.send(frame);
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            let _ =
+                                output_tx_for_reader.send(TerminalFrame::message(err.to_string()));
+                            break;
+                        }
+                    }
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+            });
+        }
 
         Ok(Self {
             output: Some(output_rx),

@@ -1869,25 +1869,23 @@ fn poll_terminal(
     target: String,
     cx: &mut Context<HerdrGui>,
 ) {
-    cx.spawn(async move |this, cx| {
+    cx.spawn(async move |this, cx| loop {
+        cx.background_executor()
+            .timer(Duration::from_millis(16))
+            .await;
         let mut latest = None;
         let mut disconnected = false;
-        let settle_start = std::time::Instant::now();
-        while settle_start.elapsed() < Duration::from_millis(100) {
+        loop {
             match receiver.try_recv() {
                 Ok(frame) => latest = Some(frame),
-                Err(TryRecvError::Empty) => {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(4))
-                        .await;
-                }
+                Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     disconnected = true;
                     break;
                 }
             }
         }
-        if let Some(frame) = latest.take() {
+        if let Some(frame) = latest {
             if this
                 .update(cx, |view, cx| {
                     view.apply_terminal_frame(token, &target, frame);
@@ -1895,7 +1893,7 @@ fn poll_terminal(
                 })
                 .is_err()
             {
-                return;
+                break;
             }
         }
         if disconnected {
@@ -1909,49 +1907,7 @@ fn poll_terminal(
                 }
                 cx.notify();
             });
-            return;
-        }
-
-        loop {
-            cx.background_executor()
-                .timer(Duration::from_millis(16))
-                .await;
-            let mut latest = None;
-            let mut disconnected = false;
-            loop {
-                match receiver.try_recv() {
-                    Ok(frame) => latest = Some(frame),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
-                    }
-                }
-            }
-            if let Some(frame) = latest {
-                if this
-                    .update(cx, |view, cx| {
-                        view.apply_terminal_frame(token, &target, frame);
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-            if disconnected {
-                let _ = this.update(cx, |view, cx| {
-                    if view.terminal_token == token {
-                        view.terminal = None;
-                        view.terminal_target = None;
-                        view.terminal_size = None;
-                        view.refresh_state();
-                        view.close_workspace_after_terminal_exit(&target);
-                    }
-                    cx.notify();
-                });
-                break;
-            }
+            break;
         }
     })
     .detach();
