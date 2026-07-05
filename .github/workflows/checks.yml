@@ -10,7 +10,12 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-      - run: git clone https://github.com/undivisible/crepuscularity.git ../crepuscularity
+      - uses: actions/checkout@v4
+        with:
+          repository: undivisible/crepuscularity
+          path: crepuscularity
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - run: mv crepuscularity ../crepuscularity
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo fmt -- --check
       - run: cargo clippy --all-targets -- -D warnings
