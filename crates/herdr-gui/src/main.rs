@@ -654,37 +654,57 @@ impl HerdrGui {
             .or_else(|| self.state.panes.first())
     }
 
-    fn handle_keystroke(&mut self, key: &Keystroke) {
-        if let (Some(client), Some(pane)) = (&self.client, self.focused_pane().cloned()) {
-            // NAMED keys always send as key events, not text.
-            // Enter as text=\n gets misinterpreted by the terminal (e.g. as shift+enter).
-            let is_named = matches!(
-                key.key.as_str(),
-                "enter"
-                    | "backspace"
-                    | "tab"
-                    | "escape"
-                    | "up"
-                    | "down"
-                    | "left"
-                    | "right"
-                    | "delete"
-                    | "home"
-                    | "end"
-                    | "pageup"
-                    | "pagedown"
-                    | "insert"
-            );
-            let result = if key.modifiers.alt || is_named {
-                client.send_key(&pane.pane_id, &key_name(key))
-            } else if let Some(text) = key.key_char.as_deref() {
-                client.send_text(&pane.pane_id, text)
-            } else {
-                client.send_key(&pane.pane_id, &key_name(key))
-            };
-            if let Err(err) = result {
-                self.status = err.to_string();
-            }
+    fn handle_keystroke(&mut self, key: &Keystroke, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let Some(pane) = self.focused_pane().cloned() else {
+            return;
+        };
+        // NAMED keys always send as key events, not text.
+        // Enter as text=\n gets misinterpreted by the terminal (e.g. as shift+enter).
+        let is_named = matches!(
+            key.key.as_str(),
+            "enter"
+                | "backspace"
+                | "tab"
+                | "escape"
+                | "up"
+                | "down"
+                | "left"
+                | "right"
+                | "delete"
+                | "home"
+                | "end"
+                | "pageup"
+                | "pagedown"
+                | "insert"
+        );
+        let pane_id = pane.pane_id;
+        if key.modifiers.alt || is_named {
+            let key_str = key_name(key);
+            cx.spawn(async move |this, cx| {
+                if let Err(err) = client.send_key(&pane_id, &key_str) {
+                    let _ = this.update(cx, |view, _cx| view.status = err.to_string());
+                }
+            })
+            .detach();
+        } else if let Some(text) = key.key_char.as_deref() {
+            let text = text.to_string();
+            cx.spawn(async move |this, cx| {
+                if let Err(err) = client.send_text(&pane_id, &text) {
+                    let _ = this.update(cx, |view, _cx| view.status = err.to_string());
+                }
+            })
+            .detach();
+        } else {
+            let key_str = key_name(key);
+            cx.spawn(async move |this, cx| {
+                if let Err(err) = client.send_key(&pane_id, &key_str) {
+                    let _ = this.update(cx, |view, _cx| view.status = err.to_string());
+                }
+            })
+            .detach();
         }
     }
 
@@ -1322,7 +1342,7 @@ impl HerdrGui {
         theme: UiTheme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        if panes.is_empty() {
+        if panes.is_empty() && pane_frame.lines.is_empty() {
             return div()
                 .flex()
                 .flex_1()
@@ -1330,6 +1350,24 @@ impl HerdrGui {
                 .items_center()
                 .justify_center()
                 .child(empty_state(&self.status, theme));
+        }
+
+        if panes.is_empty() {
+            return div()
+                .flex()
+                .flex_1()
+                .h_full()
+                .bg(rgb(theme.terminal))
+                .child(
+                    div()
+                        .flex_1()
+                        .overflow_hidden()
+                        .text_size(px(12.0))
+                        .font_family("Menlo")
+                        .line_height(px(18.0))
+                        .text_color(rgb(theme.text))
+                        .child(terminal_frame(pane_frame.as_ref(), theme.terminal)),
+                );
         }
 
         let pane = panes
@@ -1831,9 +1869,8 @@ fn main() {
             let view = window.update(cx, |_, _, cx| cx.entity());
             if let Ok(view) = view {
                 cx.observe_keystrokes(move |event, _, cx| {
-                    view.update(cx, |view, cx| {
-                        view.handle_keystroke(&event.keystroke);
-                        cx.notify();
+                    view.update(cx, |view, view_cx| {
+                        view.handle_keystroke(&event.keystroke, view_cx);
                     });
                 })
                 .detach();
@@ -1884,7 +1921,6 @@ fn poll_terminal(
         if disconnected {
             let _ = this.update(cx, |view, cx| {
                 if view.terminal_token == token {
-                    view.terminal = None;
                     view.terminal_target = None;
                     view.terminal_size = None;
                     view.refresh_state();

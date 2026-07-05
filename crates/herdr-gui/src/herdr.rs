@@ -185,6 +185,7 @@ struct ApiError {
     message: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct HerdrClient {
     socket_path: PathBuf,
 }
