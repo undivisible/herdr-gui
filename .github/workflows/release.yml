@@ -15,7 +15,7 @@ jobs:
         with:
           repository: undivisible/crepuscularity
           path: crepuscularity
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.CREPUSCULARITY_TOKEN || secrets.GITHUB_TOKEN }}
       - run: mv crepuscularity ../crepuscularity
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release
