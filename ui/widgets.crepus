@@ -1,0 +1,26 @@
+--- ResizeHandle
+div #resize-handle w-[4px] h-full flex-none cursor-col-resize hover:bg-{theme.hover} @mousedown=start_resize
+
+--- EmptyState
+div #empty-state w-[560px] rounded-lg bg-{theme.panel} border border-{theme.border} p-5 flex flex-col gap-3
+    div text-{theme.label}
+        "No Herdr panes visible"
+    div text-{theme.muted}
+        "{status}"
+    div rounded-lg bg-{theme.terminal} border border-{theme.border} p-3 font-mono text-[12px] text-{theme.text}
+        "Open Herdr in a terminal, create a workspace/pane, then press Refresh."
+
+--- SwipeHint
+div #swipe-hint absolute bottom-0 left-0 h-[2px] w-[{_width}px] bg-white opacity-35
+
+--- TabHeader
+div pt-1 flex items-center justify-between
+    {section("tabs", theme)}
+    div #new-tab-btn w-[22px] h-[22px] flex items-center justify-center cursor-pointer hover:bg-{theme.hover} @mousedown=new_tab_mouse
+        {icon("plus", 12.0, theme)}
+
+--- AgentHeader
+div pt-1 flex items-center justify-between
+    {section("agents", theme)}
+    div #toggle-agents-btn w-[22px] h-[22px] flex items-center justify-center cursor-pointer hover:bg-{theme.hover} @mousedown=toggle_agents_mouse
+        {icon(chevron_icon, 11.0, theme)}

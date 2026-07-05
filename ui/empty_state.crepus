@@ -1,7 +1,0 @@
-div #empty-state w-[560px] rounded-lg bg-{theme.panel} border border-{theme.border} p-5 flex flex-col gap-3
-    div text-{theme.label}
-        "No Herdr panes visible"
-    div text-{theme.muted}
-        "{status}"
-    div rounded-lg bg-{theme.terminal} border border-{theme.border} p-3 font-mono text-[12px] text-{theme.text}
-        "Open Herdr in a terminal, create a workspace/pane, then press Refresh."

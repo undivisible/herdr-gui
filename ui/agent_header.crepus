@@ -1,4 +1,0 @@
-div pt-1 flex items-center justify-between
-    {section("agents", theme)}
-    div #toggle-agents-btn w-[22px] h-[22px] flex items-center justify-center cursor-pointer hover:bg-{theme.hover} @mousedown=toggle_agents_mouse
-        {icon(chevron_icon, 11.0, theme)}

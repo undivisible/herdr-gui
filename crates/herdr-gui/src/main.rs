@@ -762,7 +762,8 @@ impl HerdrGui {
 
     fn tab_header(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
         let _ = cx;
-        view_file!("ui/tab_header.crepus")
+        let _ = theme;
+        view_file!("ui/widgets.crepus#TabHeader")
     }
 
     fn agent_header(
@@ -772,12 +773,13 @@ impl HerdrGui {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let _ = cx;
+        let _ = theme;
         let chevron_icon = if collapsed {
             "chevron.down"
         } else {
             "chevron.up"
         };
-        view_file!("ui/agent_header.crepus")
+        view_file!("ui/widgets.crepus#AgentHeader")
     }
 
     fn theme(&self, window: &Window) -> UiTheme {
@@ -1379,7 +1381,7 @@ fn crepus_render(
 
 fn swipe_hint(progress: f64, _theme: UiTheme) -> impl IntoElement {
     let _width = (progress.abs() * 80.0).max(8.0) as f32;
-    view_file!("ui/swipe_hint.crepus")
+    view_file!("ui/widgets.crepus#SwipeHint")
 }
 
 fn space_switcher(
@@ -1679,7 +1681,8 @@ fn agent_row_element(
 }
 
 fn empty_state(status: &str, theme: UiTheme) -> impl IntoElement {
-    view_file!("ui/empty_state.crepus")
+    let _ = (status, theme);
+    view_file!("ui/widgets.crepus#EmptyState")
 }
 
 fn main() {

@@ -1,1 +1,0 @@
-div #resize-handle w-[4px] h-full flex-none cursor-col-resize hover:bg-{theme.hover} @mousedown=start_resize
