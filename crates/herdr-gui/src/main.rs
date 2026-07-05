@@ -2,6 +2,7 @@ mod ghostty;
 mod help;
 mod herdr;
 mod input;
+mod settings;
 mod terminal_view;
 mod theme;
 
@@ -65,6 +66,7 @@ actions!(
         ThemeRosePine,
         ThemeRosePineDawn,
         ThemeVesper,
+        ThemeOled,
         ThemeSystem,
         ThemeSystemDark,
         ThemeSystemLight,
@@ -75,7 +77,7 @@ actions!(
 macro_rules! set_theme {
     ($name:ident, $action:ty, $theme:literal) => {
         fn $name(&mut self, _: &$action, _window: &mut Window, cx: &mut Context<Self>) {
-            self.set_theme($theme, cx);
+            self.set_theme($theme.to_string(), cx);
         }
     };
 }
@@ -86,9 +88,9 @@ enum SidebarLayout {
     Arc,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 enum ThemeMode {
-    Herdr(&'static str),
+    Herdr(String),
     System,
     SystemDark,
     SystemLight,
@@ -117,6 +119,7 @@ struct HerdrGui {
     theme_mode: ThemeMode,
     swipe_progress: f64,
     focus_handle: FocusHandle,
+    settings: settings::Settings,
 }
 
 type TerminalSize = (u16, u16, u16, u16);
@@ -130,6 +133,18 @@ impl HerdrGui {
             },
             Err(err) => (None, HerdrState::default(), err.to_string()),
         };
+        let settings = settings::Settings::load();
+        let sidebar_layout = match settings.sidebar_layout.as_str() {
+            "warp" => SidebarLayout::Warp,
+            _ => SidebarLayout::Arc,
+        };
+        let theme_mode = match settings.theme.as_str() {
+            "system" => ThemeMode::System,
+            "system-dark" => ThemeMode::SystemDark,
+            "system-light" => ThemeMode::SystemLight,
+            name => ThemeMode::Herdr(name.to_string()),
+        };
+        let sidebar_width = settings.sidebar_width.clamp(180.0, 360.0);
         Self {
             client,
             terminal: None,
@@ -141,18 +156,19 @@ impl HerdrGui {
             state,
             status,
             show_help: false,
-            show_spaces: false,
-            sidebar_collapsed: false,
+            show_spaces: settings.show_spaces,
+            sidebar_collapsed: settings.sidebar_collapsed,
             sidebar_hovered: false,
-            agents_collapsed: false,
-            sidebar_layout: SidebarLayout::Arc,
+            agents_collapsed: settings.agents_collapsed,
+            sidebar_layout,
             sidebar_resizing: false,
-            sidebar_width_px: 220.0,
-            sidebar_width_start: 220.0,
-            sidebar_width_target: 220.0,
-            theme_mode: ThemeMode::Herdr("catppuccin"),
+            sidebar_width_px: sidebar_width,
+            sidebar_width_start: sidebar_width,
+            sidebar_width_target: sidebar_width,
+            theme_mode,
             swipe_progress: 0.0,
             focus_handle: cx.focus_handle(),
+            settings,
         }
     }
 
@@ -171,11 +187,13 @@ impl HerdrGui {
             SidebarLayout::Warp => SidebarLayout::Arc,
             SidebarLayout::Arc => SidebarLayout::Warp,
         };
+        self.save_settings();
         cx.notify();
     }
 
     fn toggle_spaces(&mut self, _: &ToggleSpaces, _window: &mut Window, cx: &mut Context<Self>) {
         self.show_spaces = !self.show_spaces;
+        self.save_settings();
         cx.notify();
     }
 
@@ -192,16 +210,19 @@ impl HerdrGui {
         let new_width = self.sidebar_width();
         self.sidebar_width_start = old_width;
         self.sidebar_width_target = new_width;
+        self.save_settings();
         cx.notify();
     }
 
     fn toggle_agents(&mut self, _: &ToggleAgents, _window: &mut Window, cx: &mut Context<Self>) {
         self.agents_collapsed = !self.agents_collapsed;
+        self.save_settings();
         cx.notify();
     }
 
     fn theme_system(&mut self, _: &ThemeSystem, _window: &mut Window, cx: &mut Context<Self>) {
         self.theme_mode = ThemeMode::System;
+        self.save_settings();
         cx.notify();
     }
 
@@ -212,6 +233,7 @@ impl HerdrGui {
         cx: &mut Context<Self>,
     ) {
         self.theme_mode = ThemeMode::SystemDark;
+        self.save_settings();
         cx.notify();
     }
 
@@ -222,6 +244,7 @@ impl HerdrGui {
         cx: &mut Context<Self>,
     ) {
         self.theme_mode = ThemeMode::SystemLight;
+        self.save_settings();
         cx.notify();
     }
 
@@ -234,6 +257,24 @@ impl HerdrGui {
         self.with_client(HerdrClient::reload_config);
         self.refresh_state();
         cx.notify();
+    }
+
+    fn save_settings(&mut self) {
+        self.settings.theme = match &self.theme_mode {
+            ThemeMode::System => "system".to_string(),
+            ThemeMode::SystemDark => "system-dark".to_string(),
+            ThemeMode::SystemLight => "system-light".to_string(),
+            ThemeMode::Herdr(name) => name.clone(),
+        };
+        self.settings.sidebar_layout = match self.sidebar_layout {
+            SidebarLayout::Warp => "warp".to_string(),
+            SidebarLayout::Arc => "arc".to_string(),
+        };
+        self.settings.sidebar_width = self.sidebar_width_px;
+        self.settings.sidebar_collapsed = self.sidebar_collapsed;
+        self.settings.show_spaces = self.show_spaces;
+        self.settings.agents_collapsed = self.agents_collapsed;
+        self.settings.save();
     }
 
     fn refresh(&mut self, _: &Refresh, window: &mut Window, cx: &mut Context<Self>) {
@@ -634,8 +675,9 @@ impl HerdrGui {
         }
     }
 
-    fn set_theme(&mut self, name: &'static str, cx: &mut Context<Self>) {
+    fn set_theme(&mut self, name: String, cx: &mut Context<Self>) {
         self.theme_mode = ThemeMode::Herdr(name);
+        self.save_settings();
         cx.notify();
     }
 
@@ -665,6 +707,7 @@ impl HerdrGui {
     set_theme!(theme_rose_pine, ThemeRosePine, "rose-pine");
     set_theme!(theme_rose_pine_dawn, ThemeRosePineDawn, "rose-pine-dawn");
     set_theme!(theme_vesper, ThemeVesper, "vesper");
+    set_theme!(theme_oled, ThemeOled, "oled");
 
     fn handle_mouse_move(
         &mut self,
@@ -689,14 +732,15 @@ impl HerdrGui {
     fn handle_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if self.sidebar_resizing {
             self.sidebar_resizing = false;
+            self.save_settings();
             cx.notify();
         }
     }
 
     fn theme(&self, window: &Window) -> UiTheme {
-        match self.theme_mode {
+        match &self.theme_mode {
             ThemeMode::Herdr(name) => herdr_theme(name),
-            ThemeMode::SystemDark => herdr_theme("catppuccin"),
+            ThemeMode::SystemDark => herdr_theme("oled"),
             ThemeMode::SystemLight => herdr_theme("catppuccin-latte"),
             ThemeMode::System => match window.appearance() {
                 WindowAppearance::Light | WindowAppearance::VibrantLight => {
@@ -759,6 +803,7 @@ impl Render for HerdrGui {
             .on_action(cx.listener(Self::theme_rose_pine))
             .on_action(cx.listener(Self::theme_rose_pine_dawn))
             .on_action(cx.listener(Self::theme_vesper))
+            .on_action(cx.listener(Self::theme_oled))
             .on_action(cx.listener(Self::theme_system))
             .on_action(cx.listener(Self::theme_system_dark))
             .on_action(cx.listener(Self::theme_system_light))
@@ -942,6 +987,7 @@ impl HerdrGui {
         let id = gpui::ElementId::Name(format!("sidebar-{:.0}-to-{:.0}", start, target).into());
         let el = div()
             .h_full()
+            .pt(px(40.0))
             .bg(rgb(theme.panel))
             .flex()
             .flex_col()
@@ -1021,8 +1067,8 @@ impl HerdrGui {
 
     fn top_tabs(&self, tabs: Vec<Tab>, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .w_full()
             .h(px(34.0))
-            .px_1()
             .flex()
             .items_center()
             .gap_1()
@@ -1054,7 +1100,7 @@ impl HerdrGui {
             }))
             .child(
                 div()
-                    .h(px(28.0))
+                    .h_full()
                     .px_2()
                     .flex()
                     .items_center()
@@ -1331,7 +1377,7 @@ fn tab_chip(
     on_close: impl Fn(&crepuscularity_gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     div()
-        .h(px(28.0))
+        .h_full()
         .max_w(px(180.0))
         .px_2()
         .flex()
