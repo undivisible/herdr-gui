@@ -1,0 +1,4 @@
+div pt-1 flex items-center justify-between
+    {section("tabs", theme)}
+    div #new-tab-btn w-[22px] h-[22px] flex items-center justify-center cursor-pointer hover:bg-{theme.hover} @mousedown=new_tab_mouse
+        {icon("plus", 12.0, theme)}

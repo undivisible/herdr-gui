@@ -1,0 +1,1 @@
+div #resize-handle w-[4px] h-full flex-none cursor-col-resize @mousedown=start_resize

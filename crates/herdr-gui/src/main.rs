@@ -747,12 +747,42 @@ impl HerdrGui {
         cx.notify();
     }
 
+    fn new_tab_mouse(&mut self, _: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_tab(&NewTab, window, cx);
+    }
+
+    fn toggle_agents_mouse(
+        &mut self,
+        _: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_agents(&ToggleAgents, window, cx);
+    }
+
     fn resize_handle(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
         let _ = cx;
-        view! {r#"
-            div #resize-handle w-[4px] h-full flex-none cursor-col-resize @mousedown=start_resize
-        "#}
-        .hover(move |style| style.bg(rgb(theme.hover)))
+        view_file!("ui/resize_handle.crepus").hover(move |style| style.bg(rgb(theme.hover)))
+    }
+
+    fn tab_header(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
+        let _ = cx;
+        view_file!("ui/tab_header.crepus")
+    }
+
+    fn agent_header(
+        &self,
+        collapsed: bool,
+        theme: UiTheme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let _ = cx;
+        let chevron_icon = if collapsed {
+            "chevron.down"
+        } else {
+            "chevron.up"
+        };
+        view_file!("ui/agent_header.crepus")
     }
 
     fn theme(&self, window: &Window) -> UiTheme {
@@ -777,15 +807,7 @@ impl Render for HerdrGui {
         let panes = self.visible_panes();
         let pane_frame = self.terminal_frame.clone();
 
-        let root = view! {r#"
-            div #herdr-root w-full h-full flex overflow-hidden font-['Inter'] text-[14px] text-{theme.text} bg-{theme.bg}
-                @scroll=handle_workspace_scroll
-                @mousemove=handle_mouse_move
-                @mouseup=handle_mouse_up
-                {self.sidebar(theme, cx)}
-                {self.resize_handle(theme, cx)}
-                {self.terminal_area(panes, pane_frame, theme, cx)}
-        "#};
+        let root = view_file!("ui/main.crepus");
 
         root.key_context("HerdrGui")
             .track_focus(&self.focus_handle)
@@ -1046,7 +1068,7 @@ impl HerdrGui {
             .flex()
             .flex_col()
             .gap_1()
-            .child(tab_header(theme, cx))
+            .child(self.tab_header(theme, cx))
             .children(self.visible_tabs().into_iter().map(|tab| {
                 tab_sidebar_row(
                     tab.clone(),
@@ -1057,7 +1079,7 @@ impl HerdrGui {
                 )
             }))
             .child(div().flex_1())
-            .child(agent_header(self.agents_collapsed, theme, cx))
+            .child(self.agent_header(self.agents_collapsed, theme, cx))
             .when(!self.agents_collapsed, |el| {
                 el.children(self.agent_rows(theme, cx))
             })
@@ -1076,7 +1098,7 @@ impl HerdrGui {
                 }),
             )
             .child(div().h(px(1.0)).bg(rgb(theme.border)))
-            .child(agent_header(self.agents_collapsed, theme, cx))
+            .child(self.agent_header(self.agents_collapsed, theme, cx))
             .when(!self.agents_collapsed, |el| {
                 el.children(self.agent_rows(theme, cx))
             })
@@ -1360,12 +1382,9 @@ fn crepus_render(
     render_nodes(&nodes, &ctx)
 }
 
-fn swipe_hint(progress: f64, _theme: UiTheme) -> AnyElement {
-    let width = (progress.abs() * 80.0).max(8.0) as f32;
-    crepus_render(
-        "div #swipe-hint absolute bottom-0 left-0 h-[2px] w-[{width}px] bg-white opacity-35",
-        [("width", TemplateValue::Float(width as f64))],
-    )
+fn swipe_hint(progress: f64, _theme: UiTheme) -> impl IntoElement {
+    let _width = (progress.abs() * 80.0).max(8.0) as f32;
+    view_file!("ui/swipe_hint.crepus")
 }
 
 fn space_switcher(
@@ -1463,64 +1482,6 @@ fn tab_chip(
                 .hover(move |style| style.text_color(rgb(theme.text)))
                 .on_mouse_down(MouseButton::Left, on_close)
                 .child(icon("xmark", 9.0, theme)),
-        )
-}
-
-fn tab_header(theme: UiTheme, cx: &mut Context<HerdrGui>) -> impl IntoElement {
-    div()
-        .pt_1()
-        .flex()
-        .items_center()
-        .justify_between()
-        .child(section("tabs", theme))
-        .child(
-            div()
-                .w(px(22.0))
-                .h(px(22.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .hover(move |style| style.bg(rgb(theme.hover)))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| this.new_tab(&NewTab, window, cx)),
-                )
-                .child(icon("plus", 12.0, theme)),
-        )
-}
-
-fn agent_header(collapsed: bool, theme: UiTheme, cx: &mut Context<HerdrGui>) -> impl IntoElement {
-    div()
-        .pt_1()
-        .flex()
-        .items_center()
-        .justify_between()
-        .child(section("agents", theme))
-        .child(
-            div()
-                .w(px(22.0))
-                .h(px(22.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .hover(move |style| style.bg(rgb(theme.hover)))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| {
-                        this.toggle_agents(&ToggleAgents, window, cx)
-                    }),
-                )
-                .child(icon(
-                    if collapsed {
-                        "chevron.down"
-                    } else {
-                        "chevron.up"
-                    },
-                    11.0,
-                    theme,
-                )),
         )
 }
 
@@ -1723,15 +1684,7 @@ fn agent_row_element(
 }
 
 fn empty_state(status: &str, theme: UiTheme) -> impl IntoElement {
-    view! {r#"
-        div #empty-state w-[560px] rounded-lg bg-{theme.panel} border border-{theme.border} p-5 flex flex-col gap-3
-            div text-{theme.label}
-                "No Herdr panes visible"
-            div text-{theme.muted}
-                "{status}"
-            div rounded-lg bg-{theme.terminal} border border-{theme.border} p-3 font-mono text-[12px] text-{theme.text}
-                "Open Herdr in a terminal, create a workspace/pane, then press Refresh."
-    "#}
+    view_file!("ui/empty_state.crepus")
 }
 
 fn main() {
