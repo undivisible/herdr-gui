@@ -567,7 +567,7 @@ impl HerdrGui {
                     self.terminal_target = Some(target.clone());
                     self.terminal_size = Some(size);
                     self.status = "connected".to_string();
-                    if let Some(window) = cx.active_window() {
+                    if let Some(window) = cx.windows().first().copied() {
                         poll_terminal(receiver, token, target, window, cx);
                     }
                 }
