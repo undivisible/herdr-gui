@@ -7,6 +7,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -271,8 +272,10 @@ impl TerminalSession {
 
             thread::spawn(move || {
                 const BATCH_LIMIT: usize = 64 * 1024;
+                const MAX_BATCH_MS: u64 = 8;
                 let mut buf = [0_u8; 8192];
                 let mut accumulated = Vec::new();
+                let mut last_send = Instant::now();
                 let mut done = false;
                 while !done {
                     let mut fds = libc::pollfd {
@@ -280,7 +283,15 @@ impl TerminalSession {
                         events: libc::POLLIN,
                         revents: 0,
                     };
-                    let ret = unsafe { libc::poll(&mut fds, 1, 16) };
+                    let timeout = if accumulated.is_empty() {
+                        -1
+                    } else {
+                        MAX_BATCH_MS
+                            .saturating_sub(last_send.elapsed().as_millis() as u64)
+                            .try_into()
+                            .unwrap_or(0)
+                    };
+                    let ret = unsafe { libc::poll(&mut fds, 1, timeout) };
                     if ret < 0 {
                         let _ = output_tx_for_reader.send(TerminalFrame::message(
                             std::io::Error::last_os_error().to_string(),
@@ -317,11 +328,14 @@ impl TerminalSession {
                     if hungup {
                         done = true;
                     }
-                    // Render only once the kernel buffer has been drained or the
-                    // read side has shut down. This batches the initial attach
-                    // burst and continuous output into complete frames.
+                    // Render once the kernel buffer is drained, the PTY closes,
+                    // or the 8ms batch window expires. The cap keeps typing
+                    // responsive while still coalescing attach bursts.
                     if !accumulated.is_empty()
-                        && (ret == 0 || done || accumulated.len() >= BATCH_LIMIT)
+                        && (ret == 0
+                            || done
+                            || accumulated.len() >= BATCH_LIMIT
+                            || last_send.elapsed() >= Duration::from_millis(MAX_BATCH_MS))
                     {
                         for size in resize_rx.try_iter() {
                             if let Ok(mut terminal) = terminal_for_reader.lock() {
@@ -337,6 +351,7 @@ impl TerminalSession {
                             }
                         }
                         accumulated.clear();
+                        last_send = Instant::now();
                     }
                 }
                 let _ = child.kill();

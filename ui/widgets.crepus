@@ -14,13 +14,13 @@ div #empty-state w-[560px] rounded-lg bg-{theme.panel} border border-{theme.bord
 div #swipe-hint absolute bottom-0 left-0 h-[2px] w-[{_width}px] bg-white opacity-35
 
 --- TabHeader
-div pt-1 flex items-center justify-between
+div h-[22px] flex items-center justify-between
     {section("tabs", theme)}
     div #new-tab-btn w-[22px] h-[22px] flex items-center justify-center cursor-pointer hover:bg-{theme.hover} @mousedown=new_tab_mouse
         {icon("plus", 12.0, theme)}
 
 --- AgentHeader
-div pt-1 flex items-center justify-between
+div h-[22px] flex items-center justify-between
     {section("agents", theme)}
     div #toggle-agents-btn w-[22px] h-[22px] flex items-center justify-center cursor-pointer hover:bg-{theme.hover} @mousedown=toggle_agents_mouse
         {icon(chevron_icon, 11.0, theme)}

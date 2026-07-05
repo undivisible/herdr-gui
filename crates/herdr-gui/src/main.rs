@@ -1367,7 +1367,7 @@ fn small(text: &str, theme: UiTheme) -> AnyElement {
 
 fn section(text: &str, theme: UiTheme) -> AnyElement {
     crepus_render(
-        "div px-2 pt-1 text-[10px] text-{theme.muted}\n    \"{text}\"",
+        "div px-2 h-[18px] flex items-center text-[10px] text-{theme.muted}\n    \"{text}\"",
         [
             ("theme", TemplateValue::Scope(theme_ctx(theme))),
             ("text", TemplateValue::Str(text.to_string())),
