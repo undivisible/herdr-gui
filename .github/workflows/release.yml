@@ -11,6 +11,10 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: undivisible/crepuscularity
+          path: ../crepuscularity
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release
       - run: |
