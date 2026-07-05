@@ -1470,21 +1470,27 @@ fn tab_chip(
 }
 
 fn tab_header(theme: UiTheme, cx: &mut Context<HerdrGui>) -> impl IntoElement {
-    div().pt_1().flex().items_center().justify_end().child(
-        div()
-            .w(px(22.0))
-            .h(px(22.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor_pointer()
-            .hover(move |style| style.bg(rgb(theme.hover)))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| this.new_tab(&NewTab, window, cx)),
-            )
-            .child(icon("plus", 12.0, theme)),
-    )
+    div()
+        .pt_1()
+        .flex()
+        .items_center()
+        .justify_between()
+        .child(section("tabs", theme))
+        .child(
+            div()
+                .w(px(22.0))
+                .h(px(22.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(move |style| style.bg(rgb(theme.hover)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.new_tab(&NewTab, window, cx)),
+                )
+                .child(icon("plus", 12.0, theme)),
+        )
 }
 
 fn agent_header(collapsed: bool, theme: UiTheme, cx: &mut Context<HerdrGui>) -> impl IntoElement {
