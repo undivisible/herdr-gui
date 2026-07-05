@@ -987,7 +987,9 @@ impl HerdrGui {
         let id = gpui::ElementId::Name(format!("sidebar-{:.0}-to-{:.0}", start, target).into());
         let el = div()
             .h_full()
-            .pt(px(40.0))
+            .when(self.sidebar_layout == SidebarLayout::Arc, |el| {
+                el.pt(px(40.0))
+            })
             .bg(rgb(theme.panel))
             .flex()
             .flex_col()
