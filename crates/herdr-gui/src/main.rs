@@ -761,13 +761,14 @@ impl Render for HerdrGui {
         let panes = self.visible_panes();
         let pane_frame = self.terminal_frame.clone();
 
-        div()
-            .w_full()
-            .h_full()
-            .bg(rgb(theme.bg))
-            .text_color(rgb(theme.text))
-            .flex()
-            .key_context("HerdrGui")
+        let root = view! {r#"
+            div #herdr-root w-full h-full flex overflow-hidden font-['Inter']
+                {self.sidebar(theme, cx)}
+                {resize_handle(theme, cx)}
+                {self.terminal_area(panes, pane_frame, theme, cx)}
+        "#};
+
+        root.key_context("HerdrGui")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::toggle_help))
             .on_action(cx.listener(Self::refresh))
@@ -813,9 +814,8 @@ impl Render for HerdrGui {
             .on_scroll_wheel(cx.listener(Self::handle_workspace_scroll))
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
-            .child(self.sidebar(theme, cx))
-            .child(resize_handle(theme, cx))
-            .child(self.terminal_area(panes, pane_frame, theme, cx))
+            .bg(rgb(theme.bg))
+            .text_color(rgb(theme.text))
     }
 }
 
@@ -828,27 +828,27 @@ impl HerdrGui {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let tabs = self.visible_tabs();
-        div()
+        let pane_container = div()
             .flex_1()
-            .h_full()
-            .bg(rgb(theme.terminal))
             .overflow_hidden()
-            .flex()
-            .flex_col()
-            .when(self.sidebar_layout == SidebarLayout::Arc, |el| {
-                el.child(self.top_tabs(tabs, theme, cx))
-            })
-            .child(
-                div()
-                    .flex_1()
-                    .overflow_hidden()
-                    .ml(px((self.swipe_progress * 28.0) as f32))
-                    .child(self.pane_grid(panes, pane_frame, theme, cx)),
-            )
-            .when(self.swipe_progress.abs() > 0.01, |el| {
-                el.child(swipe_hint(self.swipe_progress, theme))
-            })
-            .when(self.show_help, |el| el.child(help_overlay()))
+            .ml(px((self.swipe_progress * 28.0) as f32))
+            .child(self.pane_grid(panes, pane_frame, theme, cx))
+            .into_any_element();
+        let show_top_tabs = self.sidebar_layout == SidebarLayout::Arc;
+        let show_swipe = self.swipe_progress.abs() > 0.01;
+        let show_help = self.show_help;
+
+        view! {r#"
+            div #terminal-area flex-1 h-full overflow-hidden flex flex-col font-['Inter']
+                if {show_top_tabs}
+                    {self.top_tabs(tabs, theme, cx)}
+                {pane_container}
+                if {show_swipe}
+                    {swipe_hint(self.swipe_progress, theme)}
+                if {show_help}
+                    {help_overlay()}
+        "#}
+        .bg(rgb(theme.terminal))
     }
 
     fn active_workspace(&self) -> Option<&Workspace> {
