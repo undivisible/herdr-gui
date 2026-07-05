@@ -1854,11 +1854,11 @@ fn poll_terminal(
         cx.background_executor()
             .timer(Duration::from_millis(16))
             .await;
-        let mut latest = None;
+        let mut accumulated = Vec::new();
         let mut disconnected = false;
         loop {
             match receiver.try_recv() {
-                Ok(bytes) => latest = Some(bytes),
+                Ok(bytes) => accumulated.extend_from_slice(&bytes),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     disconnected = true;
@@ -1866,12 +1866,12 @@ fn poll_terminal(
                 }
             }
         }
-        if let Some(bytes) = latest {
-            if this
+        if !accumulated.is_empty()
+            && this
                 .update(cx, |view, cx| {
                     if view.terminal_token == token {
                         if let Some(terminal) = view.terminal.as_mut() {
-                            if let Ok(frame) = terminal.write(&bytes) {
+                            if let Ok(frame) = terminal.write(&accumulated) {
                                 view.terminal_frame = Arc::new(frame);
                             }
                         }
@@ -1879,9 +1879,8 @@ fn poll_terminal(
                     cx.notify();
                 })
                 .is_err()
-            {
-                break;
-            }
+        {
+            break;
         }
         if disconnected {
             let _ = this.update(cx, |view, cx| {
