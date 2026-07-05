@@ -270,6 +270,7 @@ impl TerminalSession {
             }
 
             thread::spawn(move || {
+                const BATCH_LIMIT: usize = 64 * 1024;
                 let mut buf = [0_u8; 8192];
                 let mut accumulated = Vec::new();
                 let mut done = false;
@@ -286,7 +287,9 @@ impl TerminalSession {
                         ));
                         break;
                     }
-                    if ret > 0 && (fds.revents & libc::POLLIN) != 0 {
+                    let readable = ret > 0 && (fds.revents & libc::POLLIN) != 0;
+                    let hungup = ret > 0 && (fds.revents & (libc::POLLHUP | libc::POLLERR)) != 0;
+                    if readable {
                         loop {
                             let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
                             if n < 0 {
@@ -305,10 +308,21 @@ impl TerminalSession {
                                 break;
                             } else {
                                 accumulated.extend_from_slice(&buf[..n as usize]);
+                                if accumulated.len() >= BATCH_LIMIT {
+                                    break;
+                                }
                             }
                         }
                     }
-                    if !accumulated.is_empty() {
+                    if hungup {
+                        done = true;
+                    }
+                    // Render only once the kernel buffer has been drained or the
+                    // read side has shut down. This batches the initial attach
+                    // burst and continuous output into complete frames.
+                    if !accumulated.is_empty()
+                        && (ret == 0 || done || accumulated.len() >= BATCH_LIMIT)
+                    {
                         for size in resize_rx.try_iter() {
                             if let Ok(mut terminal) = terminal_for_reader.lock() {
                                 if let Err(err) = terminal.resize(size) {
@@ -388,6 +402,9 @@ impl TerminalSession {
         let _ = self.master.resize(size);
         if let Ok(mut terminal) = self.terminal.lock() {
             let _ = terminal.resize(size);
+            if let Ok(frame) = terminal.frame() {
+                let _ = self.output_tx.send(frame);
+            }
         }
         let _ = self.resize_tx.send(size);
     }
