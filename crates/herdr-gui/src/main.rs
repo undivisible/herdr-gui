@@ -542,13 +542,12 @@ impl HerdrGui {
         }
         match TerminalSession::attach(&target, size.0, size.1) {
             Ok(mut session) => {
+                if let Ok(frame) = session.resize(size.0, size.1, size.2, size.3) {
+                    self.terminal_frame = Arc::new(frame);
+                }
                 if let Some(receiver) = session.output.take() {
                     self.terminal_token = self.terminal_token.wrapping_add(1);
                     let token = self.terminal_token;
-                    self.terminal_frame = session
-                        .frame()
-                        .map(Arc::new)
-                        .unwrap_or_else(|_| Arc::new(TerminalFrame::default()));
                     if self.terminal_frame.lines.is_empty() {
                         if let (Some(client), Some(pane)) = (&self.client, pane.as_ref()) {
                             if let Ok(ansi) = client.read_pane_ansi(&pane.pane_id) {

@@ -394,10 +394,6 @@ impl TerminalSession {
         self.terminal.write(data);
         self.terminal.frame()
     }
-
-    pub fn frame(&mut self) -> Result<TerminalFrame, String> {
-        self.terminal.frame()
-    }
 }
 
 impl Drop for TerminalSession {
