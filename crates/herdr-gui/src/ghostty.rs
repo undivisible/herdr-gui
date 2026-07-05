@@ -3,8 +3,8 @@ use std::{
     ffi::c_void,
     ptr,
     sync::{
-        mpsc::{self, Receiver, Sender},
-        Arc, Mutex,
+        mpsc::{self, Receiver},
+        Arc,
     },
     thread,
     time::{Duration, Instant},
@@ -14,9 +14,8 @@ use std::{
 pub struct GhosttyRuntime;
 
 pub struct TerminalSession {
-    pub output: Option<Receiver<TerminalFrame>>,
-    output_tx: Sender<TerminalFrame>,
-    terminal: Arc<Mutex<GhosttyTerminal>>,
+    pub output: Option<Receiver<Vec<u8>>>,
+    terminal: GhosttyTerminal,
     master: Box<dyn MasterPty>,
     killer: Box<dyn ChildKiller + Send + Sync>,
 }
@@ -243,11 +242,10 @@ impl TerminalSession {
         let killer = child.clone_killer();
         drop(pty.slave);
 
-        let (output_tx, output_rx) = mpsc::channel::<TerminalFrame>();
-        let terminal = Arc::new(Mutex::new(GhosttyTerminal::new(api, cols, rows)?));
+        let (bytes_tx, bytes_rx) = mpsc::channel::<Vec<u8>>();
+        let terminal = GhosttyTerminal::new(api, cols, rows)?;
 
-        let terminal_for_reader = terminal.clone();
-        let output_tx_for_reader = output_tx.clone();
+        let bytes_tx_for_reader = bytes_tx.clone();
         #[cfg(unix)]
         {
             let fd = pty
@@ -291,9 +289,6 @@ impl TerminalSession {
                     };
                     let ret = unsafe { libc::poll(&mut fds, 1, timeout) };
                     if ret < 0 {
-                        let _ = output_tx_for_reader.send(TerminalFrame::message(
-                            std::io::Error::last_os_error().to_string(),
-                        ));
                         break;
                     }
                     let readable = ret > 0 && (fds.revents & libc::POLLIN) != 0;
@@ -308,8 +303,6 @@ impl TerminalSession {
                                 {
                                     break;
                                 }
-                                let _ = output_tx_for_reader
-                                    .send(TerminalFrame::message(err.to_string()));
                                 done = true;
                                 break;
                             } else if n == 0 {
@@ -326,21 +319,16 @@ impl TerminalSession {
                     if hungup {
                         done = true;
                     }
-                    // Render once the kernel buffer is drained, the PTY closes,
-                    // or the 8ms batch window expires. The cap keeps typing
-                    // responsive while still coalescing attach bursts.
+                    // Forward bytes once the kernel buffer is drained, the PTY
+                    // closes, or the 8ms batch window expires. The terminal
+                    // lives on the main thread; this thread only handles I/O.
                     if !accumulated.is_empty()
                         && (ret == 0
                             || done
                             || accumulated.len() >= BATCH_LIMIT
                             || last_send.elapsed() >= Duration::from_millis(MAX_BATCH_MS))
                     {
-                        if let Ok(mut terminal) = terminal_for_reader.lock() {
-                            terminal.write(&accumulated);
-                            if let Ok(frame) = terminal.frame() {
-                                let _ = output_tx_for_reader.send(frame);
-                            }
-                        }
+                        let _ = bytes_tx_for_reader.send(accumulated.clone());
                         accumulated.clear();
                         last_send = Instant::now();
                     }
@@ -361,18 +349,9 @@ impl TerminalSession {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            if let Ok(mut terminal) = terminal_for_reader.lock() {
-                                terminal.write(&buf[..n]);
-                                if let Ok(frame) = terminal.frame() {
-                                    let _ = output_tx_for_reader.send(frame);
-                                }
-                            }
+                            let _ = bytes_tx_for_reader.send(buf[..n].to_vec());
                         }
-                        Err(err) => {
-                            let _ =
-                                output_tx_for_reader.send(TerminalFrame::message(err.to_string()));
-                            break;
-                        }
+                        Err(_) => break,
                     }
                 }
                 let _ = child.kill();
@@ -381,37 +360,43 @@ impl TerminalSession {
         }
 
         Ok(Self {
-            output: Some(output_rx),
-            output_tx,
+            output: Some(bytes_rx),
             terminal,
             master: pty.master,
             killer,
         })
     }
 
-    pub fn resize(&self, cols: u16, rows: u16, pixel_width: u16, pixel_height: u16) {
+    pub fn resize(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+    ) -> Result<TerminalFrame, String> {
         let size = PtySize {
             rows,
             cols,
             pixel_width,
             pixel_height,
         };
-        let _ = self.master.resize(size);
-        if let Ok(mut terminal) = self.terminal.lock() {
-            let _ = terminal.resize(size);
-            if let Ok(frame) = terminal.frame() {
-                let _ = self.output_tx.send(frame);
-            }
-        }
+        self.master.resize(size).map_err(|err| err.to_string())?;
+        self.terminal.resize(size)?;
+        self.terminal.frame()
     }
 
-    pub fn scroll(&self, rows: isize) {
-        if let Ok(mut terminal) = self.terminal.lock() {
-            terminal.scroll(rows);
-            if let Ok(frame) = terminal.frame() {
-                let _ = self.output_tx.send(frame);
-            }
-        }
+    pub fn scroll(&mut self, rows: isize) -> Result<TerminalFrame, String> {
+        self.terminal.scroll(rows);
+        self.terminal.frame()
+    }
+
+    pub fn write(&mut self, data: &[u8]) -> Result<TerminalFrame, String> {
+        self.terminal.write(data);
+        self.terminal.frame()
+    }
+
+    pub fn frame(&mut self) -> Result<TerminalFrame, String> {
+        self.terminal.frame()
     }
 }
 
@@ -776,18 +761,6 @@ impl TerminalFrame {
         let mut terminal = GhosttyTerminal::new(api, cols, rows)?;
         terminal.write(ansi.as_bytes());
         terminal.frame()
-    }
-
-    fn message(text: String) -> Self {
-        Self {
-            lines: vec![TerminalLine {
-                runs: vec![TerminalRun {
-                    text,
-                    fg: 0xfca5a5,
-                    bg: None,
-                }],
-            }],
-        }
     }
 }
 

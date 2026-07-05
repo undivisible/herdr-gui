@@ -531,8 +531,10 @@ impl HerdrGui {
         };
         if self.terminal_target.as_deref() == Some(target.as_str()) {
             if self.terminal_size != Some(size) {
-                if let Some(terminal) = &self.terminal {
-                    terminal.resize(size.0, size.1, size.2, size.3);
+                if let Some(terminal) = self.terminal.as_mut() {
+                    if let Ok(frame) = terminal.resize(size.0, size.1, size.2, size.3) {
+                        self.terminal_frame = Arc::new(frame);
+                    }
                 }
                 self.terminal_size = Some(size);
             }
@@ -543,7 +545,10 @@ impl HerdrGui {
                 if let Some(receiver) = session.output.take() {
                     self.terminal_token = self.terminal_token.wrapping_add(1);
                     let token = self.terminal_token;
-                    self.terminal_frame = Arc::new(TerminalFrame::default());
+                    self.terminal_frame = session
+                        .frame()
+                        .map(Arc::new)
+                        .unwrap_or_else(|_| Arc::new(TerminalFrame::default()));
                     if self.terminal_frame.lines.is_empty() {
                         if let (Some(client), Some(pane)) = (&self.client, pane.as_ref()) {
                             if let Ok(ansi) = client.read_pane_ansi(&pane.pane_id) {
@@ -707,8 +712,10 @@ impl HerdrGui {
         }
         let rows = (delta.y.to_f64() / 18.0).round() as isize;
         if rows != 0 {
-            if let Some(terminal) = &self.terminal {
-                terminal.scroll(-rows);
+            if let Some(terminal) = self.terminal.as_mut() {
+                if let Ok(frame) = terminal.scroll(-rows) {
+                    self.terminal_frame = Arc::new(frame);
+                }
                 cx.notify();
             }
         }
@@ -760,7 +767,15 @@ impl HerdrGui {
             self.sidebar_animation.width = width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
             self.sidebar_animation.start = self.sidebar_animation.width;
             self.sidebar_animation.target = self.sidebar_animation.width;
-            self.terminal_size = None;
+            let size = self.terminal_size(_window);
+            if self.terminal_size != Some(size) {
+                if let Some(terminal) = self.terminal.as_mut() {
+                    if let Ok(frame) = terminal.resize(size.0, size.1, size.2, size.3) {
+                        self.terminal_frame = Arc::new(frame);
+                    }
+                }
+                self.terminal_size = Some(size);
+            }
             cx.notify();
             return;
         }
@@ -1830,7 +1845,7 @@ fn main() {
 }
 
 fn poll_terminal(
-    receiver: Receiver<TerminalFrame>,
+    receiver: Receiver<Vec<u8>>,
     token: u64,
     target: String,
     cx: &mut Context<HerdrGui>,
@@ -1843,7 +1858,7 @@ fn poll_terminal(
         let mut disconnected = false;
         loop {
             match receiver.try_recv() {
-                Ok(frame) => latest = Some(frame),
+                Ok(bytes) => latest = Some(bytes),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     disconnected = true;
@@ -1851,11 +1866,15 @@ fn poll_terminal(
                 }
             }
         }
-        if let Some(frame) = latest {
+        if let Some(bytes) = latest {
             if this
                 .update(cx, |view, cx| {
-                    if view.terminal_token == token && !frame.lines.is_empty() {
-                        view.terminal_frame = Arc::new(frame);
+                    if view.terminal_token == token {
+                        if let Some(terminal) = view.terminal.as_mut() {
+                            if let Ok(frame) = terminal.write(&bytes) {
+                                view.terminal_frame = Arc::new(frame);
+                            }
+                        }
                     }
                     cx.notify();
                 })
