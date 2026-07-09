@@ -126,6 +126,7 @@ pub struct Agent {
 }
 
 impl Agent {
+    #[allow(dead_code)]
     pub fn from_pane(pane: &Pane) -> Self {
         Self {
             terminal_id: pane.terminal_id.clone().unwrap_or_default(),

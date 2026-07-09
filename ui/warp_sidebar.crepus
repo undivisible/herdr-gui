@@ -1,0 +1,7 @@
+div #warp-sidebar h-full flex flex-col gap-1
+    {self.tab_header(theme, cx)}
+    {self.sidebar_tab_rows(theme, cx)}
+    div flex-1
+    {self.agent_header(self.agents_collapsed, theme, cx)}
+    if {show_agents}
+        {self.agents_dropdown("agents-dropdown", theme, cx)}

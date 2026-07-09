@@ -1,0 +1,8 @@
+div #terminal-area flex-1 h-full overflow-hidden flex flex-col bg-{theme.terminal}
+    if {show_top_tabs}
+        {self.top_tabs(tabs, theme, cx)}
+    {pane_container}
+    if {show_swipe}
+        {swipe_hint(self.swipe_progress, theme)}
+    if {show_help}
+        {help_overlay()}

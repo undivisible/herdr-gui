@@ -954,16 +954,7 @@ impl HerdrGui {
         let show_swipe = self.swipe_progress.abs() > 0.01;
         let show_help = self.show_help;
 
-        view! {r#"
-            div #terminal-area flex-1 h-full overflow-hidden flex flex-col bg-{theme.terminal}
-                if {show_top_tabs}
-                    {self.top_tabs(tabs, theme, cx)}
-                {pane_container}
-                if {show_swipe}
-                    {swipe_hint(self.swipe_progress, theme)}
-                if {show_help}
-                    {help_overlay()}
-        "#}
+        view_file!("ui/terminal_area.crepus")
     }
 
     fn active_workspace(&self) -> Option<&Workspace> {
@@ -1156,12 +1147,20 @@ impl HerdrGui {
     }
 
     fn warp_sidebar(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
+        let show_agents = !self.agents_collapsed;
+        view_file!("ui/warp_sidebar.crepus")
+    }
+
+    fn right_workspace_sidebar(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
+        let show_agents = !self.agents_collapsed;
+        view_file!("ui/arc_sidebar.crepus")
+    }
+
+    fn sidebar_tab_rows(&self, theme: UiTheme, cx: &mut Context<Self>) -> AnyElement {
         div()
-            .h_full()
             .flex()
             .flex_col()
             .gap_1()
-            .child(self.tab_header(theme, cx))
             .children(self.visible_tabs().into_iter().map(|tab| {
                 tab_sidebar_row(
                     tab.clone(),
@@ -1171,56 +1170,41 @@ impl HerdrGui {
                     cx,
                 )
             }))
-            .child(div().flex_1())
-            .child(self.agent_header(self.agents_collapsed, theme, cx))
-            .when(!self.agents_collapsed, |el| {
-                el.child(animation::opacity(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .children(self.agent_rows(theme, cx)),
-                    "agents-dropdown",
-                    Duration::from_millis(200),
-                    0.0,
-                    1.0,
-                ))
-            })
+            .into_any_element()
     }
 
-    fn right_workspace_sidebar(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn sidebar_workspace_rows(&self, theme: UiTheme, cx: &mut Context<Self>) -> AnyElement {
         div()
-            .h_full()
             .flex()
             .flex_col()
             .gap_1()
-            .child(ui_text(
-                "spaces",
-                10,
-                theme.muted,
-                false,
-                "px-2 h-[18px] flex items-center",
-            ))
             .children(
                 self.state.workspaces.iter().map(|workspace| {
                     workspace_row(workspace, self.active_workspace_id(), theme, cx)
                 }),
             )
-            .child(div().h(px(1.0)).bg(rgb(theme.border)))
-            .child(self.agent_header(self.agents_collapsed, theme, cx))
-            .when(!self.agents_collapsed, |el| {
-                el.child(animation::opacity(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .children(self.agent_rows(theme, cx)),
-                    "agents-dropdown-right",
-                    Duration::from_millis(200),
-                    0.0,
-                    1.0,
-                ))
-            })
+            .into_any_element()
+    }
+
+    #[allow(dead_code)]
+    fn agents_dropdown(
+        &self,
+        id: &'static str,
+        theme: UiTheme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        animation::opacity(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .children(self.agent_rows(theme, cx)),
+            id,
+            Duration::from_millis(200),
+            0.0,
+            1.0,
+        )
+        .into_any_element()
     }
 
     fn top_tabs(&self, tabs: Vec<Tab>, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1273,6 +1257,7 @@ impl HerdrGui {
             )
     }
 
+    #[allow(dead_code)]
     fn agent_rows(&self, theme: UiTheme, cx: &mut Context<Self>) -> Vec<AnyElement> {
         fn project_name(cwd: Option<&str>) -> String {
             cwd.and_then(|c| std::path::Path::new(c).file_name())
@@ -1352,7 +1337,7 @@ impl HerdrGui {
         pane_frame: Arc<TerminalFrame>,
         theme: UiTheme,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
         if panes.is_empty() && pane_frame.lines.is_empty() {
             return div()
                 .flex()
@@ -1360,25 +1345,14 @@ impl HerdrGui {
                 .h_full()
                 .items_center()
                 .justify_center()
-                .child(empty_state(&self.status, theme));
+                .child(empty_state(&self.status, theme))
+                .into_any_element();
         }
 
         if panes.is_empty() {
-            return div()
-                .flex()
-                .flex_1()
-                .h_full()
-                .bg(rgb(theme.terminal))
-                .child(
-                    div()
-                        .flex_1()
-                        .overflow_hidden()
-                        .text_size(px(12.0))
-                        .font_family("Menlo")
-                        .line_height(px(18.0))
-                        .text_color(rgb(theme.text))
-                        .child(terminal_frame(pane_frame.as_ref(), theme.terminal)),
-                );
+            return self
+                .terminal_only_view(pane_frame, theme)
+                .into_any_element();
         }
 
         let pane = panes
@@ -1387,7 +1361,12 @@ impl HerdrGui {
             .or_else(|| panes.first())
             .cloned();
         let Some(pane) = pane else {
-            return div().flex().flex_1().h_full().bg(rgb(theme.terminal));
+            return div()
+                .flex()
+                .flex_1()
+                .h_full()
+                .bg(rgb(theme.terminal))
+                .into_any_element();
         };
         let pane_id = pane.pane_id.clone();
         div()
@@ -1402,16 +1381,20 @@ impl HerdrGui {
                     this.focus_pane_id(pane_id.clone(), window, cx)
                 }),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .overflow_hidden()
-                    .text_size(px(12.0))
-                    .font_family("Menlo")
-                    .line_height(px(18.0))
-                    .text_color(rgb(theme.text))
-                    .child(terminal_frame(pane_frame.as_ref(), theme.terminal)),
-            )
+            .child(self.terminal_only_view(pane_frame, theme))
+            .into_any_element()
+    }
+
+    fn terminal_only_view(&self, pane_frame: Arc<TerminalFrame>, theme: UiTheme) -> AnyElement {
+        div()
+            .flex_1()
+            .overflow_hidden()
+            .text_size(px(12.0))
+            .font_family("Menlo")
+            .line_height(px(18.0))
+            .text_color(rgb(theme.text))
+            .child(terminal_frame(pane_frame.as_ref(), theme.terminal))
+            .into_any_element()
     }
 }
 
@@ -1693,6 +1676,7 @@ fn tab_sidebar_row(
         .into_any_element()
 }
 
+#[allow(dead_code)]
 fn agent_row(
     agent: &Agent,
     state: &HerdrState,
@@ -1729,6 +1713,7 @@ fn agent_row(
     agent_row_element(title, subtitle, status_key, focused, theme, on_click).into_any_element()
 }
 
+#[allow(dead_code)]
 fn agent_row_element(
     title: String,
     subtitle: String,

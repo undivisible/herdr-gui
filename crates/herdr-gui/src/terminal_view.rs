@@ -10,7 +10,7 @@ pub fn terminal_frame(frame: &TerminalFrame, terminal_bg: u32) -> impl IntoEleme
         .h_full()
         .flex()
         .flex_col()
-        .children(frame.lines.iter().map(move |line| terminal_line(line, bg)))
+        .children(frame.lines.iter().map(|line| terminal_line(line, bg)))
 }
 
 fn terminal_line(line: &TerminalLine, bg: u32) -> impl IntoElement {

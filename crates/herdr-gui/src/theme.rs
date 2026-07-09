@@ -16,6 +16,7 @@ pub struct UiTheme {
     pub border: u32,
 }
 
+#[allow(dead_code)]
 pub fn agent_status_background(status: &str, theme: UiTheme) -> u32 {
     let light = theme.bg > 0x808080;
     match status {
@@ -44,6 +45,7 @@ pub fn agent_status_background(status: &str, theme: UiTheme) -> u32 {
     }
 }
 
+#[allow(dead_code)]
 pub fn agent_status_accent(status: &str) -> u32 {
     match status {
         "working" => 0xf59e0b,
@@ -53,6 +55,7 @@ pub fn agent_status_accent(status: &str) -> u32 {
     }
 }
 
+#[allow(dead_code)]
 pub fn status_color(status: &str) -> u32 {
     match status {
         "working" => 0xf59e0b,

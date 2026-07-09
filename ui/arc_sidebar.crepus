@@ -1,0 +1,7 @@
+div #arc-sidebar h-full flex flex-col gap-1
+    {ui_text("spaces", 10, theme.muted, false, "px-2 h-[18px] flex items-center")}
+    {self.sidebar_workspace_rows(theme, cx)}
+    div h-[1px] bg-{theme.border}
+    {self.agent_header(self.agents_collapsed, theme, cx)}
+    if {show_agents}
+        {self.agents_dropdown("agents-dropdown-right", theme, cx)}
