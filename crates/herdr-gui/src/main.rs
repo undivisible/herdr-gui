@@ -1553,10 +1553,45 @@ fn workspace_row(
         || active_workspace_id.is_some_and(|focused| focused == workspace.workspace_id);
     let on_click =
         cx.listener(move |this, _, window, cx| this.focus_workspace_id(id.clone(), window, cx));
-    let on_close = cx
-        .listener(move |this, _, window, cx| this.close_workspace_id(close_id.clone(), window, cx));
-    let _ = (title, detail, focused);
-    view_file!("ui/widgets.crepus#WorkspaceRow").into_any_element()
+    div()
+        .px_3()
+        .py_2()
+        .flex()
+        .items_center()
+        .gap_2()
+        .cursor_pointer()
+        .hover(move |style| style.bg(rgb(theme.hover)))
+        .on_mouse_down(MouseButton::Left, on_click)
+        .when(focused, |el| el.bg(rgb(theme.active)))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(ui_text(&title, 14, theme.label, true, ""))
+                .child(ui_text(&detail, 11, theme.muted, false, "")),
+        )
+        .child(
+            div()
+                .w(px(20.0))
+                .h(px(20.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(theme.muted))
+                .hover(move |style| style.text_color(rgb(theme.text)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        this.close_workspace_id(close_id.clone(), window, cx)
+                    }),
+                )
+                .child(icon("xmark", 9.0, theme)),
+        )
+        .into_any_element()
 }
 
 fn tab_sidebar_row(
@@ -1576,10 +1611,45 @@ fn tab_sidebar_row(
         .to_string();
     let on_click =
         cx.listener(move |this, _, window, cx| this.focus_tab_id(id.clone(), window, cx));
-    let on_close =
-        cx.listener(move |this, _, window, cx| this.close_tab_by_id(close_id.clone(), window, cx));
-    let _ = (title, detail, focused);
-    view_file!("ui/widgets.crepus#TabSidebarRow").into_any_element()
+    div()
+        .px_3()
+        .py_2()
+        .flex()
+        .items_center()
+        .gap_2()
+        .cursor_pointer()
+        .hover(move |style| style.bg(rgb(theme.hover)))
+        .on_mouse_down(MouseButton::Left, on_click)
+        .when(focused, |el| el.bg(rgb(theme.active)))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(ui_text(&title, 14, theme.label, true, ""))
+                .child(ui_text(&detail, 11, theme.muted, false, "")),
+        )
+        .child(
+            div()
+                .w(px(20.0))
+                .h(px(20.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(theme.muted))
+                .hover(move |style| style.text_color(rgb(theme.text)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        this.close_tab_by_id(close_id.clone(), window, cx)
+                    }),
+                )
+                .child(icon("xmark", 9.0, theme)),
+        )
+        .into_any_element()
 }
 
 #[allow(dead_code)]
