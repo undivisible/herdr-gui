@@ -1208,53 +1208,34 @@ impl HerdrGui {
     }
 
     fn top_tabs(&self, tabs: Vec<Tab>, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .w_full()
-            .h(px(TOP_TAB_BAR_HEIGHT as f32))
-            .flex()
-            .items_center()
-            .gap_1()
-            .bg(rgb(theme.panel))
-            .overflow_hidden()
-            .children(tabs.into_iter().enumerate().map(|(index, tab)| {
-                let number = index + 1;
-                let id = tab.tab_id.clone();
-                let close_id = tab.tab_id.clone();
-                tab_chip(
-                    number.to_string(),
-                    tab.focused
-                        || self
-                            .state
-                            .focused_tab_id
-                            .as_deref()
-                            .is_some_and(|focused| focused == tab.tab_id),
-                    theme,
-                    cx.listener(move |this, _, window, cx| {
-                        this.focus_tab_id(id.clone(), window, cx)
-                    }),
-                    cx.listener(move |this, _, window, cx| {
-                        this.with_client(|client| client.close_tab(&close_id));
-                        this.refresh_state();
-                        this.attach_focused_terminal(window, cx);
-                        cx.notify();
-                    }),
-                )
-            }))
-            .child(
-                div()
-                    .h_full()
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(rgb(theme.hover)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| this.new_tab(&NewTab, window, cx)),
-                    )
-                    .child(icon("plus", 12.0, theme)),
-            )
+        view_file!("ui/widgets.crepus#TopTabs")
+    }
+
+    #[allow(dead_code)]
+    fn tab_chip_for(&self, tab: Tab, theme: UiTheme, cx: &mut Context<Self>) -> AnyElement {
+        let title = self.tab_title(&tab);
+        let id = tab.tab_id.clone();
+        let close_id = tab.tab_id.clone();
+        let focused = tab.focused
+            || self
+                .state
+                .focused_tab_id
+                .as_deref()
+                .is_some_and(|focused| focused == tab.tab_id);
+        let _ = focused;
+        let on_click =
+            cx.listener(move |this, _, window, cx| this.focus_tab_id(id.clone(), window, cx));
+        let on_close = cx.listener(move |this, _, window, cx| {
+            this.close_tab_by_id(close_id.clone(), window, cx)
+        });
+        view_file!("ui/widgets.crepus#TabChip").into_any_element()
+    }
+
+    fn close_tab_by_id(&mut self, tab_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.with_client(|client| client.close_tab(&tab_id));
+        self.refresh_state();
+        self.attach_focused_terminal(window, cx);
+        cx.notify();
     }
 
     #[allow(dead_code)]
@@ -1512,6 +1493,7 @@ fn space_switcher(
         )
 }
 
+#[allow(dead_code)]
 fn tab_chip(
     title: String,
     focused: bool,
@@ -1571,46 +1553,10 @@ fn workspace_row(
         || active_workspace_id.is_some_and(|focused| focused == workspace.workspace_id);
     let on_click =
         cx.listener(move |this, _, window, cx| this.focus_workspace_id(id.clone(), window, cx));
-
-    div()
-        .px_3()
-        .py_2()
-        .flex()
-        .items_center()
-        .gap_2()
-        .cursor_pointer()
-        .hover(move |style| style.bg(rgb(theme.hover)))
-        .on_mouse_down(MouseButton::Left, on_click)
-        .when(focused, |el| el.bg(rgb(theme.active)))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .gap_0p5()
-                .child(ui_text(&title, 14, theme.label, true, ""))
-                .child(ui_text(&detail, 11, theme.muted, false, "")),
-        )
-        .child(
-            div()
-                .w(px(20.0))
-                .h(px(20.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(rgb(theme.muted))
-                .hover(move |style| style.text_color(rgb(theme.text)))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, window, cx| {
-                        this.close_workspace_id(close_id.clone(), window, cx)
-                    }),
-                )
-                .child(icon("xmark", 9.0, theme)),
-        )
-        .into_any_element()
+    let on_close = cx
+        .listener(move |this, _, window, cx| this.close_workspace_id(close_id.clone(), window, cx));
+    let _ = (title, detail, focused);
+    view_file!("ui/widgets.crepus#WorkspaceRow").into_any_element()
 }
 
 fn tab_sidebar_row(
@@ -1628,52 +1574,12 @@ fn tab_sidebar_row(
         .as_deref()
         .unwrap_or(if focused { "active" } else { "idle" })
         .to_string();
-
-    div()
-        .px_3()
-        .py_2()
-        .flex()
-        .items_center()
-        .gap_2()
-        .cursor_pointer()
-        .hover(move |style| style.bg(rgb(theme.hover)))
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _, window, cx| this.focus_tab_id(id.clone(), window, cx)),
-        )
-        .when(focused, |el| el.bg(rgb(theme.active)))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .gap_0p5()
-                .child(ui_text(&title, 14, theme.label, true, ""))
-                .child(ui_text(&detail, 11, theme.muted, false, "")),
-        )
-        .child(
-            div()
-                .w(px(20.0))
-                .h(px(20.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(rgb(theme.muted))
-                .hover(move |style| style.text_color(rgb(theme.text)))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, window, cx| {
-                        this.with_client(|client| client.close_tab(&close_id));
-                        this.refresh_state();
-                        this.attach_focused_terminal(window, cx);
-                        cx.notify();
-                    }),
-                )
-                .child(icon("xmark", 9.0, theme)),
-        )
-        .into_any_element()
+    let on_click =
+        cx.listener(move |this, _, window, cx| this.focus_tab_id(id.clone(), window, cx));
+    let on_close =
+        cx.listener(move |this, _, window, cx| this.close_tab_by_id(close_id.clone(), window, cx));
+    let _ = (title, detail, focused);
+    view_file!("ui/widgets.crepus#TabSidebarRow").into_any_element()
 }
 
 #[allow(dead_code)]
