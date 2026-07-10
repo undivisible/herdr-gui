@@ -844,14 +844,12 @@ impl HerdrGui {
         self.toggle_agents(&ToggleAgents, window, cx);
     }
 
-    #[allow(dead_code)]
     fn tab_header(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
         let _ = cx;
         let _ = theme;
         view_file!("ui/widgets.crepus#TabHeader")
     }
 
-    #[allow(dead_code)]
     fn agent_header(
         &self,
         collapsed: bool,
@@ -1149,25 +1147,74 @@ impl HerdrGui {
     }
 
     fn warp_sidebar(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
-        let show_agents = !self.agents_collapsed;
-        let chevron_icon = if self.agents_collapsed {
-            "chevron.down"
-        } else {
-            "chevron.up"
-        };
-        view_file!("ui/warp_sidebar.crepus")
+        div()
+            .h_full()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(self.tab_header(theme, cx))
+            .children(self.visible_tabs().into_iter().map(|tab| {
+                tab_sidebar_row(
+                    tab.clone(),
+                    self.tab_title(&tab),
+                    self.state.focused_tab_id.as_deref(),
+                    theme,
+                    cx,
+                )
+            }))
+            .child(div().flex_1())
+            .child(self.agent_header(self.agents_collapsed, theme, cx))
+            .when(!self.agents_collapsed, |el| {
+                el.child(animation::opacity(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .children(self.agent_rows(theme, cx)),
+                    "agents-dropdown",
+                    Duration::from_millis(200),
+                    0.0,
+                    1.0,
+                ))
+            })
     }
 
     fn right_workspace_sidebar(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
-        let show_agents = !self.agents_collapsed;
-        let chevron_icon = if self.agents_collapsed {
-            "chevron.down"
-        } else {
-            "chevron.up"
-        };
-        view_file!("ui/arc_sidebar.crepus")
+        div()
+            .h_full()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(ui_text(
+                "spaces",
+                10,
+                theme.muted,
+                false,
+                "px-2 h-[18px] flex items-center",
+            ))
+            .children(
+                self.state.workspaces.iter().map(|workspace| {
+                    workspace_row(workspace, self.active_workspace_id(), theme, cx)
+                }),
+            )
+            .child(div().h(px(1.0)).bg(rgb(theme.border)))
+            .child(self.agent_header(self.agents_collapsed, theme, cx))
+            .when(!self.agents_collapsed, |el| {
+                el.child(animation::opacity(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .children(self.agent_rows(theme, cx)),
+                    "agents-dropdown-right",
+                    Duration::from_millis(200),
+                    0.0,
+                    1.0,
+                ))
+            })
     }
 
+    #[allow(dead_code)]
     fn sidebar_tab_rows(&self, theme: UiTheme, cx: &mut Context<Self>) -> AnyElement {
         div()
             .flex()
@@ -1185,6 +1232,7 @@ impl HerdrGui {
             .into_any_element()
     }
 
+    #[allow(dead_code)]
     fn sidebar_workspace_rows(&self, theme: UiTheme, cx: &mut Context<Self>) -> AnyElement {
         div()
             .flex()
@@ -1417,6 +1465,29 @@ impl HerdrGui {
     }
 }
 
+fn workspace_detail(cwd: Option<&str>) -> String {
+    let Some(path) = cwd else {
+        return "~".to_string();
+    };
+    // Try reading git branch from .git/HEAD
+    let head_path = std::path::Path::new(path).join(".git/HEAD");
+    if let Ok(head) = std::fs::read_to_string(&head_path) {
+        let head = head.trim();
+        if let Some(ref_path) = head.strip_prefix("ref: refs/heads/") {
+            return ref_path.to_string();
+        }
+        if head.len() >= 7 {
+            return head[..7].to_string();
+        }
+    }
+    // Fall back to directory name
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("~")
+        .to_string()
+}
+
 fn ui_text(text: &str, size: u32, color: u32, bold: bool, classes: &str) -> AnyElement {
     let weight = if bold { "font-semibold " } else { "" };
     let template = if classes.is_empty() {
@@ -1586,7 +1657,7 @@ fn workspace_row(
         .as_deref()
         .unwrap_or(&workspace.workspace_id)
         .to_string();
-    let detail = workspace.cwd.as_deref().unwrap_or("~").to_string();
+    let detail = workspace_detail(workspace.cwd.as_deref());
     let focused = workspace.focused
         || active_workspace_id.is_some_and(|focused| focused == workspace.workspace_id);
     let on_click =
