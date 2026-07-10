@@ -218,6 +218,7 @@ impl HerdrGui {
             SidebarLayout::Warp => SidebarLayout::Arc,
             SidebarLayout::Arc => SidebarLayout::Warp,
         };
+        self.show_spaces = false;
         self.save_settings();
         cx.notify();
     }
@@ -831,6 +832,7 @@ impl HerdrGui {
         cx.notify();
     }
 
+    #[allow(dead_code)]
     fn new_tab_mouse(&mut self, _: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.new_tab(&NewTab, window, cx);
     }
@@ -845,9 +847,34 @@ impl HerdrGui {
     }
 
     fn tab_header(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
-        let _ = cx;
-        let _ = theme;
-        view_file!("ui/widgets.crepus#TabHeader")
+        div()
+            .h(px(22.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(ui_text(
+                "tabs",
+                10,
+                theme.muted,
+                false,
+                "px-2 h-[18px] flex items-center",
+            ))
+            .child(
+                div()
+                    .w(px(22.0))
+                    .h(px(22.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(rgb(theme.hover)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| this.new_tab(&NewTab, window, cx)),
+                    )
+                    .child(icon("plus", 12.0, theme)),
+            )
     }
 
     fn agent_header(
@@ -856,14 +883,36 @@ impl HerdrGui {
         theme: UiTheme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let _ = cx;
-        let _ = theme;
         let chevron_icon = if collapsed {
             "chevron.down"
         } else {
             "chevron.up"
         };
-        view_file!("ui/widgets.crepus#AgentHeader")
+        div()
+            .h(px(22.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(ui_text(
+                "agents",
+                10,
+                theme.muted,
+                false,
+                "px-2 h-[18px] flex items-center",
+            ))
+            .child(
+                div()
+                    .w(px(22.0))
+                    .h(px(22.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(rgb(theme.hover)))
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::toggle_agents_mouse))
+                    .child(icon(chevron_icon, 11.0, theme)),
+            )
     }
 
     fn theme(&self, window: &Window) -> UiTheme {
