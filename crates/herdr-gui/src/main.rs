@@ -806,9 +806,9 @@ impl HerdrGui {
     }
 
     fn set_theme(&mut self, name: String, cx: &mut Context<Self>) {
+        let theme = herdr_theme(&name);
         self.theme_mode = ThemeMode::Herdr(name);
         self.save_settings();
-        let theme = herdr_theme(&name);
         self.sync_terminal_theme(theme, cx);
         cx.notify();
     }
