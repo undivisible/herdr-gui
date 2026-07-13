@@ -2,6 +2,6 @@ div #herdr-root w-full h-full flex overflow-hidden text-[14px] text-{theme.text}
     @scroll=handle_workspace_scroll
     @mousemove=handle_mouse_move
     @mouseup=handle_mouse_up
-    {self.sidebar(theme, cx)}
+    {self.sidebar_pane.clone()}
     include "widgets.crepus#ResizeHandle"
     {self.terminal_area(panes, pane_frame, theme, cx)}

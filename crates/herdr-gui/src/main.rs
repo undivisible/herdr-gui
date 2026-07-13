@@ -112,7 +112,8 @@ struct HerdrGui {
     state: HerdrState,
     status: String,
     show_help: bool,
-    show_spaces: bool,
+    /// Full sidebar chrome as own entity — spaces toggle must not dirty root/terminal.
+    sidebar_pane: Entity<SidebarPane>,
     sidebar_collapsed: bool,
     agents_collapsed: bool,
     sidebar_layout: SidebarLayout,
@@ -123,9 +124,57 @@ struct HerdrGui {
     scroll_x: f64,
     focus_handle: FocusHandle,
     settings: settings::Settings,
-    /// Click→next-root-render latency for spaces open diagnostics.
-    spaces_click_at: Option<Instant>,
     render_seq: u64,
+}
+
+/// Owns spaces open state + full sidebar tree so toggle never re-renders terminal.
+struct SidebarPane {
+    herdr: Entity<HerdrGui>,
+    show_spaces: bool,
+    click_at: Option<Instant>,
+}
+
+impl SidebarPane {
+    fn toggle_spaces(&mut self, cx: &mut Context<Self>) {
+        let started = Instant::now();
+        self.show_spaces = !self.show_spaces;
+        self.click_at = Some(started);
+        cx.notify();
+        lag_log(format_args!(
+            "sidebar_pane toggle_spaces {:.2}ms show_spaces={}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            self.show_spaces,
+        ));
+    }
+
+    fn close_spaces(&mut self, cx: &mut Context<Self>) {
+        if self.show_spaces {
+            self.show_spaces = false;
+            cx.notify();
+        }
+    }
+}
+
+impl Render for SidebarPane {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let render_started = Instant::now();
+        let since_click = self
+            .click_at
+            .take()
+            .map(|at| at.elapsed().as_secs_f64() * 1000.0);
+        let show_spaces = self.show_spaces;
+        // Safe: HerdrGui is not mid-update when only SidebarPane is dirty.
+        let el = self
+            .herdr
+            .update(cx, |herdr, herdr_cx| herdr.build_sidebar(show_spaces, window, herdr_cx));
+        if let Some(ms) = since_click {
+            lag_log(format_args!(
+                "sidebar_pane render {:.2}ms show_spaces={show_spaces} since_click={ms:.2}ms",
+                render_started.elapsed().as_secs_f64() * 1000.0,
+            ));
+        }
+        el
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -203,7 +252,14 @@ impl HerdrGui {
             state,
             status,
             show_help: false,
-            show_spaces: false,
+            sidebar_pane: {
+                let herdr = cx.entity();
+                cx.new(|_| SidebarPane {
+                    herdr,
+                    show_spaces: false,
+                    click_at: None,
+                })
+            },
             sidebar_collapsed: settings.sidebar_collapsed,
             agents_collapsed: settings.agents_collapsed,
             sidebar_layout,
@@ -214,7 +270,6 @@ impl HerdrGui {
             scroll_x: 0.0,
             focus_handle: cx.focus_handle(),
             settings,
-            spaces_click_at: None,
             render_seq: 0,
         }
     }
@@ -234,23 +289,16 @@ impl HerdrGui {
             SidebarLayout::Warp => SidebarLayout::Arc,
             SidebarLayout::Arc => SidebarLayout::Warp,
         };
-        self.show_spaces = false;
+        self.sidebar_pane
+            .update(cx, |pane, cx| pane.close_spaces(cx));
         self.save_settings();
         cx.notify();
     }
 
     fn toggle_spaces(&mut self, _: &ToggleSpaces, _window: &mut Window, cx: &mut Context<Self>) {
-        // In-flow under sidebar: parent reflow pushes tabs down (not overlay).
-        // Terminal is cached sibling — only its paint recycles across root notify.
-        let started = Instant::now();
-        self.show_spaces = !self.show_spaces;
-        self.spaces_click_at = Some(started);
-        cx.notify();
-        lag_log(format_args!(
-            "toggle_spaces handler {:.2}ms show_spaces={}",
-            started.elapsed().as_secs_f64() * 1000.0,
-            self.show_spaces,
-        ));
+        // Only dirty SidebarPane — root + terminal paint stay cold.
+        self.sidebar_pane
+            .update(cx, |pane, cx| pane.toggle_spaces(cx));
     }
 
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, _window: &mut Window, cx: &mut Context<Self>) {
@@ -444,7 +492,8 @@ impl HerdrGui {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.show_spaces = false;
+        self.sidebar_pane
+            .update(cx, |pane, cx| pane.close_spaces(cx));
         self.with_client(|client| client.focus_workspace(&workspace_id));
         self.refresh_state();
         self.attach_focused_terminal(window, cx);
@@ -1046,10 +1095,6 @@ impl Render for HerdrGui {
         let render_started = Instant::now();
         self.render_seq = self.render_seq.wrapping_add(1);
         let seq = self.render_seq;
-        let since_click = self
-            .spaces_click_at
-            .take()
-            .map(|at| at.elapsed().as_secs_f64() * 1000.0);
         let theme = self.theme(window);
         if self.terminal_bg != theme.terminal {
             self.terminal_bg = theme.terminal;
@@ -1062,18 +1107,16 @@ impl Render for HerdrGui {
         let root = view_file!("ui/ui.crepus");
         let after_tree = render_started.elapsed();
         let total_ms = after_tree.as_secs_f64() * 1000.0;
-        if seq <= 3 || since_click.is_some() || total_ms > 2.0 {
+        if seq <= 3 || total_ms > 2.0 {
             lag_log(format_args!(
-                "root render seq={seq} {total_ms:.2}ms state={:.2}ms tree={:.2}ms show_spaces={} workspaces={} tabs={} panes={} agents={} term_lines={} since_click={:.2?}",
+                "root render seq={seq} {total_ms:.2}ms state={:.2}ms tree={:.2}ms workspaces={} tabs={} panes={} agents={} term_lines={}",
                 after_state.as_secs_f64() * 1000.0,
                 (after_tree - after_state).as_secs_f64() * 1000.0,
-                self.show_spaces,
                 self.state.workspaces.len(),
                 self.state.tabs.len(),
                 self.state.panes.len(),
                 self.state.agents.len(),
                 self.terminal_frame.lines.len(),
-                since_click,
             ));
         }
 
@@ -1294,8 +1337,14 @@ impl HerdrGui {
         (cols, rows, width.round() as u16, height.round() as u16)
     }
 
-    fn sidebar(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
-        let started = Instant::now();
+    /// Built inside SidebarPane::render so spaces toggle reflows tabs in-pane only.
+    fn build_sidebar(
+        &self,
+        show_spaces: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = self.theme(window);
         let start = self.sidebar_animation.start;
         let target = self.sidebar_animation.target;
         let width = self.sidebar_width() as f32;
@@ -1317,8 +1366,8 @@ impl HerdrGui {
             .when(self.sidebar_layout != SidebarLayout::Arc, |el| {
                 el.child(space_switcher(self.active_workspace(), theme, cx))
             })
-            // In-flow: open pushes tabs down. Terminal is separate cached entity sibling.
-            .when(self.show_spaces, |el| {
+            // In-flow inside fixed-size sidebar entity — pushes tabs down, no overlay.
+            .when(show_spaces, |el| {
                 el.child(div().flex().flex_col().gap_2().children(
                     self.state.workspaces.iter().map(|workspace| {
                         workspace_row(workspace, self.active_workspace_id(), theme, cx)
@@ -1331,7 +1380,7 @@ impl HerdrGui {
             .when(self.sidebar_layout == SidebarLayout::Arc, |el| {
                 el.child(self.right_workspace_sidebar(theme, cx))
             });
-        let built = if (start - target).abs() < f64::EPSILON {
+        if (start - target).abs() < f64::EPSILON {
             el.into_any_element()
         } else {
             let id = gpui::ElementId::Name(format!("sidebar-{:.0}-to-{:.0}", start, target).into());
@@ -1343,16 +1392,7 @@ impl HerdrGui {
                 target as f32,
             )
             .into_any_element()
-        };
-        let ms = started.elapsed().as_secs_f64() * 1000.0;
-        if ms > 2.0 {
-            lag_log(format_args!(
-                "sidebar build {ms:.1}ms layout={:?} agents={}",
-                self.sidebar_layout,
-                self.state.agents.len()
-            ));
         }
-        built
     }
 
     fn warp_sidebar(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
