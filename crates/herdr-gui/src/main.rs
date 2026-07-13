@@ -107,6 +107,8 @@ struct HerdrGui {
     last_terminal_frame_at: Option<Instant>,
     terminal_pending_frame: bool,
     terminal_frame_in_flight: bool,
+    /// VT bytes waiting while ghostty frame() holds the session lock.
+    pending_vt: Vec<u8>,
     terminal_bg: u32,
     state: HerdrState,
     status: String,
@@ -144,15 +146,20 @@ struct SpacesMenu {
 }
 
 impl SpacesMenu {
-    fn toggle(&mut self, window: &Window, cx: &mut Context<Self>) {
+    /// Snapshot is built on HerdrGui before this update — never read herdr here
+    /// (nested entity read while HerdrGui is updating panics in GPUI).
+    fn apply_toggle(
+        &mut self,
+        open: bool,
+        rows: Vec<SpaceRow>,
+        theme: UiTheme,
+        cx: &mut Context<Self>,
+    ) {
         let started = Instant::now();
-        self.open = !self.open;
+        self.open = open;
+        self.theme = theme;
+        self.rows = rows;
         self.click_at = Some(started);
-        if self.open {
-            self.resync(window, cx);
-        } else {
-            self.rows.clear();
-        }
         cx.notify();
         lag_log(format_args!(
             "spaces_menu toggle {:.2}ms open={} rows={}",
@@ -169,30 +176,6 @@ impl SpacesMenu {
             cx.notify();
         }
     }
-
-    fn resync(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let app = self.herdr.read(cx);
-        let active_id = app.active_workspace_id().map(str::to_string);
-        self.theme = app.theme(window);
-        self.rows = app
-            .state
-            .workspaces
-            .iter()
-            .map(|workspace| SpaceRow {
-                id: workspace.workspace_id.clone(),
-                title: workspace
-                    .label
-                    .as_deref()
-                    .unwrap_or(&workspace.workspace_id)
-                    .to_string(),
-                detail: workspace_detail(workspace.cwd.as_deref()),
-                focused: workspace.focused
-                    || active_id
-                        .as_deref()
-                        .is_some_and(|active| active == workspace.workspace_id),
-            })
-            .collect();
-    }
 }
 
 impl Render for SpacesMenu {
@@ -206,29 +189,19 @@ impl Render for SpacesMenu {
                     render_started.elapsed().as_secs_f64() * 1000.0,
                 ));
             }
-            // Zero-size placeholder — no layout push into terminal.
-            return div().into_any_element();
+            return div().w_full().into_any_element();
         }
 
+        // In-flow list (Zed-style child entity), not absolute overlay.
         let herdr = self.herdr.clone();
         let theme = self.theme;
         let rows = self.rows.clone();
         let row_count = rows.len();
         let list = div()
-            // Absolute: overlay sidebar body, do not grow flex height / reflow terminal.
-            .absolute()
-            .top(px(38.0))
-            .left_0()
-            .right_0()
-            .max_h(px(360.0))
-            .overflow_hidden()
-            .bg(rgb(theme.panel))
-            .border_1()
-            .border_color(rgb(theme.border))
+            .w_full()
             .flex()
             .flex_col()
-            .gap_1()
-            .py_1()
+            .gap_2()
             .children(rows.into_iter().map(|row| {
                 let id = row.id.clone();
                 let close_id = row.id.clone();
@@ -276,7 +249,6 @@ impl Render for SpacesMenu {
                                 });
                             })
                             .child(
-                                // Text glyph — avoid SF Symbol raster on open path.
                                 div()
                                     .text_size(px(11.0))
                                     .text_color(rgb(theme.muted))
@@ -371,6 +343,7 @@ impl HerdrGui {
             last_terminal_frame_at: None,
             terminal_pending_frame: false,
             terminal_frame_in_flight: false,
+            pending_vt: Vec::new(),
             terminal_bg: 0x0a0a0a,
             state,
             status,
@@ -430,9 +403,34 @@ impl HerdrGui {
     }
 
     fn toggle_spaces(&mut self, _: &ToggleSpaces, window: &mut Window, cx: &mut Context<Self>) {
+        // Snapshot on HerdrGui first — SpacesMenu must not herdr.read while we are updating.
+        let open = !self.spaces_menu.read(cx).open;
+        let theme = self.theme(window);
+        let rows = if open {
+            let active_id = self.active_workspace_id().map(str::to_string);
+            self.state
+                .workspaces
+                .iter()
+                .map(|workspace| SpaceRow {
+                    id: workspace.workspace_id.clone(),
+                    title: workspace
+                        .label
+                        .as_deref()
+                        .unwrap_or(&workspace.workspace_id)
+                        .to_string(),
+                    detail: workspace_detail(workspace.cwd.as_deref()),
+                    focused: workspace.focused
+                        || active_id
+                            .as_deref()
+                            .is_some_and(|active| active == workspace.workspace_id),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         // Only dirty the spaces menu entity — never the full window root.
         self.spaces_menu
-            .update(cx, |menu, cx| menu.toggle(window, cx));
+            .update(cx, |menu, cx| menu.apply_toggle(open, rows, theme, cx));
     }
 
     fn spaces_open(&self, cx: &App) -> bool {
@@ -783,6 +781,16 @@ impl HerdrGui {
                 if view.terminal_token != token {
                     return;
                 }
+                // Drain VT buffered while frame() held the lock.
+                if !view.pending_vt.is_empty() {
+                    if let Some(terminal) = view.terminal.clone() {
+                        if let Ok(mut terminal) = terminal.try_lock() {
+                            terminal.write_bytes(&view.pending_vt);
+                            view.pending_vt.clear();
+                            view.terminal_pending_frame = true;
+                        }
+                    }
+                }
                 if let Ok(frame) = frame {
                     view.set_terminal_frame(Arc::new(frame), cx);
                 }
@@ -811,7 +819,7 @@ impl HerdrGui {
         if self.terminal_target.as_deref() == Some(target.as_str()) {
             if self.terminal_size != Some(size) {
                 if let Some(terminal) = self.terminal.clone() {
-                    let frame = terminal.lock().ok().and_then(|mut terminal| {
+                    let frame = terminal.try_lock().ok().and_then(|mut terminal| {
                         terminal.resize(size.0, size.1, size.2, size.3).ok()
                     });
                     if let Some(frame) = frame {
@@ -1024,7 +1032,7 @@ impl HerdrGui {
         };
         if let Some(terminal) = self.terminal.clone() {
             let frame = terminal
-                .lock()
+                .try_lock()
                 .ok()
                 .and_then(|mut terminal| terminal.scroll(-rows).ok());
             if let Some(frame) = frame {
@@ -1085,7 +1093,7 @@ impl HerdrGui {
             let size = self.terminal_size(_window);
             if self.terminal_size != Some(size) {
                 if let Some(terminal) = self.terminal.clone() {
-                    let frame = terminal.lock().ok().and_then(|mut terminal| {
+                    let frame = terminal.try_lock().ok().and_then(|mut terminal| {
                         terminal.resize(size.0, size.1, size.2, size.3).ok()
                     });
                     if let Some(frame) = frame {
@@ -1471,7 +1479,6 @@ impl HerdrGui {
         let target = self.sidebar_animation.target;
         let width = self.sidebar_width() as f32;
         let el = div()
-            .relative()
             .h_full()
             .w(px(width))
             .when(self.sidebar_layout == SidebarLayout::Arc, |el| {
@@ -2375,10 +2382,20 @@ fn poll_terminal(
                 }
                 if !accumulated.is_empty() {
                     if let Some(terminal) = view.terminal.clone() {
-                        if let Ok(mut terminal) = terminal.lock() {
-                            terminal.write_bytes(&accumulated);
+                        // Never block the UI thread on frame() — try_lock only.
+                        match terminal.try_lock() {
+                            Ok(mut terminal) => {
+                                if !view.pending_vt.is_empty() {
+                                    terminal.write_bytes(&view.pending_vt);
+                                    view.pending_vt.clear();
+                                }
+                                terminal.write_bytes(&accumulated);
+                                view.terminal_pending_frame = true;
+                            }
+                            Err(_) => {
+                                view.pending_vt.extend_from_slice(&accumulated);
+                            }
                         }
-                        view.terminal_pending_frame = true;
                     }
                 }
                 if view.terminal_pending_frame {
