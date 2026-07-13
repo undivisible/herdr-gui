@@ -20,7 +20,7 @@ impl TerminalPane {
     }
 
     pub fn set_frame(&mut self, frame: Arc<TerminalFrame>, cx: &mut Context<Self>) {
-        if Arc::ptr_eq(&self.frame, &frame) {
+        if Arc::ptr_eq(&self.frame, &frame) || self.frame.as_ref() == frame.as_ref() {
             return;
         }
         self.frame = frame;

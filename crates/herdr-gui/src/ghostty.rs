@@ -396,9 +396,20 @@ impl TerminalSession {
         self.terminal.frame()
     }
 
-    pub fn write(&mut self, data: &[u8]) -> Result<TerminalFrame, String> {
+    /// Feed VT bytes without extracting a paint frame (cheap).
+    pub fn write_bytes(&mut self, data: &[u8]) {
         self.terminal.write(data);
+    }
+
+    /// Full cell-grid extract for paint. Expensive — throttle callers.
+    pub fn frame(&mut self) -> Result<TerminalFrame, String> {
         self.terminal.frame()
+    }
+
+    #[allow(dead_code)]
+    pub fn write(&mut self, data: &[u8]) -> Result<TerminalFrame, String> {
+        self.write_bytes(data);
+        self.frame()
     }
 }
 

@@ -21,7 +21,7 @@ use input::key_name;
 use std::sync::Arc;
 use std::{
     sync::mpsc::{Receiver, TryRecvError},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use terminal_view::{cached_terminal, TerminalPane};
 use theme::{agent_status_accent, agent_status_background, herdr_theme, status_color, UiTheme};
@@ -103,6 +103,9 @@ struct HerdrGui {
     terminal_token: u64,
     terminal_frame: Arc<TerminalFrame>,
     terminal_pane: Entity<TerminalPane>,
+    last_terminal_frame_at: Option<Instant>,
+    terminal_pending_frame: bool,
+    terminal_bg: u32,
     state: HerdrState,
     status: String,
     show_help: bool,
@@ -186,6 +189,9 @@ impl HerdrGui {
             terminal_token: 0,
             terminal_frame: Arc::new(TerminalFrame::default()),
             terminal_pane: cx.new(TerminalPane::new),
+            last_terminal_frame_at: None,
+            terminal_pending_frame: false,
+            terminal_bg: 0x0a0a0a,
             state,
             status,
             show_help: false,
@@ -225,8 +231,16 @@ impl HerdrGui {
 
     fn toggle_spaces(&mut self, _: &ToggleSpaces, _window: &mut Window, cx: &mut Context<Self>) {
         // Ephemeral UI chrome — do not block the click path on settings I/O.
+        let started = Instant::now();
         self.show_spaces = !self.show_spaces;
         cx.notify();
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        if ms > 5.0 {
+            eprintln!(
+                "toggle_spaces handler {ms:.1}ms show_spaces={}",
+                self.show_spaces
+            );
+        }
     }
 
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, _window: &mut Window, cx: &mut Context<Self>) {
@@ -523,12 +537,39 @@ impl HerdrGui {
     }
 
     fn set_terminal_frame(&mut self, frame: Arc<TerminalFrame>, cx: &mut Context<Self>) {
-        if Arc::ptr_eq(&self.terminal_frame, &frame) {
+        if Arc::ptr_eq(&self.terminal_frame, &frame)
+            || self.terminal_frame.as_ref() == frame.as_ref()
+        {
             return;
         }
         self.terminal_frame = frame.clone();
+        self.last_terminal_frame_at = Some(Instant::now());
+        self.terminal_pending_frame = false;
         self.terminal_pane
             .update(cx, |pane, cx| pane.set_frame(frame, cx));
+    }
+
+    fn maybe_refresh_terminal_frame(&mut self, cx: &mut Context<Self>, force: bool) {
+        let Some(terminal) = self.terminal.as_mut() else {
+            return;
+        };
+        const FRAME_MIN_INTERVAL: Duration = Duration::from_millis(50);
+        let due = force
+            || self
+                .last_terminal_frame_at
+                .is_none_or(|at| at.elapsed() >= FRAME_MIN_INTERVAL);
+        if !due {
+            self.terminal_pending_frame = true;
+            return;
+        }
+        let started = Instant::now();
+        if let Ok(frame) = terminal.frame() {
+            self.set_terminal_frame(Arc::new(frame), cx);
+        }
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        if ms > 20.0 {
+            eprintln!("terminal.frame extract {ms:.1}ms");
+        }
     }
 
     fn attach_focused_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -767,6 +808,8 @@ impl HerdrGui {
     fn set_theme(&mut self, name: String, cx: &mut Context<Self>) {
         self.theme_mode = ThemeMode::Herdr(name);
         self.save_settings();
+        let theme = herdr_theme(&name);
+        self.sync_terminal_theme(theme, cx);
         cx.notify();
     }
 
@@ -945,8 +988,10 @@ impl HerdrGui {
 impl Render for HerdrGui {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme(window);
-        // Theme bg is cheap; only notifies terminal entity when color changes.
-        self.sync_terminal_theme(theme, cx);
+        if self.terminal_bg != theme.terminal {
+            self.terminal_bg = theme.terminal;
+            self.sync_terminal_theme(theme, cx);
+        }
         let panes = self.visible_panes();
         let pane_frame = self.terminal_frame.clone();
 
@@ -2022,6 +2067,8 @@ fn poll_terminal(
     window: AnyWindowHandle,
     cx: &mut Context<HerdrGui>,
 ) {
+    // Feed VT continuously; extract paint frames at most ~20fps so agent output
+    // cannot monopolize the UI thread (ghostty frame() walks every cell).
     cx.spawn(async move |this, cx| loop {
         cx.background_executor()
             .timer(Duration::from_millis(16))
@@ -2038,19 +2085,22 @@ fn poll_terminal(
                 }
             }
         }
-        if !accumulated.is_empty()
-            && this
-                .update(cx, |view, cx| {
-                    if view.terminal_token == token {
-                        if let Some(terminal) = view.terminal.as_mut() {
-                            if let Ok(frame) = terminal.write(&accumulated) {
-                                view.set_terminal_frame(Arc::new(frame), cx);
-                            }
-                        }
+        if this
+            .update(cx, |view, cx| {
+                if view.terminal_token != token {
+                    return;
+                }
+                if !accumulated.is_empty() {
+                    if let Some(terminal) = view.terminal.as_mut() {
+                        terminal.write_bytes(&accumulated);
+                        view.terminal_pending_frame = true;
                     }
-                    // Only dirty terminal entity; chrome reuses cached paint.
-                })
-                .is_err()
+                }
+                if view.terminal_pending_frame {
+                    view.maybe_refresh_terminal_frame(cx, false);
+                }
+            })
+            .is_err()
         {
             break;
         }
