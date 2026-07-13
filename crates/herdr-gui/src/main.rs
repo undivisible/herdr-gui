@@ -6,7 +6,6 @@ mod settings;
 mod terminal_view;
 mod theme;
 
-use crepuscularity_core::{parse_template, TemplateContext, TemplateValue};
 use crepuscularity_gpui as gpui;
 use crepuscularity_gpui::prelude::*;
 use crepuscularity_gpui::{
@@ -15,7 +14,6 @@ use crepuscularity_gpui::{
     Keystroke, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render,
     ScrollWheelEvent, SystemMenuType, TitlebarOptions, Window, WindowAppearance, WindowBounds,
 };
-use crepuscularity_runtime::render_nodes;
 use ghostty::{TerminalFrame, TerminalLine, TerminalRun, TerminalSession};
 use help::help_overlay;
 use herdr::{Agent, HerdrClient, HerdrState, Pane, Tab, Workspace};
@@ -189,7 +187,7 @@ impl HerdrGui {
             state,
             status,
             show_help: false,
-            show_spaces: settings.show_spaces,
+            show_spaces: false,
             sidebar_collapsed: settings.sidebar_collapsed,
             agents_collapsed: settings.agents_collapsed,
             sidebar_layout,
@@ -224,8 +222,8 @@ impl HerdrGui {
     }
 
     fn toggle_spaces(&mut self, _: &ToggleSpaces, _window: &mut Window, cx: &mut Context<Self>) {
+        // Ephemeral UI chrome — do not block the click path on settings I/O.
         self.show_spaces = !self.show_spaces;
-        self.save_settings();
         cx.notify();
     }
 
@@ -310,7 +308,7 @@ impl HerdrGui {
         };
         self.settings.sidebar_width = self.sidebar_animation.width;
         self.settings.sidebar_collapsed = self.sidebar_collapsed;
-        self.settings.show_spaces = self.show_spaces;
+        self.settings.show_spaces = false;
         self.settings.agents_collapsed = self.agents_collapsed;
         self.settings.save();
     }
@@ -1146,9 +1144,10 @@ impl HerdrGui {
     fn sidebar(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
         let start = self.sidebar_animation.start;
         let target = self.sidebar_animation.target;
-        let id = gpui::ElementId::Name(format!("sidebar-{:.0}-to-{:.0}", start, target).into());
+        let width = self.sidebar_width() as f32;
         let el = div()
             .h_full()
+            .w(px(width))
             .when(self.sidebar_layout == SidebarLayout::Arc, |el| {
                 el.pt(px(TRAFFIC_LIGHT_PADDING as f32))
             })
@@ -1165,18 +1164,10 @@ impl HerdrGui {
                 el.child(space_switcher(self.active_workspace(), theme, cx))
             })
             .when(self.show_spaces, |el| {
-                el.child(animation::opacity(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .children(self.state.workspaces.iter().map(|workspace| {
-                            workspace_row(workspace, self.active_workspace_id(), theme, cx)
-                        })),
-                    "spaces-dropdown",
-                    Duration::from_millis(200),
-                    0.0,
-                    1.0,
+                el.child(div().flex().flex_col().gap_2().children(
+                    self.state.workspaces.iter().map(|workspace| {
+                        workspace_row(workspace, self.active_workspace_id(), theme, cx)
+                    }),
                 ))
             })
             .when(self.sidebar_layout == SidebarLayout::Warp, |el| {
@@ -1185,14 +1176,19 @@ impl HerdrGui {
             .when(self.sidebar_layout == SidebarLayout::Arc, |el| {
                 el.child(self.right_workspace_sidebar(theme, cx))
             });
-        animation::width(
-            el,
-            id,
-            Duration::from_millis(250),
-            start as f32,
-            target as f32,
-        )
-        .into_any_element()
+        if (start - target).abs() < f64::EPSILON {
+            el.into_any_element()
+        } else {
+            let id = gpui::ElementId::Name(format!("sidebar-{:.0}-to-{:.0}", start, target).into());
+            animation::width(
+                el,
+                id,
+                Duration::from_millis(250),
+                start as f32,
+                target as f32,
+            )
+            .into_any_element()
+        }
     }
 
     fn warp_sidebar(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1538,13 +1534,18 @@ fn workspace_detail(cwd: Option<&str>) -> String {
 }
 
 fn ui_text(text: &str, size: u32, color: u32, bold: bool, classes: &str) -> AnyElement {
-    let weight = if bold { "font-semibold " } else { "" };
-    let template = if classes.is_empty() {
-        format!("div {weight}text-[{size}px] text-[#{color:06x}]\n    \"{text}\"")
-    } else {
-        format!("div {classes} {weight}text-[{size}px] text-[#{color:06x}]\n    \"{text}\"")
-    };
-    crepus_render(&template, [("text", TemplateValue::Str(text.to_string()))])
+    // Pure GPUI — avoid runtime parse_template/render_nodes on every label paint.
+    let mut el = div()
+        .text_size(px(size as f32))
+        .text_color(rgb(color))
+        .when(bold, |el| el.font_weight(FontWeight::SEMIBOLD));
+    if classes.contains("px-2") {
+        el = el.px_2();
+    }
+    if classes.contains("h-[18px]") {
+        el = el.h(px(18.0)).flex().items_center();
+    }
+    el.child(text.to_string()).into_any_element()
 }
 
 fn truncate_label(text: &str, max_chars: usize) -> String {
@@ -1569,18 +1570,6 @@ fn icon(name: &'static str, size: f32, theme: UiTheme) -> impl IntoElement {
         .size(px(size))
         .text_color(theme.label)
         .weight(SymbolWeight::Semibold)
-}
-
-fn crepus_render(
-    template: &str,
-    vars: impl IntoIterator<Item = (&'static str, TemplateValue)>,
-) -> AnyElement {
-    let mut ctx = TemplateContext::default();
-    for (key, value) in vars {
-        ctx.vars.insert(key.to_string(), value);
-    }
-    let nodes = parse_template(template).unwrap_or_default();
-    render_nodes(&nodes, &ctx)
 }
 
 fn swipe_hint(progress: f64, _theme: UiTheme) -> impl IntoElement {
