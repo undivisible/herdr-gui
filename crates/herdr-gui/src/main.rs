@@ -121,6 +121,9 @@ struct HerdrGui {
     scroll_x: f64,
     focus_handle: FocusHandle,
     settings: settings::Settings,
+    /// When set, next `render` logs click→render latency for spaces toggle.
+    spaces_click_at: Option<Instant>,
+    render_seq: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -208,6 +211,8 @@ impl HerdrGui {
             scroll_x: 0.0,
             focus_handle: cx.focus_handle(),
             settings,
+            spaces_click_at: None,
+            render_seq: 0,
         }
     }
 
@@ -235,14 +240,13 @@ impl HerdrGui {
         // Ephemeral UI chrome — do not block the click path on settings I/O.
         let started = Instant::now();
         self.show_spaces = !self.show_spaces;
+        self.spaces_click_at = Some(started);
         cx.notify();
-        let ms = started.elapsed().as_secs_f64() * 1000.0;
-        if ms > 5.0 {
-            eprintln!(
-                "toggle_spaces handler {ms:.1}ms show_spaces={}",
-                self.show_spaces
-            );
-        }
+        lag_log(format_args!(
+            "toggle_spaces handler {:.2}ms show_spaces={}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            self.show_spaces,
+        ));
     }
 
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, _window: &mut Window, cx: &mut Context<Self>) {
@@ -582,7 +586,7 @@ impl HerdrGui {
                 .await;
             let ms = started.elapsed().as_secs_f64() * 1000.0;
             if ms > 20.0 {
-                eprintln!("terminal.frame extract {ms:.1}ms (bg)");
+                lag_log(format_args!("terminal.frame extract {ms:.1}ms (bg)"));
             }
             let _ = this.update(cx, |view, cx| {
                 view.terminal_frame_in_flight = false;
@@ -1026,6 +1030,9 @@ impl HerdrGui {
 impl Render for HerdrGui {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let render_started = Instant::now();
+        self.render_seq = self.render_seq.wrapping_add(1);
+        let seq = self.render_seq;
+        let since_click_ms = self.spaces_click_at.map(|at| at.elapsed().as_secs_f64() * 1000.0);
         let theme = self.theme(window);
         if self.terminal_bg != theme.terminal {
             self.terminal_bg = theme.terminal;
@@ -1038,9 +1045,10 @@ impl Render for HerdrGui {
         let root = view_file!("ui/ui.crepus");
         let after_tree = render_started.elapsed();
         let total_ms = after_tree.as_secs_f64() * 1000.0;
-        if total_ms > 5.0 {
-            eprintln!(
-                "render tree {total_ms:.1}ms state={:.1}ms tree={:.1}ms show_spaces={} workspaces={} tabs={} panes={} agents={} term_lines={}",
+        // Always log the first few frames and every spaces-click follow-up.
+        if seq <= 3 || since_click_ms.is_some() || total_ms > 2.0 {
+            lag_log(format_args!(
+                "render tree seq={seq} {total_ms:.2}ms state={:.2}ms tree={:.2}ms show_spaces={} workspaces={} tabs={} panes={} agents={} term_lines={} since_click_ms={:.2?}",
                 after_state.as_secs_f64() * 1000.0,
                 (after_tree - after_state).as_secs_f64() * 1000.0,
                 self.show_spaces,
@@ -1049,7 +1057,11 @@ impl Render for HerdrGui {
                 self.state.panes.len(),
                 self.state.agents.len(),
                 self.terminal_frame.lines.len(),
-            );
+                since_click_ms,
+            ));
+        }
+        if since_click_ms.is_some() {
+            self.spaces_click_at = None;
         }
 
         root.key_context("HerdrGui")
@@ -1122,12 +1134,12 @@ impl HerdrGui {
         let el = view_file!("ui/terminal_area.crepus");
         let ms = started.elapsed().as_secs_f64() * 1000.0;
         if ms > 2.0 {
-            eprintln!(
+            lag_log(format_args!(
                 "terminal_area build {ms:.1}ms tabs={} panes={} term_lines={}",
                 tab_count,
                 self.state.panes.len(),
                 self.terminal_frame.lines.len()
-            );
+            ));
         }
         el
     }
@@ -1320,12 +1332,12 @@ impl HerdrGui {
         };
         let ms = started.elapsed().as_secs_f64() * 1000.0;
         if ms > 2.0 {
-            eprintln!(
+            lag_log(format_args!(
                 "sidebar build {ms:.1}ms show_spaces={} layout={:?} agents={}",
                 self.show_spaces,
                 self.sidebar_layout,
                 self.state.agents.len()
-            );
+            ));
         }
         built
     }
@@ -1623,6 +1635,20 @@ impl HerdrGui {
     fn sync_terminal_theme(&self, theme: UiTheme, cx: &mut Context<Self>) {
         self.terminal_pane
             .update(cx, |pane, cx| pane.set_bg(theme.terminal, cx));
+    }
+}
+
+fn lag_log(args: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let line = format!("{args}");
+    eprintln!("{line}");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/herdr-gui-lag.log")
+    {
+        let _ = writeln!(file, "{line}");
+        let _ = file.flush();
     }
 }
 
