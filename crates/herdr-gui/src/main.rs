@@ -1062,7 +1062,7 @@ impl HerdrGui {
 
     fn tab_header(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .h(px(22.0))
+            .h(px(32.0))
             .flex()
             .items_center()
             .justify_between()
@@ -1071,12 +1071,12 @@ impl HerdrGui {
                 10,
                 theme.muted,
                 false,
-                "px-2 h-[18px] flex items-center",
+                "px-2 h-[32px] flex items-center",
             ))
             .child(
                 div()
-                    .w(px(22.0))
-                    .h(px(22.0))
+                    .w(px(32.0))
+                    .h(px(32.0))
                     .flex_none()
                     .flex()
                     .items_center()
@@ -1087,7 +1087,7 @@ impl HerdrGui {
                         MouseButton::Left,
                         cx.listener(|this, _, window, cx| this.new_tab(&NewTab, window, cx)),
                     )
-                    .child(icon("plus", 12.0, theme)),
+                    .child(icon("plus", 13.0, theme)),
             )
     }
 
@@ -1597,7 +1597,8 @@ impl HerdrGui {
             .child(
                 div()
                     .h_full()
-                    .px_2()
+                    .w(px(32.0))
+                    .flex_none()
                     .flex()
                     .items_center()
                     .justify_center()
@@ -1607,7 +1608,7 @@ impl HerdrGui {
                         MouseButton::Left,
                         cx.listener(|this, _, window, cx| this.new_tab(&NewTab, window, cx)),
                     )
-                    .child(icon("plus", 12.0, theme)),
+                    .child(icon("plus", 13.0, theme)),
             )
     }
 

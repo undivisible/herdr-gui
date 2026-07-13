@@ -1,8 +1,8 @@
 div #warp-sidebar h-full flex flex-col gap-1
-    div h-[22px] flex items-center justify-between
-        {ui_text("tabs", 10, theme.muted, false, "px-2 h-[18px] flex items-center")}
-        div #new-tab-btn w-[22px] h-[22px] flex items-center justify-center cursor-pointer hover:bg-{theme.hover} @mousedown=new_tab_mouse
-            {icon("plus", 12.0, theme)}
+    div h-[32px] flex items-center justify-between
+        {ui_text("tabs", 10, theme.muted, false, "px-2 h-[32px] flex items-center")}
+        div #new-tab-btn w-[32px] h-[32px] flex items-center justify-center cursor-pointer hover:bg-{theme.hover} @mousedown=new_tab_mouse
+            {icon("plus", 13.0, theme)}
     {self.sidebar_tab_rows(theme, cx)}
     div flex-1
     div h-[22px] flex items-center justify-between
