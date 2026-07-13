@@ -110,7 +110,7 @@ struct HerdrGui {
     state: HerdrState,
     status: String,
     show_help: bool,
-    show_spaces: bool,
+    spaces_menu: Entity<SpacesMenu>,
     sidebar_collapsed: bool,
     agents_collapsed: bool,
     sidebar_layout: SidebarLayout,
@@ -121,9 +121,135 @@ struct HerdrGui {
     scroll_x: f64,
     focus_handle: FocusHandle,
     settings: settings::Settings,
-    /// When set, next `render` logs click→render latency for spaces toggle.
-    spaces_click_at: Option<Instant>,
     render_seq: u64,
+}
+
+/// Spaces dropdown isolated from root paint — toggle only dirties this entity.
+struct SpacesMenu {
+    herdr: Entity<HerdrGui>,
+    open: bool,
+    click_at: Option<Instant>,
+}
+
+impl SpacesMenu {
+    fn toggle(&mut self, cx: &mut Context<Self>) {
+        let started = Instant::now();
+        self.open = !self.open;
+        self.click_at = Some(started);
+        cx.notify();
+        lag_log(format_args!(
+            "spaces_menu toggle {:.2}ms open={}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            self.open,
+        ));
+    }
+
+    fn close(&mut self, cx: &mut Context<Self>) {
+        if self.open {
+            self.open = false;
+            cx.notify();
+        }
+    }
+}
+
+impl Render for SpacesMenu {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let render_started = Instant::now();
+        let since_click = self.click_at.take().map(|at| at.elapsed().as_secs_f64() * 1000.0);
+        if !self.open {
+            if let Some(ms) = since_click {
+                lag_log(format_args!(
+                    "spaces_menu render closed {:.2}ms since_click={ms:.2}ms",
+                    render_started.elapsed().as_secs_f64() * 1000.0,
+                ));
+            }
+            return div().w_full().into_any_element();
+        }
+
+        let herdr = self.herdr.clone();
+        let (workspaces, active_id, theme) = {
+            let app = self.herdr.read(cx);
+            (
+                app.state.workspaces.clone(),
+                app.active_workspace_id().map(str::to_string),
+                app.theme(window),
+            )
+        };
+
+        let list = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .children(workspaces.into_iter().map(|workspace| {
+                let id = workspace.workspace_id.clone();
+                let close_id = workspace.workspace_id.clone();
+                let title = workspace
+                    .label
+                    .as_deref()
+                    .unwrap_or(&workspace.workspace_id)
+                    .to_string();
+                let detail = workspace_detail(workspace.cwd.as_deref());
+                let focused = workspace.focused
+                    || active_id
+                        .as_deref()
+                        .is_some_and(|active| active == workspace.workspace_id);
+                let herdr_click = herdr.clone();
+                let herdr_close = herdr.clone();
+                let menu = cx.entity();
+                div()
+                    .px_3()
+                    .py_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(rgb(theme.hover)))
+                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                        menu.update(cx, |menu, cx| menu.close(cx));
+                        herdr_click.update(cx, |app, cx| {
+                            app.focus_workspace_id(id.clone(), window, cx);
+                        });
+                    })
+                    .when(focused, |el| el.bg(rgb(theme.active)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(ui_text(&title, 14, theme.label, true, ""))
+                            .child(ui_text(&detail, 11, theme.muted, false, "")),
+                    )
+                    .child(
+                        div()
+                            .w(px(20.0))
+                            .h(px(20.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(rgb(theme.muted))
+                            .hover(move |style| style.text_color(rgb(theme.text)))
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                herdr_close.update(cx, |app, cx| {
+                                    app.close_workspace_id(close_id.clone(), window, cx);
+                                });
+                            })
+                            .child(icon("xmark", 9.0, theme)),
+                    )
+                    .into_any_element()
+            }));
+
+        lag_log(format_args!(
+            "spaces_menu render open {:.2}ms rows={} since_click={:.2?}",
+            render_started.elapsed().as_secs_f64() * 1000.0,
+            self.herdr.read(cx).state.workspaces.len(),
+            since_click,
+        ));
+        list.into_any_element()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -200,7 +326,14 @@ impl HerdrGui {
             state,
             status,
             show_help: false,
-            show_spaces: false,
+            spaces_menu: {
+                let herdr = cx.entity();
+                cx.new(|_| SpacesMenu {
+                    herdr,
+                    open: false,
+                    click_at: None,
+                })
+            },
             sidebar_collapsed: settings.sidebar_collapsed,
             agents_collapsed: settings.agents_collapsed,
             sidebar_layout,
@@ -211,7 +344,6 @@ impl HerdrGui {
             scroll_x: 0.0,
             focus_handle: cx.focus_handle(),
             settings,
-            spaces_click_at: None,
             render_seq: 0,
         }
     }
@@ -231,22 +363,18 @@ impl HerdrGui {
             SidebarLayout::Warp => SidebarLayout::Arc,
             SidebarLayout::Arc => SidebarLayout::Warp,
         };
-        self.show_spaces = false;
+        self.spaces_menu.update(cx, |menu, cx| menu.close(cx));
         self.save_settings();
         cx.notify();
     }
 
     fn toggle_spaces(&mut self, _: &ToggleSpaces, _window: &mut Window, cx: &mut Context<Self>) {
-        // Ephemeral UI chrome — do not block the click path on settings I/O.
-        let started = Instant::now();
-        self.show_spaces = !self.show_spaces;
-        self.spaces_click_at = Some(started);
-        cx.notify();
-        lag_log(format_args!(
-            "toggle_spaces handler {:.2}ms show_spaces={}",
-            started.elapsed().as_secs_f64() * 1000.0,
-            self.show_spaces,
-        ));
+        // Only dirty the spaces menu entity — never the full window root.
+        self.spaces_menu.update(cx, |menu, cx| menu.toggle(cx));
+    }
+
+    fn spaces_open(&self, cx: &App) -> bool {
+        self.spaces_menu.read(cx).open
     }
 
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, _window: &mut Window, cx: &mut Context<Self>) {
@@ -440,7 +568,7 @@ impl HerdrGui {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.show_spaces = false;
+        self.spaces_menu.update(cx, |menu, cx| menu.close(cx));
         self.with_client(|client| client.focus_workspace(&workspace_id));
         self.refresh_state();
         self.attach_focused_terminal(window, cx);
@@ -1032,7 +1160,6 @@ impl Render for HerdrGui {
         let render_started = Instant::now();
         self.render_seq = self.render_seq.wrapping_add(1);
         let seq = self.render_seq;
-        let since_click_ms = self.spaces_click_at.map(|at| at.elapsed().as_secs_f64() * 1000.0);
         let theme = self.theme(window);
         if self.terminal_bg != theme.terminal {
             self.terminal_bg = theme.terminal;
@@ -1045,23 +1172,18 @@ impl Render for HerdrGui {
         let root = view_file!("ui/ui.crepus");
         let after_tree = render_started.elapsed();
         let total_ms = after_tree.as_secs_f64() * 1000.0;
-        // Always log the first few frames and every spaces-click follow-up.
-        if seq <= 3 || since_click_ms.is_some() || total_ms > 2.0 {
+        if seq <= 3 || total_ms > 2.0 {
             lag_log(format_args!(
-                "render tree seq={seq} {total_ms:.2}ms state={:.2}ms tree={:.2}ms show_spaces={} workspaces={} tabs={} panes={} agents={} term_lines={} since_click_ms={:.2?}",
+                "root render seq={seq} {total_ms:.2}ms state={:.2}ms tree={:.2}ms spaces_open={} workspaces={} tabs={} panes={} agents={} term_lines={}",
                 after_state.as_secs_f64() * 1000.0,
                 (after_tree - after_state).as_secs_f64() * 1000.0,
-                self.show_spaces,
+                self.spaces_open(cx),
                 self.state.workspaces.len(),
                 self.state.tabs.len(),
                 self.state.panes.len(),
                 self.state.agents.len(),
                 self.terminal_frame.lines.len(),
-                since_click_ms,
             ));
-        }
-        if since_click_ms.is_some() {
-            self.spaces_click_at = None;
         }
 
         root.key_context("HerdrGui")
@@ -1304,13 +1426,8 @@ impl HerdrGui {
             .when(self.sidebar_layout != SidebarLayout::Arc, |el| {
                 el.child(space_switcher(self.active_workspace(), theme, cx))
             })
-            .when(self.show_spaces, |el| {
-                el.child(div().flex().flex_col().gap_2().children(
-                    self.state.workspaces.iter().map(|workspace| {
-                        workspace_row(workspace, self.active_workspace_id(), theme, cx)
-                    }),
-                ))
-            })
+            // Own entity: open/close does not dirty root HerdrGui paint.
+            .child(self.spaces_menu.clone())
             .when(self.sidebar_layout == SidebarLayout::Warp, |el| {
                 el.child(self.warp_sidebar(theme, cx))
             })
@@ -1333,8 +1450,7 @@ impl HerdrGui {
         let ms = started.elapsed().as_secs_f64() * 1000.0;
         if ms > 2.0 {
             lag_log(format_args!(
-                "sidebar build {ms:.1}ms show_spaces={} layout={:?} agents={}",
-                self.show_spaces,
+                "sidebar build {ms:.1}ms layout={:?} agents={}",
                 self.sidebar_layout,
                 self.state.agents.len()
             ));
