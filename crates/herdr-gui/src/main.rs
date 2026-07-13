@@ -598,14 +598,31 @@ impl HerdrGui {
     }
 
     fn refresh_state(&mut self) {
+        let started = Instant::now();
         if let Some(client) = &self.client {
             match client.state() {
                 Ok(state) => {
+                    lag_log(format_args!(
+                        "refresh_state ok workspaces={} tabs={} panes={} agents={} {:.2}ms",
+                        state.workspaces.len(),
+                        state.tabs.len(),
+                        state.panes.len(),
+                        state.agents.len(),
+                        started.elapsed().as_secs_f64() * 1000.0,
+                    ));
                     self.state = state;
                     self.status = "connected".to_string();
                 }
-                Err(err) => self.status = err.to_string(),
+                Err(err) => {
+                    lag_log(format_args!(
+                        "refresh_state err {err} {:.2}ms",
+                        started.elapsed().as_secs_f64() * 1000.0
+                    ));
+                    self.status = err.to_string();
+                }
             }
+        } else {
+            lag_log(format_args!("refresh_state skipped no client"));
         }
     }
 
@@ -613,8 +630,14 @@ impl HerdrGui {
         if Arc::ptr_eq(&self.terminal_frame, &frame)
             || self.terminal_frame.as_ref() == frame.as_ref()
         {
+            lag_log(format_args!("set_terminal_frame skip same"));
             return;
         }
+        let runs: usize = frame.lines.iter().map(|l| l.runs.len()).sum();
+        lag_log(format_args!(
+            "set_terminal_frame lines={} runs={runs}",
+            frame.lines.len()
+        ));
         self.terminal_frame = frame.clone();
         self.last_terminal_frame_at = Some(Instant::now());
         self.terminal_pending_frame = false;
@@ -636,6 +659,12 @@ impl HerdrGui {
             return;
         }
         // Extract off the UI thread — ghostty frame() walks every cell via FFI.
+        lag_log(format_args!(
+            "maybe_refresh schedule force={force} last_frame_age_ms={:.1}",
+            self.last_terminal_frame_at
+                .map(|at| at.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(-1.0)
+        ));
         self.terminal_frame_in_flight = true;
         self.terminal_pending_frame = false;
         self.last_terminal_frame_at = Some(Instant::now());
@@ -1358,6 +1387,7 @@ impl HerdrGui {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let started = Instant::now();
         let theme = self.theme(window);
         let start = self.sidebar_animation.start;
         let target = self.sidebar_animation.target;
@@ -1394,7 +1424,7 @@ impl HerdrGui {
             .when(self.sidebar_layout == SidebarLayout::Arc, |el| {
                 el.child(self.right_workspace_sidebar(theme, cx))
             });
-        if (start - target).abs() < f64::EPSILON {
+        let built = if (start - target).abs() < f64::EPSILON {
             el.into_any_element()
         } else {
             let id = gpui::ElementId::Name(format!("sidebar-{:.0}-to-{:.0}", start, target).into());
@@ -1406,7 +1436,16 @@ impl HerdrGui {
                 target as f32,
             )
             .into_any_element()
-        }
+        };
+        lag_log(format_args!(
+            "build_sidebar {:.2}ms show_spaces={show_spaces} layout={:?} width={width:.0} workspaces={} tabs={} agents={}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            self.sidebar_layout,
+            self.state.workspaces.len(),
+            self.state.tabs.len(),
+            self.state.agents.len(),
+        ));
+        built
     }
 
     fn warp_sidebar(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1707,7 +1746,12 @@ impl HerdrGui {
 
 fn lag_log(args: std::fmt::Arguments<'_>) {
     use std::io::Write;
-    let line = format!("{args}");
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let line = format!("[{ts:.3}] {args}");
     eprintln!("{line}");
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
@@ -1852,6 +1896,12 @@ fn space_switcher(
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, window, cx| {
+                        lag_log(format_args!(
+                            "mouse_down space_switcher term_in_flight={} pending_vt={} term_lines={}",
+                            this.terminal_frame_in_flight,
+                            this.pending_vt.len(),
+                            this.terminal_frame.lines.len(),
+                        ));
                         this.toggle_spaces(&ToggleSpaces, window, cx)
                     }),
                 )
@@ -2245,10 +2295,16 @@ fn poll_terminal(
 ) {
     // Feed VT continuously; extract paint frames at most ~20fps so agent output
     // cannot monopolize the UI thread (ghostty frame() walks every cell).
+    let mut tick: u64 = 0;
+    let mut last_summary = Instant::now();
+    let mut bytes_window: usize = 0;
+    let mut writes_window: u64 = 0;
+    let mut frames_window: u64 = 0;
     cx.spawn(async move |this, cx| loop {
         cx.background_executor()
             .timer(Duration::from_millis(16))
             .await;
+        tick = tick.wrapping_add(1);
         let mut accumulated = Vec::new();
         let mut disconnected = false;
         loop {
@@ -2267,6 +2323,8 @@ fn poll_terminal(
                     return;
                 }
                 if !accumulated.is_empty() {
+                    bytes_window = bytes_window.saturating_add(accumulated.len());
+                    writes_window = writes_window.wrapping_add(1);
                     if let Some(terminal) = view.terminal.clone() {
                         // Never block the UI thread on frame() — try_lock only.
                         match terminal.try_lock() {
@@ -2279,18 +2337,38 @@ fn poll_terminal(
                                 view.terminal_pending_frame = true;
                             }
                             Err(_) => {
+                                lag_log(format_args!(
+                                    "poll try_lock busy, buffer {} bytes (pending now {})",
+                                    accumulated.len(),
+                                    view.pending_vt.len() + accumulated.len(),
+                                ));
                                 view.pending_vt.extend_from_slice(&accumulated);
                             }
                         }
                     }
                 }
                 if view.terminal_pending_frame {
+                    let before = view.terminal_frame_in_flight;
                     view.maybe_refresh_terminal_frame(cx, false);
+                    if !before && view.terminal_frame_in_flight {
+                        frames_window = frames_window.wrapping_add(1);
+                    }
                 }
             })
             .is_err()
         {
             break;
+        }
+        if last_summary.elapsed() >= Duration::from_secs(1) {
+            if writes_window > 0 || frames_window > 0 {
+                lag_log(format_args!(
+                    "poll 1s tick={tick} writes={writes_window} bytes={bytes_window} frames_sched={frames_window}"
+                ));
+            }
+            last_summary = Instant::now();
+            bytes_window = 0;
+            writes_window = 0;
+            frames_window = 0;
         }
         if disconnected {
             let _ = this.update(cx, |view, cx| {

@@ -23,6 +23,23 @@ impl TerminalPane {
         if Arc::ptr_eq(&self.frame, &frame) || self.frame.as_ref() == frame.as_ref() {
             return;
         }
+        let runs: usize = frame.lines.iter().map(|l| l.runs.len()).sum();
+        eprintln!(
+            "[terminal_pane] set_frame lines={} runs={runs} -> notify",
+            frame.lines.len()
+        );
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/herdr-gui-lag.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(
+                file,
+                "[terminal_pane] set_frame lines={} runs={runs} -> notify",
+                frame.lines.len()
+            );
+        }
         self.frame = frame;
         cx.notify();
     }

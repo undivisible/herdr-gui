@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 
@@ -364,6 +364,7 @@ impl HerdrClient {
     }
 
     fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T, HerdrError> {
+        let started = Instant::now();
         let mut stream = UnixStream::connect(&self.socket_path).map_err(|err| {
             HerdrError::SocketUnavailable(self.socket_path.display().to_string(), err.to_string())
         })?;
@@ -372,6 +373,11 @@ impl HerdrClient {
         let mut line = String::new();
         BufReader::new(stream).read_line(&mut line)?;
         let response: ApiResponse<T> = serde_json::from_str(&line)?;
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        let bytes = line.len();
+        lag_log(format_args!(
+            "herdr.call {method} {ms:.2}ms resp_bytes={bytes} params={params}"
+        ));
         if let Some(error) = response.error {
             Err(HerdrError::Api(
                 error.message.unwrap_or_else(|| "unknown error".to_string()),
@@ -381,6 +387,24 @@ impl HerdrClient {
         } else {
             Err(HerdrError::Api("missing result".to_string()))
         }
+    }
+}
+
+fn lag_log(args: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let line = format!("[{ts:.3}] {args}");
+    eprintln!("{line}");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/herdr-gui-lag.log")
+    {
+        let _ = writeln!(file, "{line}");
+        let _ = file.flush();
     }
 }
 
