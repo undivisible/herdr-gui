@@ -295,10 +295,24 @@ impl HerdrGui {
         cx.notify();
     }
 
-    fn toggle_spaces(&mut self, _: &ToggleSpaces, _window: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_spaces(&mut self, _: &ToggleSpaces, window: &mut Window, cx: &mut Context<Self>) {
         // Only dirty SidebarPane — root + terminal paint stay cold.
+        let click_at = Instant::now();
+        let term_in_flight = self.terminal_frame_in_flight;
+        let pending_vt = self.pending_vt.len();
+        let term_lines = self.terminal_frame.lines.len();
         self.sidebar_pane
             .update(cx, |pane, cx| pane.toggle_spaces(cx));
+        lag_log(format_args!(
+            "toggle_spaces env term_in_flight={term_in_flight} pending_vt={pending_vt} term_lines={term_lines}"
+        ));
+        // End-to-end: click → after next painted frame (not just tree build).
+        cx.on_next_frame(window, move |_this, _window, _cx| {
+            lag_log(format_args!(
+                "spaces click→next_frame {:.2}ms",
+                click_at.elapsed().as_secs_f64() * 1000.0,
+            ));
+        });
     }
 
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1715,6 +1729,7 @@ fn workspace_detail(cwd: Option<&str>) -> String {
             std::collections::HashMap<String, (Option<std::time::SystemTime>, String)>
         > = std::cell::RefCell::new(std::collections::HashMap::new());
     }
+    let started = Instant::now();
     let head_path = std::path::Path::new(path).join(".git/HEAD");
     let mtime = std::fs::metadata(&head_path)
         .and_then(|meta| meta.modified())
@@ -1739,6 +1754,10 @@ fn workspace_detail(cwd: Option<&str>) -> String {
             dir_name(path)
         };
         cache.insert(path.to_string(), (mtime, detail.clone()));
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        if ms > 0.5 {
+            lag_log(format_args!("workspace_detail disk {ms:.2}ms path={path}"));
+        }
         detail
     })
 }
