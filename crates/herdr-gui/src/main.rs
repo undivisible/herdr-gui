@@ -18,7 +18,7 @@ use ghostty::{TerminalFrame, TerminalLine, TerminalRun, TerminalSession};
 use help::help_overlay;
 use herdr::{Agent, HerdrClient, HerdrState, Pane, Tab, Workspace};
 use input::key_name;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::{
     sync::mpsc::{Receiver, TryRecvError},
     time::{Duration, Instant},
@@ -81,7 +81,7 @@ macro_rules! set_theme {
     };
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SidebarLayout {
     Warp,
     Arc,
@@ -97,7 +97,7 @@ enum ThemeMode {
 
 struct HerdrGui {
     client: Option<HerdrClient>,
-    terminal: Option<TerminalSession>,
+    terminal: Option<Arc<Mutex<TerminalSession>>>,
     terminal_target: Option<String>,
     terminal_size: Option<TerminalSize>,
     terminal_token: u64,
@@ -105,6 +105,7 @@ struct HerdrGui {
     terminal_pane: Entity<TerminalPane>,
     last_terminal_frame_at: Option<Instant>,
     terminal_pending_frame: bool,
+    terminal_frame_in_flight: bool,
     terminal_bg: u32,
     state: HerdrState,
     status: String,
@@ -191,6 +192,7 @@ impl HerdrGui {
             terminal_pane: cx.new(TerminalPane::new),
             last_terminal_frame_at: None,
             terminal_pending_frame: false,
+            terminal_frame_in_flight: false,
             terminal_bg: 0x0a0a0a,
             state,
             status,
@@ -550,7 +552,7 @@ impl HerdrGui {
     }
 
     fn maybe_refresh_terminal_frame(&mut self, cx: &mut Context<Self>, force: bool) {
-        let Some(terminal) = self.terminal.as_mut() else {
+        let Some(terminal) = self.terminal.clone() else {
             return;
         };
         const FRAME_MIN_INTERVAL: Duration = Duration::from_millis(50);
@@ -558,18 +560,44 @@ impl HerdrGui {
             || self
                 .last_terminal_frame_at
                 .is_none_or(|at| at.elapsed() >= FRAME_MIN_INTERVAL);
-        if !due {
+        if !due || self.terminal_frame_in_flight {
             self.terminal_pending_frame = true;
             return;
         }
-        let started = Instant::now();
-        if let Ok(frame) = terminal.frame() {
-            self.set_terminal_frame(Arc::new(frame), cx);
-        }
-        let ms = started.elapsed().as_secs_f64() * 1000.0;
-        if ms > 20.0 {
-            eprintln!("terminal.frame extract {ms:.1}ms");
-        }
+        // Extract off the UI thread — ghostty frame() walks every cell via FFI.
+        self.terminal_frame_in_flight = true;
+        self.terminal_pending_frame = false;
+        self.last_terminal_frame_at = Some(Instant::now());
+        let token = self.terminal_token;
+        cx.spawn(async move |this, cx| {
+            let started = Instant::now();
+            let frame = cx
+                .background_executor()
+                .spawn(async move {
+                    terminal
+                        .lock()
+                        .map_err(|err| err.to_string())
+                        .and_then(|mut terminal| terminal.frame())
+                })
+                .await;
+            let ms = started.elapsed().as_secs_f64() * 1000.0;
+            if ms > 20.0 {
+                eprintln!("terminal.frame extract {ms:.1}ms (bg)");
+            }
+            let _ = this.update(cx, |view, cx| {
+                view.terminal_frame_in_flight = false;
+                if view.terminal_token != token {
+                    return;
+                }
+                if let Ok(frame) = frame {
+                    view.set_terminal_frame(Arc::new(frame), cx);
+                }
+                if view.terminal_pending_frame {
+                    view.maybe_refresh_terminal_frame(cx, false);
+                }
+            });
+        })
+        .detach();
     }
 
     fn attach_focused_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -588,8 +616,11 @@ impl HerdrGui {
         };
         if self.terminal_target.as_deref() == Some(target.as_str()) {
             if self.terminal_size != Some(size) {
-                if let Some(terminal) = self.terminal.as_mut() {
-                    if let Ok(frame) = terminal.resize(size.0, size.1, size.2, size.3) {
+                if let Some(terminal) = self.terminal.clone() {
+                    let frame = terminal.lock().ok().and_then(|mut terminal| {
+                        terminal.resize(size.0, size.1, size.2, size.3).ok()
+                    });
+                    if let Some(frame) = frame {
                         self.set_terminal_frame(Arc::new(frame), cx);
                     }
                 }
@@ -614,7 +645,7 @@ impl HerdrGui {
                             }
                         }
                     }
-                    self.terminal = Some(session);
+                    self.terminal = Some(Arc::new(Mutex::new(session)));
                     self.terminal_target = Some(target.clone());
                     self.terminal_size = Some(size);
                     self.status = "connected".to_string();
@@ -797,8 +828,12 @@ impl HerdrGui {
         } else {
             -(delta.y.to_f64().abs() / 18.0).round().max(1.0) as isize
         };
-        if let Some(terminal) = self.terminal.as_mut() {
-            if let Ok(frame) = terminal.scroll(-rows) {
+        if let Some(terminal) = self.terminal.clone() {
+            let frame = terminal
+                .lock()
+                .ok()
+                .and_then(|mut terminal| terminal.scroll(-rows).ok());
+            if let Some(frame) = frame {
                 self.set_terminal_frame(Arc::new(frame), cx);
             }
             cx.notify();
@@ -855,8 +890,11 @@ impl HerdrGui {
             self.sidebar_animation.target = self.sidebar_animation.width;
             let size = self.terminal_size(_window);
             if self.terminal_size != Some(size) {
-                if let Some(terminal) = self.terminal.as_mut() {
-                    if let Ok(frame) = terminal.resize(size.0, size.1, size.2, size.3) {
+                if let Some(terminal) = self.terminal.clone() {
+                    let frame = terminal.lock().ok().and_then(|mut terminal| {
+                        terminal.resize(size.0, size.1, size.2, size.3).ok()
+                    });
+                    if let Some(frame) = frame {
                         self.set_terminal_frame(Arc::new(frame), cx);
                     }
                 }
@@ -987,6 +1025,7 @@ impl HerdrGui {
 
 impl Render for HerdrGui {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let render_started = Instant::now();
         let theme = self.theme(window);
         if self.terminal_bg != theme.terminal {
             self.terminal_bg = theme.terminal;
@@ -994,8 +1033,24 @@ impl Render for HerdrGui {
         }
         let panes = self.visible_panes();
         let pane_frame = self.terminal_frame.clone();
+        let after_state = render_started.elapsed();
 
         let root = view_file!("ui/ui.crepus");
+        let after_tree = render_started.elapsed();
+        let total_ms = after_tree.as_secs_f64() * 1000.0;
+        if total_ms > 5.0 {
+            eprintln!(
+                "render tree {total_ms:.1}ms state={:.1}ms tree={:.1}ms show_spaces={} workspaces={} tabs={} panes={} agents={} term_lines={}",
+                after_state.as_secs_f64() * 1000.0,
+                (after_tree - after_state).as_secs_f64() * 1000.0,
+                self.show_spaces,
+                self.state.workspaces.len(),
+                self.state.tabs.len(),
+                self.state.panes.len(),
+                self.state.agents.len(),
+                self.terminal_frame.lines.len(),
+            );
+        }
 
         root.key_context("HerdrGui")
             .track_focus(&self.focus_handle)
@@ -1051,6 +1106,7 @@ impl HerdrGui {
         theme: UiTheme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let started = Instant::now();
         let tabs = self.visible_tabs();
         let pane_container = div()
             .flex_1()
@@ -1061,8 +1117,19 @@ impl HerdrGui {
         let show_top_tabs = self.sidebar_layout == SidebarLayout::Arc;
         let show_swipe = self.swipe_progress.abs() > 0.01;
         let show_help = self.show_help;
+        let tab_count = tabs.len();
 
-        view_file!("ui/terminal_area.crepus")
+        let el = view_file!("ui/terminal_area.crepus");
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        if ms > 2.0 {
+            eprintln!(
+                "terminal_area build {ms:.1}ms tabs={} panes={} term_lines={}",
+                tab_count,
+                self.state.panes.len(),
+                self.terminal_frame.lines.len()
+            );
+        }
+        el
     }
 
     fn active_workspace(&self) -> Option<&Workspace> {
@@ -1203,6 +1270,7 @@ impl HerdrGui {
     }
 
     fn sidebar(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
+        let started = Instant::now();
         let start = self.sidebar_animation.start;
         let target = self.sidebar_animation.target;
         let width = self.sidebar_width() as f32;
@@ -1237,7 +1305,7 @@ impl HerdrGui {
             .when(self.sidebar_layout == SidebarLayout::Arc, |el| {
                 el.child(self.right_workspace_sidebar(theme, cx))
             });
-        if (start - target).abs() < f64::EPSILON {
+        let built = if (start - target).abs() < f64::EPSILON {
             el.into_any_element()
         } else {
             let id = gpui::ElementId::Name(format!("sidebar-{:.0}-to-{:.0}", start, target).into());
@@ -1249,7 +1317,17 @@ impl HerdrGui {
                 target as f32,
             )
             .into_any_element()
+        };
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        if ms > 2.0 {
+            eprintln!(
+                "sidebar build {ms:.1}ms show_spaces={} layout={:?} agents={}",
+                self.show_spaces,
+                self.sidebar_layout,
+                self.state.agents.len()
+            );
         }
+        built
     }
 
     fn warp_sidebar(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2091,8 +2169,10 @@ fn poll_terminal(
                     return;
                 }
                 if !accumulated.is_empty() {
-                    if let Some(terminal) = view.terminal.as_mut() {
-                        terminal.write_bytes(&accumulated);
+                    if let Some(terminal) = view.terminal.clone() {
+                        if let Ok(mut terminal) = terminal.lock() {
+                            terminal.write_bytes(&accumulated);
+                        }
                         view.terminal_pending_frame = true;
                     }
                 }
