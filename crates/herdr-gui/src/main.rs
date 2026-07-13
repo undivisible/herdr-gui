@@ -10,9 +10,10 @@ use crepuscularity_gpui as gpui;
 use crepuscularity_gpui::prelude::*;
 use crepuscularity_gpui::{
     actions, bounce, bounds, div, gpui_window_options, linear, point, px, rgb, size, AnyElement,
-    AnyWindowHandle, App, Application, Context, Entity, FocusHandle, Icon, IntoElement, KeyBinding,
-    Keystroke, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render,
-    ScrollWheelEvent, SystemMenuType, TitlebarOptions, Window, WindowAppearance, WindowBounds,
+    AnyView, AnyWindowHandle, App, Application, Context, Entity, FocusHandle, Icon, IntoElement,
+    KeyBinding, Keystroke, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Render, ScrollWheelEvent, SystemMenuType, TitlebarOptions, Window, WindowAppearance,
+    WindowBounds,
 };
 use ghostty::{TerminalFrame, TerminalLine, TerminalRun, TerminalSession};
 use help::help_overlay;
@@ -124,36 +125,78 @@ struct HerdrGui {
     render_seq: u64,
 }
 
+#[derive(Clone)]
+struct SpaceRow {
+    id: String,
+    title: String,
+    detail: String,
+    focused: bool,
+}
+
 /// Spaces dropdown isolated from root paint — toggle only dirties this entity.
+/// Snapshot + absolute overlay: open must not reflow terminal bounds / paint.
 struct SpacesMenu {
     herdr: Entity<HerdrGui>,
     open: bool,
     click_at: Option<Instant>,
+    rows: Vec<SpaceRow>,
+    theme: UiTheme,
 }
 
 impl SpacesMenu {
-    fn toggle(&mut self, cx: &mut Context<Self>) {
+    fn toggle(&mut self, window: &Window, cx: &mut Context<Self>) {
         let started = Instant::now();
         self.open = !self.open;
         self.click_at = Some(started);
+        if self.open {
+            self.resync(window, cx);
+        } else {
+            self.rows.clear();
+        }
         cx.notify();
         lag_log(format_args!(
-            "spaces_menu toggle {:.2}ms open={}",
+            "spaces_menu toggle {:.2}ms open={} rows={}",
             started.elapsed().as_secs_f64() * 1000.0,
             self.open,
+            self.rows.len(),
         ));
     }
 
     fn close(&mut self, cx: &mut Context<Self>) {
         if self.open {
             self.open = false;
+            self.rows.clear();
             cx.notify();
         }
+    }
+
+    fn resync(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let app = self.herdr.read(cx);
+        let active_id = app.active_workspace_id().map(str::to_string);
+        self.theme = app.theme(window);
+        self.rows = app
+            .state
+            .workspaces
+            .iter()
+            .map(|workspace| SpaceRow {
+                id: workspace.workspace_id.clone(),
+                title: workspace
+                    .label
+                    .as_deref()
+                    .unwrap_or(&workspace.workspace_id)
+                    .to_string(),
+                detail: workspace_detail(workspace.cwd.as_deref()),
+                focused: workspace.focused
+                    || active_id
+                        .as_deref()
+                        .is_some_and(|active| active == workspace.workspace_id),
+            })
+            .collect();
     }
 }
 
 impl Render for SpacesMenu {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let render_started = Instant::now();
         let since_click = self.click_at.take().map(|at| at.elapsed().as_secs_f64() * 1000.0);
         if !self.open {
@@ -163,37 +206,32 @@ impl Render for SpacesMenu {
                     render_started.elapsed().as_secs_f64() * 1000.0,
                 ));
             }
-            return div().w_full().into_any_element();
+            // Zero-size placeholder — no layout push into terminal.
+            return div().into_any_element();
         }
 
         let herdr = self.herdr.clone();
-        let (workspaces, active_id, theme) = {
-            let app = self.herdr.read(cx);
-            (
-                app.state.workspaces.clone(),
-                app.active_workspace_id().map(str::to_string),
-                app.theme(window),
-            )
-        };
-
+        let theme = self.theme;
+        let rows = self.rows.clone();
+        let row_count = rows.len();
         let list = div()
-            .w_full()
+            // Absolute: overlay sidebar body, do not grow flex height / reflow terminal.
+            .absolute()
+            .top(px(38.0))
+            .left_0()
+            .right_0()
+            .max_h(px(360.0))
+            .overflow_hidden()
+            .bg(rgb(theme.panel))
+            .border_1()
+            .border_color(rgb(theme.border))
             .flex()
             .flex_col()
-            .gap_2()
-            .children(workspaces.into_iter().map(|workspace| {
-                let id = workspace.workspace_id.clone();
-                let close_id = workspace.workspace_id.clone();
-                let title = workspace
-                    .label
-                    .as_deref()
-                    .unwrap_or(&workspace.workspace_id)
-                    .to_string();
-                let detail = workspace_detail(workspace.cwd.as_deref());
-                let focused = workspace.focused
-                    || active_id
-                        .as_deref()
-                        .is_some_and(|active| active == workspace.workspace_id);
+            .gap_1()
+            .py_1()
+            .children(rows.into_iter().map(|row| {
+                let id = row.id.clone();
+                let close_id = row.id.clone();
                 let herdr_click = herdr.clone();
                 let herdr_close = herdr.clone();
                 let menu = cx.entity();
@@ -211,7 +249,7 @@ impl Render for SpacesMenu {
                             app.focus_workspace_id(id.clone(), window, cx);
                         });
                     })
-                    .when(focused, |el| el.bg(rgb(theme.active)))
+                    .when(row.focused, |el| el.bg(rgb(theme.active)))
                     .child(
                         div()
                             .flex_1()
@@ -219,8 +257,8 @@ impl Render for SpacesMenu {
                             .flex()
                             .flex_col()
                             .gap_0p5()
-                            .child(ui_text(&title, 14, theme.label, true, ""))
-                            .child(ui_text(&detail, 11, theme.muted, false, "")),
+                            .child(ui_text(&row.title, 14, theme.label, true, ""))
+                            .child(ui_text(&row.detail, 11, theme.muted, false, "")),
                     )
                     .child(
                         div()
@@ -237,19 +275,30 @@ impl Render for SpacesMenu {
                                     app.close_workspace_id(close_id.clone(), window, cx);
                                 });
                             })
-                            .child(icon("xmark", 9.0, theme)),
+                            .child(
+                                // Text glyph — avoid SF Symbol raster on open path.
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(theme.muted))
+                                    .child("×"),
+                            ),
                     )
                     .into_any_element()
             }));
 
-        lag_log(format_args!(
-            "spaces_menu render open {:.2}ms rows={} since_click={:.2?}",
-            render_started.elapsed().as_secs_f64() * 1000.0,
-            self.herdr.read(cx).state.workspaces.len(),
-            since_click,
-        ));
+        if let Some(ms) = since_click {
+            lag_log(format_args!(
+                "spaces_menu render open {:.2}ms rows={row_count} since_click={ms:.2}ms",
+                render_started.elapsed().as_secs_f64() * 1000.0,
+            ));
+        }
         list.into_any_element()
     }
+}
+
+fn cached_spaces_menu(entity: Entity<SpacesMenu>) -> AnyView {
+    // Cache paint when parent/window refreshes; do NOT force flex_1/size_full (broke layout).
+    AnyView::from(entity).cached(gpui::StyleRefinement::default().w_full())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -332,6 +381,18 @@ impl HerdrGui {
                     herdr,
                     open: false,
                     click_at: None,
+                    rows: Vec::new(),
+                    theme: UiTheme {
+                        bg: 0x0a0a0a,
+                        panel: 0x121212,
+                        terminal: 0x0a0a0a,
+                        text: 0xc5ceda,
+                        label: 0xd8dee9,
+                        muted: 0x6b7280,
+                        hover: 0x1f2937,
+                        active: 0x273449,
+                        border: 0x2a2a2a,
+                    },
                 })
             },
             sidebar_collapsed: settings.sidebar_collapsed,
@@ -368,9 +429,10 @@ impl HerdrGui {
         cx.notify();
     }
 
-    fn toggle_spaces(&mut self, _: &ToggleSpaces, _window: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_spaces(&mut self, _: &ToggleSpaces, window: &mut Window, cx: &mut Context<Self>) {
         // Only dirty the spaces menu entity — never the full window root.
-        self.spaces_menu.update(cx, |menu, cx| menu.toggle(cx));
+        self.spaces_menu
+            .update(cx, |menu, cx| menu.toggle(window, cx));
     }
 
     fn spaces_open(&self, cx: &App) -> bool {
@@ -1409,6 +1471,7 @@ impl HerdrGui {
         let target = self.sidebar_animation.target;
         let width = self.sidebar_width() as f32;
         let el = div()
+            .relative()
             .h_full()
             .w(px(width))
             .when(self.sidebar_layout == SidebarLayout::Arc, |el| {
@@ -1426,8 +1489,8 @@ impl HerdrGui {
             .when(self.sidebar_layout != SidebarLayout::Arc, |el| {
                 el.child(space_switcher(self.active_workspace(), theme, cx))
             })
-            // Own entity: open/close does not dirty root HerdrGui paint.
-            .child(self.spaces_menu.clone())
+            // Own entity + cached paint: open/close does not dirty root or thrash parent frames.
+            .child(cached_spaces_menu(self.spaces_menu.clone()))
             .when(self.sidebar_layout == SidebarLayout::Warp, |el| {
                 el.child(self.warp_sidebar(theme, cx))
             })
