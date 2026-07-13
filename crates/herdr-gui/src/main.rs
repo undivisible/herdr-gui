@@ -18,10 +18,11 @@ use ghostty::{TerminalFrame, TerminalLine, TerminalRun, TerminalSession};
 use help::help_overlay;
 use herdr::{Agent, HerdrClient, HerdrState, Pane, Tab, Workspace};
 use input::key_name;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{
     sync::mpsc::{Receiver, TryRecvError},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use terminal_view::{cached_terminal, TerminalPane};
 use theme::{agent_status_accent, agent_status_background, herdr_theme, status_color, UiTheme};
@@ -274,6 +275,48 @@ impl HerdrGui {
         }
     }
 
+    fn start_lag_heartbeat(cx: &mut Context<Self>) {
+        // Detect main-thread stalls *before* mouse_down (click→next_frame only measures after).
+        cx.spawn(async move |this, cx| {
+            let mut n = 0u64;
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
+                let tick_started = Instant::now();
+                let ok = this.update(cx, |view, _cx| {
+                    n = n.wrapping_add(1);
+                    let now_ms = unix_ms();
+                    let prev = LAST_HEARTBEAT_MS.swap(now_ms, Ordering::SeqCst);
+                    let gap_ms = if prev == 0 {
+                        0.0
+                    } else {
+                        now_ms.saturating_sub(prev) as f64
+                    };
+                    HEARTBEAT_N.store(n, Ordering::SeqCst);
+                    // Always log: gaps >> 50ms = main thread blocked.
+                    lag_log(format_args!(
+                        "heartbeat n={n} scheduled_gap_ms={gap_ms:.0} term_in_flight={} pending_vt={} term_lines={} sidebar_spaces={}",
+                        view.terminal_frame_in_flight,
+                        view.pending_vt.len(),
+                        view.terminal_frame.lines.len(),
+                        view.sidebar_pane.read(_cx).show_spaces,
+                    ));
+                });
+                if ok.is_err() {
+                    break;
+                }
+                let update_ms = tick_started.elapsed().as_secs_f64() * 1000.0;
+                if update_ms > 2.0 {
+                    lag_log(format_args!(
+                        "heartbeat update_blocked {update_ms:.2}ms (main thread busy during update)"
+                    ));
+                }
+            }
+        })
+        .detach();
+    }
+
     fn toggle_help(&mut self, _: &ToggleHelp, _window: &mut Window, cx: &mut Context<Self>) {
         self.show_help = !self.show_help;
         cx.notify();
@@ -298,21 +341,28 @@ impl HerdrGui {
     fn toggle_spaces(&mut self, _: &ToggleSpaces, window: &mut Window, cx: &mut Context<Self>) {
         // Only dirty SidebarPane — root + terminal paint stay cold.
         let click_at = Instant::now();
+        let click_unix_ms = unix_ms();
+        let last_hb = LAST_HEARTBEAT_MS.load(Ordering::SeqCst);
+        let since_hb_ms = if last_hb == 0 {
+            -1.0
+        } else {
+            click_unix_ms.saturating_sub(last_hb) as f64
+        };
         let term_in_flight = self.terminal_frame_in_flight;
         let pending_vt = self.pending_vt.len();
         let term_lines = self.terminal_frame.lines.len();
+        let hb_n = HEARTBEAT_N.load(Ordering::SeqCst);
+        lag_log(format_args!(
+            "toggle_spaces BEGIN since_last_heartbeat_ms={since_hb_ms:.0} hb_n={hb_n} term_in_flight={term_in_flight} pending_vt={pending_vt} term_lines={term_lines}"
+        ));
         self.sidebar_pane
             .update(cx, |pane, cx| pane.toggle_spaces(cx));
         lag_log(format_args!(
-            "toggle_spaces env term_in_flight={term_in_flight} pending_vt={pending_vt} term_lines={term_lines}"
+            "toggle_spaces AFTER_SIDEBAR_UPDATE {:.2}ms",
+            click_at.elapsed().as_secs_f64() * 1000.0
         ));
-        // End-to-end: click → after next painted frame (not just tree build).
-        cx.on_next_frame(window, move |_this, _window, _cx| {
-            lag_log(format_args!(
-                "spaces click→next_frame {:.2}ms",
-                click_at.elapsed().as_secs_f64() * 1000.0,
-            ));
-        });
+        // Multi-frame probes: lag after first frame still shows if present is delayed.
+        schedule_frame_probes(window, cx, click_at, &[0, 1, 2, 3, 5, 10, 30, 60]);
     }
 
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1744,14 +1794,22 @@ impl HerdrGui {
     }
 }
 
+static LAST_HEARTBEAT_MS: AtomicU64 = AtomicU64::new(0);
+static HEARTBEAT_N: AtomicU64 = AtomicU64::new(0);
+static LAG_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn lag_log(args: std::fmt::Arguments<'_>) {
     use std::io::Write;
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
-    let line = format!("[{ts:.3}] {args}");
+    let seq = LAG_SEQ.fetch_add(1, Ordering::SeqCst);
+    let ts = unix_ms() as f64 / 1000.0;
+    let line = format!("[{ts:.3} #{seq}] {args}");
     eprintln!("{line}");
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
@@ -1761,6 +1819,38 @@ fn lag_log(args: std::fmt::Arguments<'_>) {
         let _ = writeln!(file, "{line}");
         let _ = file.flush();
     }
+}
+
+fn schedule_frame_probes(
+    window: &mut Window,
+    cx: &mut Context<HerdrGui>,
+    click_at: Instant,
+    frames: &[u32],
+) {
+    fn step(
+        window: &mut Window,
+        cx: &mut Context<HerdrGui>,
+        click_at: Instant,
+        targets: Vec<u32>,
+        at: u32,
+    ) {
+        if targets.iter().all(|&t| t <= at) {
+            return;
+        }
+        cx.on_next_frame(window, move |this, window, cx| {
+            let next = at + 1;
+            if targets.iter().any(|&t| t == next) {
+                lag_log(format_args!(
+                    "spaces click→frame_{next} {:.2}ms show_spaces={} term_in_flight={}",
+                    click_at.elapsed().as_secs_f64() * 1000.0,
+                    this.sidebar_pane.read(cx).show_spaces,
+                    this.terminal_frame_in_flight,
+                ));
+            }
+            step(window, cx, click_at, targets, next);
+        });
+    }
+    step(window, cx, click_at, frames.to_vec(), 0);
 }
 
 fn workspace_detail(cwd: Option<&str>) -> String {
@@ -1896,8 +1986,15 @@ fn space_switcher(
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, window, cx| {
+                        let last_hb = LAST_HEARTBEAT_MS.load(Ordering::SeqCst);
+                        let since_hb = if last_hb == 0 {
+                            -1.0
+                        } else {
+                            unix_ms().saturating_sub(last_hb) as f64
+                        };
                         lag_log(format_args!(
-                            "mouse_down space_switcher term_in_flight={} pending_vt={} term_lines={}",
+                            "mouse_down space_switcher since_last_heartbeat_ms={since_hb:.0} hb_n={} term_in_flight={} pending_vt={} term_lines={}",
+                            HEARTBEAT_N.load(Ordering::SeqCst),
                             this.terminal_frame_in_flight,
                             this.pending_vt.len(),
                             this.terminal_frame.lines.len(),
@@ -2270,6 +2367,8 @@ fn main() {
         let window = cx.open_window(options, |_window, cx| cx.new(HerdrGui::new));
         if let Ok(window) = window {
             let _ = window.update(cx, |view, window, cx| {
+                HerdrGui::start_lag_heartbeat(cx);
+                lag_log(format_args!("app window ready — heartbeat every 50ms"));
                 view.attach_focused_terminal(window, cx)
             });
             let view = window.update(cx, |_, _, cx| cx.entity());
