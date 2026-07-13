@@ -1839,7 +1839,7 @@ fn schedule_frame_probes(
         }
         cx.on_next_frame(window, move |this, window, cx| {
             let next = at + 1;
-            if targets.iter().any(|&t| t == next) {
+            if targets.contains(&next) {
                 lag_log(format_args!(
                     "spaces click→frame_{next} {:.2}ms show_spaces={} term_in_flight={}",
                     click_at.elapsed().as_secs_f64() * 1000.0,
