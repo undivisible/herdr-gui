@@ -11,9 +11,9 @@ use crepuscularity_gpui::prelude::*;
 use crepuscularity_gpui::{
     actions, bounce, bounds, div, gpui_window_options, linear, point, px, rgb, size, AnyElement,
     AnyView, AnyWindowHandle, App, Application, Context, Entity, FocusHandle, Icon, IntoElement,
-    KeyBinding, Keystroke, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Render, ScrollWheelEvent, SystemMenuType, TitlebarOptions, Window, WindowAppearance,
-    WindowBounds,
+    KeyBinding, Keystroke, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Render, ScrollWheelEvent, SystemMenuType, TitlebarOptions, Window,
+    WindowAppearance, WindowBounds,
 };
 use ghostty::{TerminalFrame, TerminalLine, TerminalRun, TerminalSession};
 use help::help_overlay;
@@ -166,9 +166,9 @@ impl Render for SidebarPane {
             .map(|at| at.elapsed().as_secs_f64() * 1000.0);
         let show_spaces = self.show_spaces;
         // Safe: HerdrGui is not mid-update when only SidebarPane is dirty.
-        let el = self
-            .herdr
-            .update(cx, |herdr, herdr_cx| herdr.build_sidebar(show_spaces, window, herdr_cx));
+        let el = self.herdr.update(cx, |herdr, herdr_cx| {
+            herdr.build_sidebar(show_spaces, window, herdr_cx)
+        });
         if let Some(ms) = since_click {
             lag_log(format_args!(
                 "sidebar_pane render {:.2}ms show_spaces={show_spaces} since_click={ms:.2}ms",
