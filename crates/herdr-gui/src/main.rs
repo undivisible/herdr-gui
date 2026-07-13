@@ -1210,17 +1210,13 @@ impl HerdrGui {
             .child(div().flex_1())
             .child(self.agent_header(self.agents_collapsed, theme, cx))
             .when(!self.agents_collapsed, |el| {
-                el.child(animation::opacity(
+                el.child(
                     div()
                         .flex()
                         .flex_col()
                         .gap_1()
                         .children(self.agent_rows(theme, cx)),
-                    "agents-dropdown",
-                    Duration::from_millis(200),
-                    0.0,
-                    1.0,
-                ))
+                )
             })
     }
 
@@ -1245,17 +1241,13 @@ impl HerdrGui {
             .child(div().h(px(1.0)).bg(rgb(theme.border)))
             .child(self.agent_header(self.agents_collapsed, theme, cx))
             .when(!self.agents_collapsed, |el| {
-                el.child(animation::opacity(
+                el.child(
                     div()
                         .flex()
                         .flex_col()
                         .gap_1()
                         .children(self.agent_rows(theme, cx)),
-                    "agents-dropdown-right",
-                    Duration::from_millis(200),
-                    0.0,
-                    1.0,
-                ))
+                )
             })
     }
 
@@ -1289,27 +1281,6 @@ impl HerdrGui {
                 }),
             )
             .into_any_element()
-    }
-
-    #[allow(dead_code)]
-    fn agents_dropdown(
-        &self,
-        id: &'static str,
-        theme: UiTheme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        animation::opacity(
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .children(self.agent_rows(theme, cx)),
-            id,
-            Duration::from_millis(200),
-            0.0,
-            1.0,
-        )
-        .into_any_element()
     }
 
     fn top_tabs(&self, tabs: Vec<Tab>, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1514,18 +1485,41 @@ fn workspace_detail(cwd: Option<&str>) -> String {
     let Some(path) = cwd else {
         return "~".to_string();
     };
-    // Try reading git branch from .git/HEAD
-    let head_path = std::path::Path::new(path).join(".git/HEAD");
-    if let Ok(head) = std::fs::read_to_string(&head_path) {
-        let head = head.trim();
-        if let Some(ref_path) = head.strip_prefix("ref: refs/heads/") {
-            return ref_path.to_string();
-        }
-        if head.len() >= 7 {
-            return head[..7].to_string();
-        }
+    // ponytail: thread-local mtime cache; refresh on HEAD change only
+    thread_local! {
+        static BRANCH_CACHE: std::cell::RefCell<
+            std::collections::HashMap<String, (Option<std::time::SystemTime>, String)>
+        > = std::cell::RefCell::new(std::collections::HashMap::new());
     }
-    // Fall back to directory name
+    let head_path = std::path::Path::new(path).join(".git/HEAD");
+    let mtime = std::fs::metadata(&head_path)
+        .and_then(|meta| meta.modified())
+        .ok();
+    BRANCH_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some((cached_mtime, detail)) = cache.get(path) {
+            if *cached_mtime == mtime {
+                return detail.clone();
+            }
+        }
+        let detail = if let Ok(head) = std::fs::read_to_string(&head_path) {
+            let head = head.trim();
+            if let Some(ref_path) = head.strip_prefix("ref: refs/heads/") {
+                ref_path.to_string()
+            } else if head.len() >= 7 {
+                head[..7].to_string()
+            } else {
+                dir_name(path)
+            }
+        } else {
+            dir_name(path)
+        };
+        cache.insert(path.to_string(), (mtime, detail.clone()));
+        detail
+    })
+}
+
+fn dir_name(path: &str) -> String {
     std::path::Path::new(path)
         .file_name()
         .and_then(|s| s.to_str())
@@ -2058,4 +2052,41 @@ fn poll_terminal(
         }
     })
     .detach();
+}
+
+#[cfg(test)]
+mod workspace_detail_tests {
+    use super::workspace_detail;
+    use std::fs;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn workspace_detail_reads_branch_and_refreshes_on_head_change() {
+        let nanos = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_nanos(),
+            Err(err) => panic!("{err}"),
+        };
+        let root = std::env::temp_dir().join(format!("herdr-gui-branch-{nanos}"));
+        let git = root.join(".git");
+        if let Err(err) = fs::create_dir_all(&git) {
+            panic!("{err}");
+        }
+        if let Err(err) = fs::write(git.join("HEAD"), "ref: refs/heads/feature/lag\n") {
+            panic!("{err}");
+        }
+
+        let Some(path) = root.to_str() else {
+            panic!("temp path not utf8");
+        };
+        assert_eq!(workspace_detail(Some(path)), "feature/lag");
+        assert_eq!(workspace_detail(Some(path)), "feature/lag");
+
+        std::thread::sleep(Duration::from_millis(1100));
+        if let Err(err) = fs::write(git.join("HEAD"), "ref: refs/heads/main\n") {
+            panic!("{err}");
+        }
+        assert_eq!(workspace_detail(Some(path)), "main");
+
+        let _ = fs::remove_dir_all(root);
+    }
 }
