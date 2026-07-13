@@ -10,9 +10,10 @@ use crepuscularity_gpui as gpui;
 use crepuscularity_gpui::prelude::*;
 use crepuscularity_gpui::{
     actions, bounce, bounds, div, gpui_window_options, linear, point, px, rgb, size, AnyElement,
-    AnyWindowHandle, App, Application, Context, Entity, FocusHandle, Icon, IntoElement, KeyBinding,
-    Keystroke, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render,
-    ScrollWheelEvent, SystemMenuType, TitlebarOptions, Window, WindowAppearance, WindowBounds,
+    AnyView, AnyWindowHandle, App, Application, Context, Entity, FocusHandle, Icon, IntoElement,
+    KeyBinding, Keystroke, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Render, ScrollWheelEvent, SystemMenuType, TitlebarOptions, Window, WindowAppearance,
+    WindowBounds,
 };
 use ghostty::{TerminalFrame, TerminalLine, TerminalRun, TerminalSession};
 use help::help_overlay;
@@ -294,20 +295,21 @@ impl HerdrGui {
                         now_ms.saturating_sub(prev) as f64
                     };
                     HEARTBEAT_N.store(n, Ordering::SeqCst);
-                    // Always log: gaps >> 50ms = main thread blocked.
-                    lag_log(format_args!(
-                        "heartbeat n={n} scheduled_gap_ms={gap_ms:.0} term_in_flight={} pending_vt={} term_lines={} sidebar_spaces={}",
-                        view.terminal_frame_in_flight,
-                        view.pending_vt.len(),
-                        view.terminal_frame.lines.len(),
-                        view.sidebar_pane.read(_cx).show_spaces,
-                    ));
+                    // Only log stalls — healthy 50ms ticks are noise.
+                    if gap_ms > 80.0 {
+                        lag_log(format_args!(
+                            "heartbeat STALL n={n} scheduled_gap_ms={gap_ms:.0} term_in_flight={} pending_vt={} term_lines={}",
+                            view.terminal_frame_in_flight,
+                            view.pending_vt.len(),
+                            view.terminal_frame.lines.len(),
+                        ));
+                    }
                 });
                 if ok.is_err() {
                     break;
                 }
                 let update_ms = tick_started.elapsed().as_secs_f64() * 1000.0;
-                if update_ms > 2.0 {
+                if update_ms > 5.0 {
                     lag_log(format_args!(
                         "heartbeat update_blocked {update_ms:.2}ms (main thread busy during update)"
                     ));
@@ -335,6 +337,7 @@ impl HerdrGui {
         self.sidebar_pane
             .update(cx, |pane, cx| pane.close_spaces(cx));
         self.save_settings();
+        self.notify_sidebar(cx);
         cx.notify();
     }
 
@@ -385,13 +388,14 @@ impl HerdrGui {
         self.sidebar_animation.start = old_width;
         self.sidebar_animation.target = new_width;
         self.save_settings();
+        self.notify_sidebar(cx);
         cx.notify();
     }
 
     fn toggle_agents(&mut self, _: &ToggleAgents, _window: &mut Window, cx: &mut Context<Self>) {
         self.agents_collapsed = !self.agents_collapsed;
         self.save_settings();
-        cx.notify();
+        self.notify_sidebar(cx);
     }
 
     fn theme_system(&mut self, _: &ThemeSystem, _window: &mut Window, cx: &mut Context<Self>) {
@@ -454,6 +458,7 @@ impl HerdrGui {
     fn refresh(&mut self, _: &Refresh, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_state();
         self.attach_focused_terminal(window, cx);
+        self.notify_sidebar(cx);
         cx.notify();
     }
 
@@ -503,6 +508,7 @@ impl HerdrGui {
         self.with_client(|client| client.create_tab(workspace_id.as_deref()));
         self.refresh_state();
         self.attach_focused_terminal(window, cx);
+        self.notify_sidebar(cx);
         cx.notify();
     }
 
@@ -561,6 +567,7 @@ impl HerdrGui {
         self.with_client(|client| client.focus_workspace(&workspace_id));
         self.refresh_state();
         self.attach_focused_terminal(window, cx);
+        self.notify_sidebar(cx);
         cx.notify();
     }
 
@@ -568,6 +575,7 @@ impl HerdrGui {
         self.with_client(|client| client.focus_tab(&tab_id));
         self.refresh_state();
         self.attach_focused_terminal(window, cx);
+        self.notify_sidebar(cx);
         cx.notify();
     }
 
@@ -680,26 +688,26 @@ impl HerdrGui {
         if Arc::ptr_eq(&self.terminal_frame, &frame)
             || self.terminal_frame.as_ref() == frame.as_ref()
         {
-            lag_log(format_args!("set_terminal_frame skip same"));
             return;
         }
-        let runs: usize = frame.lines.iter().map(|l| l.runs.len()).sum();
-        lag_log(format_args!(
-            "set_terminal_frame lines={} runs={runs}",
-            frame.lines.len()
-        ));
         self.terminal_frame = frame.clone();
         self.last_terminal_frame_at = Some(Instant::now());
         self.terminal_pending_frame = false;
+        // Only notify TerminalPane — never root/sidebar (cached siblings stay cold).
         self.terminal_pane
             .update(cx, |pane, cx| pane.set_frame(frame, cx));
+    }
+
+    fn notify_sidebar(&self, cx: &mut Context<Self>) {
+        self.sidebar_pane.update(cx, |_, cx| cx.notify());
     }
 
     fn maybe_refresh_terminal_frame(&mut self, cx: &mut Context<Self>, force: bool) {
         let Some(terminal) = self.terminal.clone() else {
             return;
         };
-        const FRAME_MIN_INTERVAL: Duration = Duration::from_millis(50);
+        // 10fps paint under agent flood — was 20fps + full sidebar rebuild spam.
+        const FRAME_MIN_INTERVAL: Duration = Duration::from_millis(100);
         let due = force
             || self
                 .last_terminal_frame_at
@@ -709,12 +717,6 @@ impl HerdrGui {
             return;
         }
         // Extract off the UI thread — ghostty frame() walks every cell via FFI.
-        lag_log(format_args!(
-            "maybe_refresh schedule force={force} last_frame_age_ms={:.1}",
-            self.last_terminal_frame_at
-                .map(|at| at.elapsed().as_secs_f64() * 1000.0)
-                .unwrap_or(-1.0)
-        ));
         self.terminal_frame_in_flight = true;
         self.terminal_pending_frame = false;
         self.last_terminal_frame_at = Some(Instant::now());
@@ -731,7 +733,7 @@ impl HerdrGui {
                 })
                 .await;
             let ms = started.elapsed().as_secs_f64() * 1000.0;
-            if ms > 20.0 {
+            if ms > 30.0 {
                 lag_log(format_args!("terminal.frame extract {ms:.1}ms (bg)"));
             }
             let _ = this.update(cx, |view, cx| {
@@ -1487,15 +1489,23 @@ impl HerdrGui {
             )
             .into_any_element()
         };
-        lag_log(format_args!(
-            "build_sidebar {:.2}ms show_spaces={show_spaces} layout={:?} width={width:.0} workspaces={} tabs={} agents={}",
-            started.elapsed().as_secs_f64() * 1000.0,
-            self.sidebar_layout,
-            self.state.workspaces.len(),
-            self.state.tabs.len(),
-            self.state.agents.len(),
-        ));
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        if ms > 1.0 {
+            lag_log(format_args!(
+                "build_sidebar {ms:.2}ms show_spaces={show_spaces} layout={:?} width={width:.0} workspaces={} tabs={} agents={}",
+                self.sidebar_layout,
+                self.state.workspaces.len(),
+                self.state.tabs.len(),
+                self.state.agents.len(),
+            ));
+        }
         built
+    }
+
+    /// Paint-cache sidebar entity so terminal paints do not rebuild the whole sidebar.
+    fn cached_sidebar(&self) -> AnyView {
+        AnyView::from(self.sidebar_pane.clone())
+            .cached(gpui::StyleRefinement::default().h_full())
     }
 
     fn warp_sidebar(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2458,10 +2468,10 @@ fn poll_terminal(
         {
             break;
         }
-        if last_summary.elapsed() >= Duration::from_secs(1) {
+        if last_summary.elapsed() >= Duration::from_secs(2) {
             if writes_window > 0 || frames_window > 0 {
                 lag_log(format_args!(
-                    "poll 1s tick={tick} writes={writes_window} bytes={bytes_window} frames_sched={frames_window}"
+                    "poll 2s writes={writes_window} bytes={bytes_window} frames_sched={frames_window}"
                 ));
             }
             last_summary = Instant::now();
