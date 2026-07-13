@@ -1918,7 +1918,7 @@ fn space_switcher(
         .h(px(38.0))
         .flex()
         .items_center()
-        .pl(px(12.0))
+        .pl_0()
         .child(
             div()
                 .flex_1()
