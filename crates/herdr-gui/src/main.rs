@@ -1503,9 +1503,17 @@ impl HerdrGui {
     }
 
     /// Paint-cache sidebar entity so terminal paints do not rebuild the whole sidebar.
+    ///
+    /// IMPORTANT: GPUI cached views use this StyleRefinement as the *layout shell*
+    /// when not dirty. Width must live here — otherwise the sidebar collapses to 0.
     fn cached_sidebar(&self) -> AnyView {
-        AnyView::from(self.sidebar_pane.clone())
-            .cached(gpui::StyleRefinement::default().h_full())
+        let width = self.sidebar_width() as f32;
+        AnyView::from(self.sidebar_pane.clone()).cached(
+            gpui::StyleRefinement::default()
+                .h_full()
+                .w(px(width))
+                .flex_shrink_0(),
+        )
     }
 
     fn warp_sidebar(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
