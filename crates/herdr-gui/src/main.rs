@@ -10,7 +10,7 @@ use crepuscularity_gpui as gpui;
 use crepuscularity_gpui::prelude::*;
 use crepuscularity_gpui::{
     actions, bounce, bounds, div, gpui_window_options, linear, point, px, rgb, size, AnyElement,
-    AnyWindowHandle, App, Application, Context, FocusHandle, Icon, IntoElement, KeyBinding,
+    AnyWindowHandle, App, Application, Context, Entity, FocusHandle, Icon, IntoElement, KeyBinding,
     Keystroke, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render,
     ScrollWheelEvent, SystemMenuType, TitlebarOptions, Window, WindowAppearance, WindowBounds,
 };
@@ -23,7 +23,7 @@ use std::{
     sync::mpsc::{Receiver, TryRecvError},
     time::Duration,
 };
-use terminal_view::terminal_frame;
+use terminal_view::{cached_terminal, TerminalPane};
 use theme::{agent_status_accent, agent_status_background, herdr_theme, status_color, UiTheme};
 
 actions!(
@@ -102,6 +102,7 @@ struct HerdrGui {
     terminal_size: Option<TerminalSize>,
     terminal_token: u64,
     terminal_frame: Arc<TerminalFrame>,
+    terminal_pane: Entity<TerminalPane>,
     state: HerdrState,
     status: String,
     show_help: bool,
@@ -184,6 +185,7 @@ impl HerdrGui {
             terminal_size: None,
             terminal_token: 0,
             terminal_frame: Arc::new(TerminalFrame::default()),
+            terminal_pane: cx.new(TerminalPane::new),
             state,
             status,
             show_help: false,
@@ -520,6 +522,15 @@ impl HerdrGui {
         }
     }
 
+    fn set_terminal_frame(&mut self, frame: Arc<TerminalFrame>, cx: &mut Context<Self>) {
+        if Arc::ptr_eq(&self.terminal_frame, &frame) {
+            return;
+        }
+        self.terminal_frame = frame.clone();
+        self.terminal_pane
+            .update(cx, |pane, cx| pane.set_frame(frame, cx));
+    }
+
     fn attach_focused_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let size = self.terminal_size(window);
         let pane = self.focused_pane().cloned();
@@ -538,7 +549,7 @@ impl HerdrGui {
             if self.terminal_size != Some(size) {
                 if let Some(terminal) = self.terminal.as_mut() {
                     if let Ok(frame) = terminal.resize(size.0, size.1, size.2, size.3) {
-                        self.terminal_frame = Arc::new(frame);
+                        self.set_terminal_frame(Arc::new(frame), cx);
                     }
                 }
                 self.terminal_size = Some(size);
@@ -548,7 +559,7 @@ impl HerdrGui {
         match TerminalSession::attach(&target, size.0, size.1) {
             Ok(mut session) => {
                 if let Ok(frame) = session.resize(size.0, size.1, size.2, size.3) {
-                    self.terminal_frame = Arc::new(frame);
+                    self.set_terminal_frame(Arc::new(frame), cx);
                 }
                 if let Some(receiver) = session.output.take() {
                     self.terminal_token = self.terminal_token.wrapping_add(1);
@@ -557,7 +568,7 @@ impl HerdrGui {
                         if let (Some(client), Some(pane)) = (&self.client, pane.as_ref()) {
                             if let Ok(ansi) = client.read_pane_ansi(&pane.pane_id) {
                                 if let Ok(frame) = TerminalFrame::from_ansi(size.0, size.1, &ansi) {
-                                    self.terminal_frame = Arc::new(frame);
+                                    self.set_terminal_frame(Arc::new(frame), cx);
                                 }
                             }
                         }
@@ -575,15 +586,18 @@ impl HerdrGui {
                 self.terminal = None;
                 self.terminal_target = None;
                 self.terminal_size = None;
-                self.terminal_frame = Arc::new(TerminalFrame {
-                    lines: vec![TerminalLine {
-                        runs: vec![TerminalRun {
-                            text: err.clone(),
-                            fg: 0xfca5a5,
-                            bg: None,
+                self.set_terminal_frame(
+                    Arc::new(TerminalFrame {
+                        lines: vec![TerminalLine {
+                            runs: vec![TerminalRun {
+                                text: err.clone(),
+                                fg: 0xfca5a5,
+                                bg: None,
+                            }],
                         }],
-                    }],
-                });
+                    }),
+                    cx,
+                );
                 self.status = err;
             }
         }
@@ -744,7 +758,7 @@ impl HerdrGui {
         };
         if let Some(terminal) = self.terminal.as_mut() {
             if let Ok(frame) = terminal.scroll(-rows) {
-                self.terminal_frame = Arc::new(frame);
+                self.set_terminal_frame(Arc::new(frame), cx);
             }
             cx.notify();
         }
@@ -800,7 +814,7 @@ impl HerdrGui {
             if self.terminal_size != Some(size) {
                 if let Some(terminal) = self.terminal.as_mut() {
                     if let Ok(frame) = terminal.resize(size.0, size.1, size.2, size.3) {
-                        self.terminal_frame = Arc::new(frame);
+                        self.set_terminal_frame(Arc::new(frame), cx);
                     }
                 }
                 self.terminal_size = Some(size);
@@ -931,6 +945,8 @@ impl HerdrGui {
 impl Render for HerdrGui {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme(window);
+        // Theme bg is cheap; only notifies terminal entity when color changes.
+        self.sync_terminal_theme(theme, cx);
         let panes = self.visible_panes();
         let pane_frame = self.terminal_frame.clone();
 
@@ -1433,9 +1449,7 @@ impl HerdrGui {
         }
 
         if panes.is_empty() {
-            return self
-                .terminal_only_view(pane_frame, theme)
-                .into_any_element();
+            return self.terminal_only_view(theme).into_any_element();
         }
 
         let pane = panes
@@ -1464,11 +1478,14 @@ impl HerdrGui {
                     this.focus_pane_id(pane_id.clone(), window, cx)
                 }),
             )
-            .child(self.terminal_only_view(pane_frame, theme))
+            .child(self.terminal_only_view(theme))
             .into_any_element()
     }
 
-    fn terminal_only_view(&self, pane_frame: Arc<TerminalFrame>, theme: UiTheme) -> AnyElement {
+    fn terminal_only_view(&self, theme: UiTheme) -> AnyElement {
+        // Keep bg in sync without forcing a full parent re-render tree of terminal cells.
+        // set_bg is no-op when unchanged.
+        let _ = theme;
         div()
             .flex_1()
             .overflow_hidden()
@@ -1476,8 +1493,13 @@ impl HerdrGui {
             .font_family("Menlo")
             .line_height(px(18.0))
             .text_color(rgb(theme.text))
-            .child(terminal_frame(pane_frame.as_ref(), theme.terminal))
+            .child(cached_terminal(self.terminal_pane.clone()))
             .into_any_element()
+    }
+
+    fn sync_terminal_theme(&self, theme: UiTheme, cx: &mut Context<Self>) {
+        self.terminal_pane
+            .update(cx, |pane, cx| pane.set_bg(theme.terminal, cx));
     }
 }
 
@@ -2022,11 +2044,11 @@ fn poll_terminal(
                     if view.terminal_token == token {
                         if let Some(terminal) = view.terminal.as_mut() {
                             if let Ok(frame) = terminal.write(&accumulated) {
-                                view.terminal_frame = Arc::new(frame);
+                                view.set_terminal_frame(Arc::new(frame), cx);
                             }
                         }
                     }
-                    cx.notify();
+                    // Only dirty terminal entity; chrome reuses cached paint.
                 })
                 .is_err()
         {

@@ -1,16 +1,56 @@
 use crepuscularity_gpui::prelude::*;
-use crepuscularity_gpui::{div, px, rgb, IntoElement};
+use crepuscularity_gpui::{cached_view, div, px, rgb, Entity, IntoElement, Render, Window};
+use std::sync::Arc;
 
 use crate::ghostty::{TerminalFrame, TerminalLine, TerminalRun};
 
-pub fn terminal_frame(frame: &TerminalFrame, terminal_bg: u32) -> impl IntoElement {
-    let bg = terminal_bg;
-    div()
-        .w_full()
-        .h_full()
-        .flex()
-        .flex_col()
-        .children(frame.lines.iter().map(|line| terminal_line(line, bg)))
+/// Own entity so parent chrome re-renders (spaces dropdown, etc.) can reuse
+/// previous layout/paint — Zed-style via [`AnyView::cached`].
+pub struct TerminalPane {
+    frame: Arc<TerminalFrame>,
+    bg: u32,
+}
+
+impl TerminalPane {
+    pub fn new(_cx: &mut Context<Self>) -> Self {
+        Self {
+            frame: Arc::new(TerminalFrame::default()),
+            bg: 0x0a0a0a,
+        }
+    }
+
+    pub fn set_frame(&mut self, frame: Arc<TerminalFrame>, cx: &mut Context<Self>) {
+        if Arc::ptr_eq(&self.frame, &frame) {
+            return;
+        }
+        self.frame = frame;
+        cx.notify();
+    }
+
+    pub fn set_bg(&mut self, bg: u32, cx: &mut Context<Self>) {
+        if self.bg == bg {
+            return;
+        }
+        self.bg = bg;
+        cx.notify();
+    }
+}
+
+impl Render for TerminalPane {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let bg = self.bg;
+        div().w_full().h_full().flex().flex_col().children(
+            self.frame
+                .lines
+                .iter()
+                .map(move |line| terminal_line(line, bg)),
+        )
+    }
+}
+
+/// Embed terminal entity with GPUI paint recycling when parent re-renders.
+pub fn cached_terminal(entity: Entity<TerminalPane>) -> impl IntoElement {
+    cached_view(entity)
 }
 
 fn terminal_line(line: &TerminalLine, bg: u32) -> impl IntoElement {
