@@ -133,20 +133,12 @@ struct HerdrGui {
 struct SidebarPane {
     herdr: Entity<HerdrGui>,
     show_spaces: bool,
-    click_at: Option<Instant>,
 }
 
 impl SidebarPane {
     fn toggle_spaces(&mut self, cx: &mut Context<Self>) {
-        let started = Instant::now();
         self.show_spaces = !self.show_spaces;
-        self.click_at = Some(started);
         cx.notify();
-        lag_log(format_args!(
-            "sidebar_pane toggle_spaces {:.2}ms show_spaces={}",
-            started.elapsed().as_secs_f64() * 1000.0,
-            self.show_spaces,
-        ));
     }
 
     fn close_spaces(&mut self, cx: &mut Context<Self>) {
@@ -159,23 +151,11 @@ impl SidebarPane {
 
 impl Render for SidebarPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let render_started = Instant::now();
-        let since_click = self
-            .click_at
-            .take()
-            .map(|at| at.elapsed().as_secs_f64() * 1000.0);
         let show_spaces = self.show_spaces;
         // Safe: HerdrGui is not mid-update when only SidebarPane is dirty.
-        let el = self.herdr.update(cx, |herdr, herdr_cx| {
+        self.herdr.update(cx, |herdr, herdr_cx| {
             herdr.build_sidebar(show_spaces, window, herdr_cx)
-        });
-        if let Some(ms) = since_click {
-            lag_log(format_args!(
-                "sidebar_pane render {:.2}ms show_spaces={show_spaces} since_click={ms:.2}ms",
-                render_started.elapsed().as_secs_f64() * 1000.0,
-            ));
-        }
-        el
+        })
     }
 }
 
@@ -259,7 +239,6 @@ impl HerdrGui {
                 cx.new(|_| SidebarPane {
                     herdr,
                     show_spaces: false,
-                    click_at: None,
                 })
             },
             sidebar_collapsed: settings.sidebar_collapsed,
@@ -276,6 +255,7 @@ impl HerdrGui {
         }
     }
 
+    #[allow(dead_code)]
     fn start_lag_heartbeat(cx: &mut Context<Self>) {
         // Detect main-thread stalls *before* mouse_down (click→next_frame only measures after).
         cx.spawn(async move |this, cx| {
@@ -341,31 +321,10 @@ impl HerdrGui {
         cx.notify();
     }
 
-    fn toggle_spaces(&mut self, _: &ToggleSpaces, window: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_spaces(&mut self, _: &ToggleSpaces, _window: &mut Window, cx: &mut Context<Self>) {
         // Only dirty SidebarPane — root + terminal paint stay cold.
-        let click_at = Instant::now();
-        let click_unix_ms = unix_ms();
-        let last_hb = LAST_HEARTBEAT_MS.load(Ordering::SeqCst);
-        let since_hb_ms = if last_hb == 0 {
-            -1.0
-        } else {
-            click_unix_ms.saturating_sub(last_hb) as f64
-        };
-        let term_in_flight = self.terminal_frame_in_flight;
-        let pending_vt = self.pending_vt.len();
-        let term_lines = self.terminal_frame.lines.len();
-        let hb_n = HEARTBEAT_N.load(Ordering::SeqCst);
-        lag_log(format_args!(
-            "toggle_spaces BEGIN since_last_heartbeat_ms={since_hb_ms:.0} hb_n={hb_n} term_in_flight={term_in_flight} pending_vt={pending_vt} term_lines={term_lines}"
-        ));
         self.sidebar_pane
             .update(cx, |pane, cx| pane.toggle_spaces(cx));
-        lag_log(format_args!(
-            "toggle_spaces AFTER_SIDEBAR_UPDATE {:.2}ms",
-            click_at.elapsed().as_secs_f64() * 1000.0
-        ));
-        // Multi-frame probes: lag after first frame still shows if present is delayed.
-        schedule_frame_probes(window, cx, click_at, &[0, 1, 2, 3, 5, 10, 30, 60]);
     }
 
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1507,13 +1466,7 @@ impl HerdrGui {
     /// IMPORTANT: GPUI cached views use this StyleRefinement as the *layout shell*
     /// when not dirty. Width must live here — otherwise the sidebar collapses to 0.
     fn cached_sidebar(&self) -> AnyView {
-        let width = self.sidebar_width() as f32;
-        AnyView::from(self.sidebar_pane.clone()).cached(
-            gpui::StyleRefinement::default()
-                .h_full()
-                .w(px(width))
-                .flex_shrink_0(),
-        )
+        AnyView::from(self.sidebar_pane.clone())
     }
 
     fn warp_sidebar(&self, theme: UiTheme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1825,52 +1778,31 @@ fn unix_ms() -> u64 {
 
 fn lag_log(args: std::fmt::Arguments<'_>) {
     use std::io::Write;
+    static LOGGER: std::sync::OnceLock<std::sync::mpsc::SyncSender<String>> =
+        std::sync::OnceLock::new();
     let seq = LAG_SEQ.fetch_add(1, Ordering::SeqCst);
     let ts = unix_ms() as f64 / 1000.0;
     let line = format!("[{ts:.3} #{seq}] {args}");
-    eprintln!("{line}");
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/herdr-gui-lag.log")
-    {
-        let _ = writeln!(file, "{line}");
-        let _ = file.flush();
-    }
-}
-
-fn schedule_frame_probes(
-    window: &mut Window,
-    cx: &mut Context<HerdrGui>,
-    click_at: Instant,
-    frames: &[u32],
-) {
-    fn step(
-        window: &mut Window,
-        cx: &mut Context<HerdrGui>,
-        click_at: Instant,
-        targets: Vec<u32>,
-        at: u32,
-    ) {
-        if targets.iter().all(|&t| t <= at) {
-            return;
-        }
-        cx.on_next_frame(window, move |this, window, cx| {
-            let next = at + 1;
-            if targets.contains(&next) {
-                lag_log(format_args!(
-                    "spaces click→frame_{next} {:.2}ms show_spaces={} term_in_flight={}",
-                    click_at.elapsed().as_secs_f64() * 1000.0,
-                    this.sidebar_pane.read(cx).show_spaces,
-                    this.terminal_frame_in_flight,
-                ));
+    let sender = LOGGER.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1024);
+        std::thread::spawn(move || {
+            let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/herdr-gui-lag.log")
+            else {
+                return;
+            };
+            for line in receiver {
+                let _ = writeln!(file, "{line}");
             }
-            step(window, cx, click_at, targets, next);
         });
-    }
-    step(window, cx, click_at, frames.to_vec(), 0);
+        sender
+    });
+    let _ = sender.try_send(line);
 }
 
+#[allow(dead_code)]
 fn workspace_detail(cwd: Option<&str>) -> String {
     let Some(path) = cwd else {
         return "~".to_string();
@@ -1986,7 +1918,7 @@ fn space_switcher(
         .h(px(38.0))
         .flex()
         .items_center()
-        .pl(px(82.0))
+        .pl(px(12.0))
         .child(
             div()
                 .flex_1()
@@ -2004,19 +1936,6 @@ fn space_switcher(
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, window, cx| {
-                        let last_hb = LAST_HEARTBEAT_MS.load(Ordering::SeqCst);
-                        let since_hb = if last_hb == 0 {
-                            -1.0
-                        } else {
-                            unix_ms().saturating_sub(last_hb) as f64
-                        };
-                        lag_log(format_args!(
-                            "mouse_down space_switcher since_last_heartbeat_ms={since_hb:.0} hb_n={} term_in_flight={} pending_vt={} term_lines={}",
-                            HEARTBEAT_N.load(Ordering::SeqCst),
-                            this.terminal_frame_in_flight,
-                            this.pending_vt.len(),
-                            this.terminal_frame.lines.len(),
-                        ));
                         this.toggle_spaces(&ToggleSpaces, window, cx)
                     }),
                 )
@@ -2379,14 +2298,12 @@ fn main() {
         );
         options.titlebar = Some(TitlebarOptions {
             title: None,
-            appears_transparent: true,
+            appears_transparent: false,
             traffic_light_position: Some(point(px(12.0), px(12.0))),
         });
         let window = cx.open_window(options, |_window, cx| cx.new(HerdrGui::new));
         if let Ok(window) = window {
             let _ = window.update(cx, |view, window, cx| {
-                HerdrGui::start_lag_heartbeat(cx);
-                lag_log(format_args!("app window ready — heartbeat every 50ms"));
                 view.attach_focused_terminal(window, cx)
             });
             let view = window.update(cx, |_, _, cx| cx.entity());
