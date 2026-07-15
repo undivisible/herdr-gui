@@ -2489,7 +2489,15 @@ fn agent_row(
         .as_deref()
         .or(agent.name.as_deref())
         .unwrap_or("");
-    let acp_kind = agent_panel::AgentKind::from_herdr_agent(agent_name);
+    let acp_kind = agent_panel::AgentKind::from_herdr_agent(agent_name).filter(|kind| {
+        std::process::Command::new("which")
+            .arg(kind.command())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    });
     let acp_button = acp_kind.map(|kind| {
         div()
             .w(px(20.0))
