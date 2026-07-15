@@ -19,6 +19,73 @@ pub enum AgentEvent {
     Error(String),
 }
 
+/// How the agent chat connects to the agent.
+pub enum AgentSession {
+    /// Direct connection to an existing herdr pane (no external process).
+    Direct {
+        pane_id: String,
+        last_output: String,
+    },
+    /// ACP subprocess (external agent binary).
+    Acp(AcpSession),
+}
+
+impl AgentSession {
+    /// Connect to an existing herdr agent pane directly.
+    pub fn direct(pane_id: String) -> Self {
+        AgentSession::Direct {
+            pane_id,
+            last_output: String::new(),
+        }
+    }
+
+    /// Spawn an ACP agent subprocess.
+    pub fn acp_spawn(command: &str, cwd: PathBuf) -> Result<Self, String> {
+        Ok(AgentSession::Acp(AcpSession::spawn(command, cwd)?))
+    }
+
+    pub fn try_recv(&self) -> Option<AgentEvent> {
+        match self {
+            AgentSession::Acp(session) => session.try_recv(),
+            AgentSession::Direct { .. } => None, // polled via read_pane_ansi
+        }
+    }
+
+    pub fn send_prompt(&self, text: &str) -> Result<(), String> {
+        match self {
+            AgentSession::Acp(session) => session.send_prompt(text),
+            AgentSession::Direct { pane_id, .. } => {
+                // Will be handled externally via herdr client
+                Err(format!("direct pane {pane_id} — send via herdr"))
+            }
+        }
+    }
+
+    pub fn pane_id(&self) -> Option<&str> {
+        match self {
+            AgentSession::Direct { pane_id, .. } => Some(pane_id),
+            AgentSession::Acp(_) => None,
+        }
+    }
+
+    pub fn is_direct(&self) -> bool {
+        matches!(self, AgentSession::Direct { .. })
+    }
+
+    pub fn last_output(&self) -> &str {
+        match self {
+            AgentSession::Direct { last_output, .. } => last_output,
+            AgentSession::Acp(_) => "",
+        }
+    }
+
+    pub fn set_last_output(&mut self, output: String) {
+        if let AgentSession::Direct { last_output, .. } = self {
+            *last_output = output;
+        }
+    }
+}
+
 pub struct AcpSession {
     event_rx: mpsc::Receiver<AgentEvent>,
     prompt_tx: mpsc::Sender<String>,
@@ -107,7 +174,6 @@ async fn run_agent(
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(agent, |connection: ConnectionTo<Agent>| async move {
-            // Initialize
             connection
                 .send_request(InitializeRequest::new(
                     agent_client_protocol::schema::ProtocolVersion::V1,
@@ -115,7 +181,6 @@ async fn run_agent(
                 .block_task()
                 .await?;
 
-            // Create session
             let session_response = connection
                 .send_request(NewSessionRequest::new(cwd))
                 .block_task()
@@ -123,7 +188,6 @@ async fn run_agent(
 
             let session_id = session_response.session_id.clone();
 
-            // Wait for prompts from the GUI
             while let Ok(prompt_text) = prompt_rx.recv() {
                 let prompt_req = PromptRequest::new(
                     session_id.clone(),

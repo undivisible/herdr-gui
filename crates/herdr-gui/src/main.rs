@@ -400,18 +400,8 @@ impl HerdrGui {
 
     fn start_agent_session(&mut self, _cx: &mut Context<Self>) {
         let kind = self.agent_chat.selected_agent;
-        // Guard: only spawn if this specific agent is installed
-        if !self.agent_chat.installed_agents.contains(&kind) {
-            self.agent_chat
-                .messages
-                .push(agent_panel::AgentChatMessage {
-                    role: AgentRole::Error,
-                    text: format!("{} is not installed. Install it first.", kind.label()),
-                });
-            return;
-        }
         let cwd = std::env::current_dir().unwrap_or_default();
-        match acp::AcpSession::spawn(kind.command(), cwd) {
+        match acp::AgentSession::acp_spawn(kind.command(), cwd) {
             Ok(session) => {
                 self.agent_chat.session = Some(session);
                 self.agent_chat.is_working = true;
@@ -431,6 +421,88 @@ impl HerdrGui {
                     });
             }
         }
+    }
+
+    /// Connect directly to an existing herdr agent pane.
+    fn connect_to_pane(&mut self, pane_id: String, agent_name: String) {
+        self.agent_chat.connected_pane_id = Some(pane_id.clone());
+        self.agent_chat.session = Some(acp::AgentSession::direct(pane_id.clone()));
+        self.agent_chat.is_working = false;
+        self.agent_chat
+            .messages
+            .push(agent_panel::AgentChatMessage {
+                role: AgentRole::Agent,
+                text: format!("Connected to {agent_name}"),
+            });
+        // Read initial terminal content
+        if let Some(client) = &self.client {
+            if let Ok(output) = client.read_pane_ansi(&pane_id) {
+                let stripped = strip_ansi(&output);
+                if !stripped.trim().is_empty() {
+                    self.agent_chat
+                        .messages
+                        .push(agent_panel::AgentChatMessage {
+                            role: AgentRole::Agent,
+                            text: stripped,
+                        });
+                }
+                if let Some(session) = &mut self.agent_chat.session {
+                    session.set_last_output(output);
+                }
+            }
+        }
+    }
+
+    fn send_agent_prompt(&mut self, cx: &mut Context<Self>) {
+        let text = self.agent_chat.input_text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        self.agent_chat
+            .messages
+            .push(agent_panel::AgentChatMessage {
+                role: AgentRole::User,
+                text: text.clone(),
+            });
+        self.agent_chat.input_text.clear();
+
+        // Direct mode: send via herdr pane API
+        if let Some(pane_id) = self
+            .agent_chat
+            .session
+            .as_ref()
+            .and_then(|s| s.pane_id())
+            .map(String::from)
+        {
+            if let Some(client) = &self.client {
+                let _ = client.send_text(&pane_id, &text);
+                let _ = client.send_key(&pane_id, "enter");
+                self.agent_chat.is_working = true;
+            }
+            cx.notify();
+            return;
+        }
+
+        // ACP mode: send via channel
+        if let Some(session) = self.agent_chat.session.as_ref() {
+            if let Err(err) = session.send_prompt(&text) {
+                self.agent_chat
+                    .messages
+                    .push(agent_panel::AgentChatMessage {
+                        role: AgentRole::Error,
+                        text: err,
+                    });
+            } else {
+                self.agent_chat.is_working = true;
+            }
+        } else {
+            self.start_agent_session(cx);
+            if let Some(session) = self.agent_chat.session.as_ref() {
+                let _ = session.send_prompt(&text);
+                self.agent_chat.is_working = true;
+            }
+        }
+        cx.notify();
     }
 
     fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
@@ -473,6 +545,55 @@ impl HerdrGui {
     }
 
     fn poll_agent_events(&mut self) {
+        // Direct mode: poll herdr pane for new terminal output
+        if let Some(session) = self.agent_chat.session.as_ref() {
+            if session.is_direct() {
+                if let Some(pane_id) = session.pane_id().map(String::from) {
+                    if let Some(client) = &self.client {
+                        if let Ok(output) = client.read_pane_ansi(&pane_id) {
+                            let last = self
+                                .agent_chat
+                                .session
+                                .as_ref()
+                                .map(|s| s.last_output().to_string())
+                                .unwrap_or_default();
+                            if output != last {
+                                let new_content = strip_ansi(&output);
+                                let old_content = strip_ansi(&last);
+                                // Find what's new
+                                if let Some(diff) = new_content.strip_prefix(old_content.trim_end())
+                                {
+                                    let diff = diff.trim();
+                                    if !diff.is_empty() {
+                                        self.agent_chat.messages.push(
+                                            agent_panel::AgentChatMessage {
+                                                role: agent_panel::AgentRole::Agent,
+                                                text: diff.to_string(),
+                                            },
+                                        );
+                                    }
+                                } else if new_content != old_content {
+                                    // Content changed significantly — show latest
+                                    self.agent_chat
+                                        .messages
+                                        .push(agent_panel::AgentChatMessage {
+                                            role: agent_panel::AgentRole::Agent,
+                                            text: new_content.clone(),
+                                        });
+                                }
+                                if let Some(session) = &mut self.agent_chat.session {
+                                    session.set_last_output(output);
+                                }
+                                self.agent_chat.is_working = false;
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+        }
+
+        // ACP mode: poll ACP events
         let Some(session) = self.agent_chat.session.as_ref() else {
             return;
         };
@@ -517,41 +638,6 @@ impl HerdrGui {
                 }
             }
         }
-    }
-
-    fn send_agent_prompt(&mut self, cx: &mut Context<Self>) {
-        let text = self.agent_chat.input_text.trim().to_string();
-        if text.is_empty() {
-            return;
-        }
-        self.agent_chat
-            .messages
-            .push(agent_panel::AgentChatMessage {
-                role: agent_panel::AgentRole::User,
-                text: text.clone(),
-            });
-        self.agent_chat.input_text.clear();
-        if let Some(session) = self.agent_chat.session.as_ref() {
-            if let Err(err) = session.send_prompt(&text) {
-                self.agent_chat
-                    .messages
-                    .push(agent_panel::AgentChatMessage {
-                        role: agent_panel::AgentRole::Error,
-                        text: err,
-                    });
-            } else {
-                self.agent_chat.is_working = true;
-            }
-        } else {
-            // No session — try to start one
-            self.start_agent_session(cx);
-            // Queue the prompt to send after session starts
-            if let Some(session) = self.agent_chat.session.as_ref() {
-                let _ = session.send_prompt(&text);
-                self.agent_chat.is_working = true;
-            }
-        }
-        cx.notify();
     }
 
     fn theme_system(&mut self, _: &ThemeSystem, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2483,47 +2569,48 @@ fn agent_row(
             cx,
         );
     });
-    // ACP button: opens agent chat for this agent type
+    // ACP button: connects to existing agent pane directly
     let agent_name = agent
         .agent
         .as_deref()
         .or(agent.name.as_deref())
-        .unwrap_or("");
-    let acp_kind = agent_panel::AgentKind::from_herdr_agent(agent_name).filter(|kind| {
-        std::process::Command::new("which")
-            .arg(kind.command())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    });
-    let acp_button = acp_kind.map(|kind| {
-        div()
-            .w(px(20.0))
-            .h(px(20.0))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_sm()
-            .cursor_pointer()
-            .hover(move |style| style.bg(rgb(theme.hover)))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, window, cx| {
-                    this.agent_chat.selected_agent = kind;
-                    this.toggle_agent_chat(&ToggleAgentChat, window, cx);
-                }),
-            )
-            .child(
-                div()
-                    .text_size(px(11.0))
-                    .text_color(rgb(theme.muted))
-                    .child(kind.icon().to_string()),
-            )
-            .into_any_element()
-    });
+        .unwrap_or("")
+        .to_string();
+    let acp_pane_id = agent.pane_id.clone();
+    let acp_button = if acp_pane_id.is_some() {
+        let name = agent_name.clone();
+        let pid = acp_pane_id.clone().unwrap_or_default();
+        Some(
+            div()
+                .w(px(20.0))
+                .h(px(20.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_sm()
+                .cursor_pointer()
+                .hover(move |style| style.bg(rgb(theme.hover)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _window, cx| {
+                        this.connect_to_pane(pid.clone(), name.clone());
+                        this.agent_chat.view = agent_panel::PaneView::AgentChat;
+                        this.agent_chat.visible = true;
+                        this.notify_sidebar(cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(theme.muted))
+                        .child("▸".to_string()),
+                )
+                .into_any_element(),
+        )
+    } else {
+        None
+    };
 
     agent_row_element(
         title, subtitle, status_key, focused, theme, on_click, acp_button,
@@ -2582,6 +2669,44 @@ fn agent_row_element(
 fn empty_state(status: &str, theme: UiTheme) -> impl IntoElement {
     let _ = (status, theme);
     view_file!("ui/widgets.crepus#EmptyState")
+}
+
+fn strip_ansi(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip ESC sequences
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(&next) = chars.peek() {
+                    if next.is_ascii_alphabetic() {
+                        chars.next();
+                        break;
+                    }
+                    chars.next();
+                }
+            } else if chars.peek() == Some(&']') {
+                // OSC: skip until BEL or ST
+                chars.next();
+                while let Some(next) = chars.next() {
+                    if next == '\x07' {
+                        break;
+                    }
+                    if next == '\x1b' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            } else {
+                // Other ESC: skip next char
+                chars.next();
+            }
+        } else if c != '\r' {
+            result.push(c);
+        }
+    }
+    result
 }
 
 fn main() {

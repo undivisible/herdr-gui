@@ -1,4 +1,4 @@
-use crate::acp::AcpSession;
+use crate::acp::AgentSession;
 use crepuscularity_gpui::prelude::*;
 use crepuscularity_gpui::{div, px, rgb, AnyElement, FontWeight, IntoElement};
 use std::process::Command;
@@ -31,13 +31,15 @@ pub struct AgentChatState {
     pub visible: bool,
     pub messages: Vec<AgentChatMessage>,
     pub input_text: String,
-    pub session: Option<AcpSession>,
+    pub session: Option<AgentSession>,
     pub is_working: bool,
     pub selected_agent: AgentKind,
     /// Agents detected as installed on this machine.
     pub installed_agents: Vec<AgentKind>,
     /// Agent detected from herdr's running agents.
     pub herdr_agent: Option<AgentKind>,
+    /// Connected herdr pane ID (for direct mode).
+    pub connected_pane_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -160,6 +162,7 @@ impl AgentChatState {
             selected_agent: installed.first().copied().unwrap_or(AgentKind::ClaudeCode),
             installed_agents: installed,
             herdr_agent: None,
+            connected_pane_id: None,
         }
     }
 
