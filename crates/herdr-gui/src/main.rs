@@ -1,3 +1,4 @@
+mod acp;
 mod ghostty;
 mod help;
 mod herdr;
