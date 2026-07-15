@@ -478,6 +478,28 @@ impl HerdrGui {
         }
     }
 
+    fn build_conversation_context(&self) -> String {
+        let mut context = String::new();
+        context.push_str("Continue this conversation:\n\n");
+        for msg in &self.agent_chat.messages {
+            match msg.role {
+                AgentRole::User => {
+                    context.push_str(&format!("User: {}\n", msg.text));
+                }
+                AgentRole::Agent => {
+                    context.push_str(&format!("Agent: {}\n", msg.text));
+                }
+                AgentRole::ToolCall => {
+                    context.push_str(&format!("[Tool: {}]\n", msg.text));
+                }
+                AgentRole::Error => {
+                    context.push_str(&format!("[Error: {}]\n", msg.text));
+                }
+            }
+        }
+        context
+    }
+
     fn send_agent_prompt(&mut self, cx: &mut Context<Self>) {
         let text = self.agent_chat.input_text.trim().to_string();
         if text.is_empty() {
@@ -1240,13 +1262,14 @@ impl HerdrGui {
                 return;
             }
             if key.key == "tab" {
-                // Cycle agent — keep message history
+                // Cycle agent — keep message history, switch mode
                 let all = agent_panel::AgentKind::all();
                 let idx = all
                     .iter()
                     .position(|k| *k == self.agent_chat.selected_agent)
                     .unwrap_or(0);
-                self.agent_chat.selected_agent = all[(idx + 1) % all.len()];
+                let new_kind = all[(idx + 1) % all.len()];
+                self.agent_chat.selected_agent = new_kind;
                 // Drop old session but keep messages
                 self.agent_chat.session = None;
                 self.agent_chat.connected_pane_id = None;
@@ -1255,8 +1278,20 @@ impl HerdrGui {
                     .messages
                     .push(agent_panel::AgentChatMessage {
                         role: AgentRole::Agent,
-                        text: format!("Switched to {}", self.agent_chat.selected_agent.label()),
+                        text: format!("Switched to {}", new_kind.label()),
                     });
+                // Start ACP session and replay conversation context
+                if self.agent_chat.installed_agents.contains(&new_kind) {
+                    self.start_agent_session(cx);
+                    // Send conversation history as context
+                    let context = self.build_conversation_context();
+                    if !context.is_empty() {
+                        if let Some(session) = self.agent_chat.session.as_ref() {
+                            let _ = session.send_prompt(&context);
+                            self.agent_chat.is_working = true;
+                        }
+                    }
+                }
                 cx.notify();
                 return;
             }
