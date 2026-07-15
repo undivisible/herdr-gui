@@ -12,7 +12,7 @@ use crepuscularity_gpui::{
     actions, bounce, bounds, div, gpui_window_options, linear, point, px, rgb, size, AnyElement,
     AnyView, AnyWindowHandle, App, Application, Context, Entity, FocusHandle, Icon, IntoElement,
     KeyBinding, Keystroke, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Render, ScrollWheelEvent, SystemMenuType, TitlebarOptions, Window,
+    MouseUpEvent, Render, ScrollWheelEvent, SystemMenuType, TitlebarOptions, TouchPhase, Window,
     WindowAppearance, WindowBounds,
 };
 use ghostty::{TerminalFrame, TerminalLine, TerminalRun, TerminalSession};
@@ -124,6 +124,10 @@ struct HerdrGui {
     theme_mode: ThemeMode,
     swipe_progress: f64,
     scroll_x: f64,
+    /// Trackpad sends many tiny wheel events; accumulate before ghostty scroll.
+    terminal_scroll_y: f64,
+    scroll_active: bool,
+    pending_scroll_rows: isize,
     focus_handle: FocusHandle,
     settings: settings::Settings,
     render_seq: u64,
@@ -190,6 +194,11 @@ const TERMINAL_MAX_COLS: f64 = 500.0;
 const TERMINAL_MIN_ROWS: f64 = 12.0;
 const TERMINAL_MAX_ROWS: f64 = 180.0;
 const RESIZE_HANDLE_WIDTH: f64 = 4.0;
+/// Unified titlebar above GPUI content (macOS).
+#[cfg(target_os = "macos")]
+const MACOS_TITLEBAR_HEIGHT: f64 = 28.0;
+#[cfg(not(target_os = "macos"))]
+const MACOS_TITLEBAR_HEIGHT: f64 = 0.0;
 const TOP_TAB_BAR_HEIGHT: f64 = 34.0;
 /// macOS traffic-light cluster width + inset; keeps Arc top tabs aligned with sidebar.
 const TRAFFIC_LIGHT_INSET_X: f64 = 78.0;
@@ -254,6 +263,9 @@ impl HerdrGui {
             theme_mode,
             swipe_progress: 0.0,
             scroll_x: 0.0,
+            terminal_scroll_y: 0.0,
+            scroll_active: false,
+            pending_scroll_rows: 0,
             focus_handle: cx.focus_handle(),
             settings,
             render_seq: 0,
@@ -591,9 +603,13 @@ impl HerdrGui {
     }
 
     fn focus_pane_id(&mut self, pane_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.terminal_scroll_y = 0.0;
+        self.scroll_active = false;
+        self.pending_scroll_rows = 0;
         self.with_client(|client| client.focus_pane(&pane_id));
         self.refresh_state();
         self.attach_focused_terminal(window, cx);
+        self.maybe_refresh_terminal_frame(cx, true);
         cx.notify();
     }
 
@@ -676,11 +692,24 @@ impl HerdrGui {
             || self
                 .last_terminal_frame_at
                 .is_none_or(|at| at.elapsed() >= FRAME_MIN_INTERVAL);
-        if !due || self.terminal_frame_in_flight {
+        let scroll_rows = self.pending_scroll_rows;
+        self.pending_scroll_rows = 0;
+        let vt_drain = std::mem::take(&mut self.pending_vt);
+        let want_frame = force || scroll_rows != 0 || due;
+        if self.scroll_active && scroll_rows == 0 && !force {
+            if !vt_drain.is_empty() {
+                self.pending_vt.extend_from_slice(&vt_drain);
+            }
+            return;
+        }
+        if !want_frame || self.terminal_frame_in_flight {
+            self.pending_scroll_rows = self.pending_scroll_rows.saturating_add(scroll_rows);
+            if !vt_drain.is_empty() {
+                self.pending_vt.extend_from_slice(&vt_drain);
+            }
             self.terminal_pending_frame = true;
             return;
         }
-        // Extract off the UI thread — ghostty frame() walks every cell via FFI.
         self.terminal_frame_in_flight = true;
         self.terminal_pending_frame = false;
         self.last_terminal_frame_at = Some(Instant::now());
@@ -693,7 +722,15 @@ impl HerdrGui {
                     terminal
                         .lock()
                         .map_err(|err| err.to_string())
-                        .and_then(|mut terminal| terminal.frame())
+                        .and_then(|mut session| {
+                            if !vt_drain.is_empty() {
+                                session.write_bytes(&vt_drain);
+                            }
+                            if scroll_rows != 0 {
+                                session.scroll(-scroll_rows)?;
+                            }
+                            session.frame()
+                        })
                 })
                 .await;
             let ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -705,22 +742,52 @@ impl HerdrGui {
                 if view.terminal_token != token {
                     return;
                 }
-                // Drain VT buffered while frame() held the lock.
-                if !view.pending_vt.is_empty() {
-                    if let Some(terminal) = view.terminal.clone() {
-                        if let Ok(mut terminal) = terminal.try_lock() {
-                            terminal.write_bytes(&view.pending_vt);
-                            view.pending_vt.clear();
-                            view.terminal_pending_frame = true;
-                        }
-                    }
+                if let Ok(frame) = frame {
+                    view.set_terminal_frame(Arc::new(frame), cx);
+                }
+                if view.terminal_pending_frame || view.pending_scroll_rows != 0 {
+                    view.maybe_refresh_terminal_frame(cx, false);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn sync_terminal_geometry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(terminal) = self.terminal.clone() else {
+            return;
+        };
+        let size = self.terminal_size(window);
+        if self.terminal_size == Some(size) {
+            return;
+        }
+        let token = self.terminal_token;
+        if let Ok(mut session) = terminal.try_lock() {
+            if let Ok(frame) = session.resize(size.0, size.1, size.2, size.3) {
+                self.set_terminal_frame(Arc::new(frame), cx);
+            }
+            self.terminal_size = Some(size);
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let frame = cx
+                .background_executor()
+                .spawn(async move {
+                    terminal
+                        .lock()
+                        .map_err(|err| err.to_string())
+                        .and_then(|mut session| session.resize(size.0, size.1, size.2, size.3))
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.terminal_token != token {
+                    return;
                 }
                 if let Ok(frame) = frame {
                     view.set_terminal_frame(Arc::new(frame), cx);
                 }
-                if view.terminal_pending_frame {
-                    view.maybe_refresh_terminal_frame(cx, false);
-                }
+                view.terminal_size = Some(size);
+                cx.notify();
             });
         })
         .detach();
@@ -741,17 +808,7 @@ impl HerdrGui {
             None => return,
         };
         if self.terminal_target.as_deref() == Some(target.as_str()) {
-            if self.terminal_size != Some(size) {
-                if let Some(terminal) = self.terminal.clone() {
-                    let frame = terminal.try_lock().ok().and_then(|mut terminal| {
-                        terminal.resize(size.0, size.1, size.2, size.3).ok()
-                    });
-                    if let Some(frame) = frame {
-                        self.set_terminal_frame(Arc::new(frame), cx);
-                    }
-                }
-                self.terminal_size = Some(size);
-            }
+            self.sync_terminal_geometry(window, cx);
             return;
         }
         match TerminalSession::attach(&target, size.0, size.1) {
@@ -927,6 +984,17 @@ impl HerdrGui {
         }
     }
 
+    fn queue_terminal_scroll_rows(&mut self, rows: isize, cx: &mut Context<Self>) {
+        if rows == 0 || self.terminal.is_none() {
+            return;
+        }
+        if rows > 0 {
+            self.scroll_active = true;
+        }
+        self.pending_scroll_rows += rows;
+        self.maybe_refresh_terminal_frame(cx, true);
+    }
+
     #[allow(dead_code)]
     fn handle_terminal_scroll(
         &mut self,
@@ -934,14 +1002,16 @@ impl HerdrGui {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let delta = event.delta.pixel_delta(px(18.0));
+        let line_height = px(TERMINAL_CELL_HEIGHT as f32);
+        let delta = event.delta.pixel_delta(line_height);
         let dx = delta.x.to_f64().abs();
         let dy = delta.y.to_f64().abs();
         if dx > dy && dx > 2.0 {
+            self.terminal_scroll_y = 0.0;
             self.scroll_x += delta.x.to_f64();
             self.swipe_progress = (self.scroll_x / 80.0).clamp(-1.0, 1.0);
-            cx.notify();
             if self.scroll_x.abs() < 80.0 {
+                cx.notify();
                 return;
             }
             let offset = if self.scroll_x < 0.0 { 1 } else { -1 };
@@ -950,46 +1020,32 @@ impl HerdrGui {
             self.focus_workspace_offset(offset, window, cx);
             return;
         }
-        if dy < 0.5 {
+        if dy < f64::EPSILON && dx < f64::EPSILON {
             return;
         }
-        let rows = if delta.y.to_f64() > 0.0 {
-            (delta.y.to_f64() / 18.0).round().max(1.0) as isize
-        } else {
-            -(delta.y.to_f64().abs() / 18.0).round().max(1.0) as isize
-        };
-        let Some(terminal) = self.terminal.clone() else {
-            return;
-        };
-        let token = self.terminal_token;
-        if let Ok(mut session) = terminal.try_lock() {
-            if let Ok(frame) = session.scroll(rows) {
-                self.set_terminal_frame(Arc::new(frame), cx);
+        self.terminal_scroll_y += delta.y.to_f64();
+        let gesture_done = matches!(event.touch_phase, TouchPhase::Ended);
+        let threshold = TERMINAL_CELL_HEIGHT * 0.2;
+        let mut rows = 0_isize;
+        while self.terminal_scroll_y.abs() >= threshold && rows.abs() < 4 {
+            if self.terminal_scroll_y > 0.0 {
+                rows += 1;
+                self.terminal_scroll_y -= TERMINAL_CELL_HEIGHT;
+            } else {
+                rows -= 1;
+                self.terminal_scroll_y += TERMINAL_CELL_HEIGHT;
             }
-            cx.notify();
-            return;
         }
-        cx.spawn(async move |this, cx| {
-            let frame = cx
-                .background_executor()
-                .spawn(async move {
-                    terminal
-                        .lock()
-                        .map_err(|err| err.to_string())
-                        .and_then(|mut session| session.scroll(rows))
-                })
-                .await;
-            let _ = this.update(cx, |view, cx| {
-                if view.terminal_token != token {
-                    return;
-                }
-                if let Ok(frame) = frame {
-                    view.set_terminal_frame(Arc::new(frame), cx);
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        if rows == 0 && gesture_done && self.terminal_scroll_y.abs() > 0.5 {
+            rows = if self.terminal_scroll_y > 0.0 { 1 } else { -1 };
+        }
+        if gesture_done {
+            self.terminal_scroll_y = 0.0;
+        }
+        if rows < 0 {
+            self.scroll_active = false;
+        }
+        self.queue_terminal_scroll_rows(rows, cx);
     }
 
     fn set_theme(&mut self, name: String, cx: &mut Context<Self>) {
@@ -1181,6 +1237,7 @@ impl Render for HerdrGui {
         self.render_seq = self.render_seq.wrapping_add(1);
         let seq = self.render_seq;
         let theme = self.theme(window);
+        self.sync_terminal_geometry(window, cx);
         if self.terminal_bg != theme.terminal {
             self.terminal_bg = theme.terminal;
             self.sync_terminal_theme(theme, cx);
@@ -1403,20 +1460,24 @@ impl HerdrGui {
         }
     }
 
+    fn chrome_height(&self) -> f64 {
+        let mut chrome = MACOS_TITLEBAR_HEIGHT;
+        if self.sidebar_layout == SidebarLayout::Arc {
+            chrome += TOP_TAB_BAR_HEIGHT;
+        }
+        chrome
+    }
+
     fn terminal_size(&self, window: &Window) -> TerminalSize {
         let size = window.bounds().size;
         let width = (size.width.to_f64() - self.sidebar_width() - RESIZE_HANDLE_WIDTH)
             .max(TERMINAL_MIN_WIDTH);
-        let top_tabs_height = if self.sidebar_layout == SidebarLayout::Arc {
-            TOP_TAB_BAR_HEIGHT
-        } else {
-            0.0
-        };
-        let height = (size.height.to_f64() - top_tabs_height).max(TERMINAL_MIN_HEIGHT);
+        let height = (size.height.to_f64() - self.chrome_height()).max(TERMINAL_MIN_HEIGHT);
         let cols = (width / TERMINAL_CELL_WIDTH)
             .floor()
             .clamp(TERMINAL_MIN_COLS, TERMINAL_MAX_COLS) as u16;
-        let rows = (height / TERMINAL_CELL_HEIGHT)
+        let paint_fudge = 2.0;
+        let rows = ((height - paint_fudge) / TERMINAL_CELL_HEIGHT)
             .floor()
             .clamp(TERMINAL_MIN_ROWS, TERMINAL_MAX_ROWS) as u16;
         (cols, rows, width.round() as u16, height.round() as u16)
@@ -1744,7 +1805,11 @@ impl HerdrGui {
         }
 
         if panes.is_empty() {
-            return self.terminal_only_view(theme).into_any_element();
+            return div()
+                .flex_1()
+                .h_full()
+                .child(self.terminal_only_view(theme))
+                .into_any_element();
         }
 
         let pane = panes
