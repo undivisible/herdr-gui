@@ -1,5 +1,4 @@
 div #herdr-root w-full h-full flex overflow-hidden text-[14px] text-{theme.text} bg-{theme.bg}
-    @scroll=handle_workspace_scroll
     @mousemove=handle_mouse_move
     @mouseup=handle_mouse_up
     {self.cached_sidebar()}

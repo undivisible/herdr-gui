@@ -1,4 +1,5 @@
 div #terminal-area flex-1 h-full overflow-hidden flex flex-col bg-{theme.terminal}
+    @scroll=handle_terminal_scroll
     if {show_top_tabs}
         {self.top_tabs(tabs, theme, cx)}
     {pane_container}

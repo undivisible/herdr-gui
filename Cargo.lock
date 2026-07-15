@@ -472,12 +472,6 @@ dependencies = [
 
 [[package]]
 name = "base64"
-version = "0.21.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
-
-[[package]]
-name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
@@ -1173,7 +1167,7 @@ dependencies = [
 
 [[package]]
 name = "crepuscularity-core"
-version = "0.4.20"
+version = "0.4.22"
 dependencies = [
  "notify",
  "serde_json",
@@ -1185,23 +1179,19 @@ dependencies = [
 
 [[package]]
 name = "crepuscularity-gpui"
-version = "0.5.2"
+version = "0.5.5"
 dependencies = [
  "crepuscularity-core",
  "crepuscularity-runtime",
  "crepuscularity_macros",
  "gpui",
  "gpui-symbols",
- "hdrhistogram",
- "log",
  "pollster 0.4.0",
- "schemars",
- "serde",
 ]
 
 [[package]]
 name = "crepuscularity-runtime"
-version = "0.4.12"
+version = "0.4.15"
 dependencies = [
  "crepuscularity-core",
  "gpui",
@@ -1213,21 +1203,12 @@ dependencies = [
 
 [[package]]
 name = "crepuscularity_macros"
-version = "0.5.6"
+version = "0.5.8"
 dependencies = [
  "crepuscularity-core",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
-]
-
-[[package]]
-name = "crossbeam-channel"
-version = "0.5.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
-dependencies = [
- "crossbeam-utils",
 ]
 
 [[package]]
@@ -2448,20 +2429,6 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
-
-[[package]]
-name = "hdrhistogram"
-version = "7.5.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "765c9198f173dd59ce26ff9f95ef0aafd0a0fe01fb9d72841bc5066a4c06511d"
-dependencies = [
- "base64 0.21.7",
- "byteorder",
- "crossbeam-channel",
- "flate2",
- "nom 7.1.3",
- "num-traits",
-]
 
 [[package]]
 name = "heck"
@@ -5938,7 +5905,7 @@ version = "0.45.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "80be9b06fbae3b8b303400ab20778c80bbaf338f563afe567cf3c9eea17b47ef"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "data-url",
  "flate2",
  "fontdb 0.23.0",
@@ -7101,7 +7068,7 @@ version = "0.12.15-zed"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac2d05756ff48539950c3282ad7acf3817ad3f08797c205ad1c34a2ce03b9970"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "bytes",
  "encoding_rs",
  "futures-core",

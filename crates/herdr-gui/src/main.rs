@@ -191,7 +191,12 @@ const TERMINAL_MIN_ROWS: f64 = 12.0;
 const TERMINAL_MAX_ROWS: f64 = 180.0;
 const RESIZE_HANDLE_WIDTH: f64 = 4.0;
 const TOP_TAB_BAR_HEIGHT: f64 = 34.0;
+/// macOS traffic-light cluster width + inset; keeps Arc top tabs aligned with sidebar.
+const TRAFFIC_LIGHT_INSET_X: f64 = 78.0;
+/// Vertical inset under unified titlebar (sidebar + tab row).
 const TRAFFIC_LIGHT_PADDING: f64 = 40.0;
+/// ~12px button in ~28px titlebar: (28 - 12) / 2
+const TRAFFIC_LIGHT_Y: f64 = 8.0;
 
 type TerminalSize = (u16, u16, u16, u16);
 
@@ -923,15 +928,16 @@ impl HerdrGui {
     }
 
     #[allow(dead_code)]
-    fn handle_workspace_scroll(
+    fn handle_terminal_scroll(
         &mut self,
         event: &ScrollWheelEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let delta = event.delta.pixel_delta(px(18.0));
-        let horizontal = delta.x.abs() > delta.y.abs() + px(20.0);
-        if horizontal {
+        let dx = delta.x.to_f64().abs();
+        let dy = delta.y.to_f64().abs();
+        if dx > dy && dx > 2.0 {
             self.scroll_x += delta.x.to_f64();
             self.swipe_progress = (self.scroll_x / 80.0).clamp(-1.0, 1.0);
             cx.notify();
@@ -944,21 +950,46 @@ impl HerdrGui {
             self.focus_workspace_offset(offset, window, cx);
             return;
         }
+        if dy < 0.5 {
+            return;
+        }
         let rows = if delta.y.to_f64() > 0.0 {
             (delta.y.to_f64() / 18.0).round().max(1.0) as isize
         } else {
             -(delta.y.to_f64().abs() / 18.0).round().max(1.0) as isize
         };
-        if let Some(terminal) = self.terminal.clone() {
-            let frame = terminal
-                .try_lock()
-                .ok()
-                .and_then(|mut terminal| terminal.scroll(-rows).ok());
-            if let Some(frame) = frame {
+        let Some(terminal) = self.terminal.clone() else {
+            return;
+        };
+        let token = self.terminal_token;
+        if let Ok(mut session) = terminal.try_lock() {
+            if let Ok(frame) = session.scroll(rows) {
                 self.set_terminal_frame(Arc::new(frame), cx);
             }
             cx.notify();
+            return;
         }
+        cx.spawn(async move |this, cx| {
+            let frame = cx
+                .background_executor()
+                .spawn(async move {
+                    terminal
+                        .lock()
+                        .map_err(|err| err.to_string())
+                        .and_then(|mut session| session.scroll(rows))
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.terminal_token != token {
+                    return;
+                }
+                if let Ok(frame) = frame {
+                    view.set_terminal_frame(Arc::new(frame), cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn set_theme(&mut self, name: String, cx: &mut Context<Self>) {
@@ -1567,6 +1598,7 @@ impl HerdrGui {
             .h(px(TOP_TAB_BAR_HEIGHT as f32))
             .flex()
             .items_center()
+            .pl(px(TRAFFIC_LIGHT_INSET_X as f32))
             .gap_1()
             .bg(rgb(theme.panel))
             .overflow_hidden()
@@ -2300,7 +2332,7 @@ fn main() {
         options.titlebar = Some(TitlebarOptions {
             title: None,
             appears_transparent: false,
-            traffic_light_position: Some(point(px(12.0), px(12.0))),
+            traffic_light_position: Some(point(px(12.0), px(TRAFFIC_LIGHT_Y as f32))),
         });
         let window = cx.open_window(options, |_window, cx| cx.new(HerdrGui::new));
         if let Ok(window) = window {
