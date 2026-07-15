@@ -400,13 +400,13 @@ impl HerdrGui {
 
     fn start_agent_session(&mut self, _cx: &mut Context<Self>) {
         let kind = self.agent_chat.selected_agent;
-        // Guard: only spawn if the command actually exists
-        if self.agent_chat.installed_agents.is_empty() {
+        // Guard: only spawn if this specific agent is installed
+        if !self.agent_chat.installed_agents.contains(&kind) {
             self.agent_chat
                 .messages
                 .push(agent_panel::AgentChatMessage {
                     role: AgentRole::Error,
-                    text: "No ACP agents found on PATH. Install one to chat.".to_string(),
+                    text: format!("{} is not installed. Install it first.", kind.label()),
                 });
             return;
         }
@@ -517,6 +517,41 @@ impl HerdrGui {
                 }
             }
         }
+    }
+
+    fn send_agent_prompt(&mut self, cx: &mut Context<Self>) {
+        let text = self.agent_chat.input_text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        self.agent_chat
+            .messages
+            .push(agent_panel::AgentChatMessage {
+                role: agent_panel::AgentRole::User,
+                text: text.clone(),
+            });
+        self.agent_chat.input_text.clear();
+        if let Some(session) = self.agent_chat.session.as_ref() {
+            if let Err(err) = session.send_prompt(&text) {
+                self.agent_chat
+                    .messages
+                    .push(agent_panel::AgentChatMessage {
+                        role: agent_panel::AgentRole::Error,
+                        text: err,
+                    });
+            } else {
+                self.agent_chat.is_working = true;
+            }
+        } else {
+            // No session — try to start one
+            self.start_agent_session(cx);
+            // Queue the prompt to send after session starts
+            if let Some(session) = self.agent_chat.session.as_ref() {
+                let _ = session.send_prompt(&text);
+                self.agent_chat.is_working = true;
+            }
+        }
+        cx.notify();
     }
 
     fn theme_system(&mut self, _: &ThemeSystem, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1076,6 +1111,46 @@ impl HerdrGui {
     }
 
     fn handle_keystroke(&mut self, key: &Keystroke, cx: &mut Context<Self>) {
+        // Route keystrokes to agent input when agent chat is visible
+        if self.agent_chat.view == agent_panel::PaneView::AgentChat {
+            if key.key == "escape" {
+                self.agent_chat.view = agent_panel::PaneView::Terminal;
+                self.agent_chat.visible = false;
+                cx.notify();
+                return;
+            }
+            if key.key == "enter" && !key.modifiers.platform {
+                self.send_agent_prompt(cx);
+                return;
+            }
+            if key.key == "backspace" {
+                self.agent_chat.input_text.pop();
+                cx.notify();
+                return;
+            }
+            if key.key == "tab" {
+                // Cycle agent
+                let all = agent_panel::AgentKind::all();
+                let idx = all
+                    .iter()
+                    .position(|k| *k == self.agent_chat.selected_agent)
+                    .unwrap_or(0);
+                self.agent_chat.selected_agent = all[(idx + 1) % all.len()];
+                self.agent_chat.session = None;
+                self.agent_chat.messages.clear();
+                self.agent_chat.is_working = false;
+                self.start_agent_session(cx);
+                cx.notify();
+                return;
+            }
+            if let Some(text) = key.key_char.as_deref() {
+                self.agent_chat.input_text.push_str(text);
+                cx.notify();
+                return;
+            }
+            return;
+        }
+
         let Some(client) = self.client.clone() else {
             return;
         };

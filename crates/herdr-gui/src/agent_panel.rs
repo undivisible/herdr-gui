@@ -439,6 +439,7 @@ fn render_empty(agent: AgentKind, state: &AgentChatState, theme: UiTheme) -> Any
 
 fn render_composer(state: &AgentChatState, theme: UiTheme) -> AnyElement {
     let has_agent = !state.installed_agents.is_empty() || state.herdr_agent.is_some();
+    let is_agent_view = state.view == PaneView::AgentChat;
 
     div()
         .w_full()
@@ -473,7 +474,11 @@ fn render_composer(state: &AgentChatState, theme: UiTheme) -> AnyElement {
                         .child(if !has_agent {
                             "No agent available — install one to chat".to_string()
                         } else if state.input_text.is_empty() {
-                            format!("Ask {}…", state.selected_agent.label())
+                            if is_agent_view {
+                                format!("Type a message to {}…", state.selected_agent.label())
+                            } else {
+                                format!("Ask {}…", state.selected_agent.label())
+                            }
                         } else {
                             state.input_text.clone()
                         }),
@@ -488,7 +493,11 @@ fn render_composer(state: &AgentChatState, theme: UiTheme) -> AnyElement {
                     div()
                         .text_size(px(10.0))
                         .text_color(rgb(theme.label))
-                        .child("Enter to send · Tab to switch agent · Esc to close"),
+                        .child(if is_agent_view {
+                            "Enter to send · Tab to switch agent · Esc to close"
+                        } else {
+                            "Click agent icon to start chatting"
+                        }),
                 )
                 .child(
                     div()
