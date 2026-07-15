@@ -1422,6 +1422,10 @@ impl Render for HerdrGui {
         self.sync_terminal_geometry(window, cx);
         // Poll ACP agent events
         self.poll_agent_events();
+        // Auto-select agent from herdr's running agents (once)
+        if self.agent_chat.herdr_agent.is_none() && !self.state.agents.is_empty() {
+            self.agent_chat.auto_select(&self.state.agents);
+        }
         if self.terminal_bg != theme.terminal {
             self.terminal_bg = theme.terminal;
             self.sync_terminal_theme(theme, cx);
