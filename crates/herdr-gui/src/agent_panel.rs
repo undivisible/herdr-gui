@@ -165,13 +165,15 @@ impl AgentChatState {
 
     /// Pick the best agent: herdr running agent > first installed > default.
     pub fn auto_select(&mut self, herdr_agents: &[crate::herdr::Agent]) {
-        // Try to match a running herdr agent
+        // Try to match a running herdr agent that is also installed on PATH
         for ha in herdr_agents {
             if let Some(name) = ha.agent.as_deref() {
                 if let Some(kind) = AgentKind::from_herdr_agent(name) {
-                    self.selected_agent = kind;
-                    self.herdr_agent = Some(kind);
-                    return;
+                    if self.installed_agents.contains(&kind) {
+                        self.selected_agent = kind;
+                        self.herdr_agent = Some(kind);
+                        return;
+                    }
                 }
             }
         }

@@ -36,6 +36,7 @@ actions!(
     [
         ToggleHelp,
         Refresh,
+        Paste,
         SplitRight,
         SplitDown,
         FocusRight,
@@ -428,6 +429,45 @@ impl HerdrGui {
                         role: AgentRole::Error,
                         text: format!("Failed to start {}: {err}", kind.label()),
                     });
+            }
+        }
+    }
+
+    fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let Some(pane) = self.focused_pane().cloned() else {
+            return;
+        };
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        let Some(text) = item.text() else {
+            return;
+        };
+        let text = text.to_string();
+        let pane_id = pane.pane_id;
+        let lines: Vec<String> = text.lines().map(String::from).collect();
+        for (i, line) in lines.iter().enumerate() {
+            let line = line.clone();
+            let c = client.clone();
+            let pid = pane_id.clone();
+            cx.spawn(async move |this, cx| {
+                if let Err(err) = c.send_text(&pid, &line) {
+                    let _ = this.update(cx, |view, _| view.status = err.to_string());
+                }
+            })
+            .detach();
+            if i < lines.len() - 1 {
+                let c = client.clone();
+                let pid = pane_id.clone();
+                cx.spawn(async move |this, cx| {
+                    if let Err(err) = c.send_key(&pid, "enter") {
+                        let _ = this.update(cx, |view, _| view.status = err.to_string());
+                    }
+                })
+                .detach();
             }
         }
     }
@@ -1393,6 +1433,7 @@ impl Render for HerdrGui {
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_agents))
             .on_action(cx.listener(Self::toggle_agent_chat))
+            .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::toggle_sidebar_layout))
             .on_action(cx.listener(Self::theme_catppuccin))
             .on_action(cx.listener(Self::theme_catppuccin_latte))
@@ -2532,6 +2573,7 @@ fn main() {
             KeyBinding::new("cmd-b", ToggleSidebar, None),
             KeyBinding::new("cmd-shift-a", ToggleAgents, None),
             KeyBinding::new("cmd-shift-c", ToggleAgentChat, None),
+            KeyBinding::new("cmd-v", Paste, None),
             KeyBinding::new("cmd-shift-l", ToggleSidebarLayout, None),
             KeyBinding::new("cmd-shift-r", ReloadHerdrConfig, None),
             KeyBinding::new("cmd-t", NewTab, None),
