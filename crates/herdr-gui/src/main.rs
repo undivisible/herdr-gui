@@ -8,7 +8,7 @@ mod settings;
 mod terminal_view;
 mod theme;
 
-use agent_panel::{AgentKind, AgentRole, PaneView};
+use agent_panel::{AgentRole, PaneView};
 use crepuscularity_gpui as gpui;
 use crepuscularity_gpui::prelude::*;
 use crepuscularity_gpui::{
@@ -399,6 +399,16 @@ impl HerdrGui {
 
     fn start_agent_session(&mut self, _cx: &mut Context<Self>) {
         let kind = self.agent_chat.selected_agent;
+        // Guard: only spawn if the command actually exists
+        if self.agent_chat.installed_agents.is_empty() {
+            self.agent_chat
+                .messages
+                .push(agent_panel::AgentChatMessage {
+                    role: AgentRole::Error,
+                    text: "No ACP agents found on PATH. Install one to chat.".to_string(),
+                });
+            return;
+        }
         let cwd = std::env::current_dir().unwrap_or_default();
         match acp::AcpSession::spawn(kind.command(), cwd) {
             Ok(session) => {
@@ -420,23 +430,6 @@ impl HerdrGui {
                     });
             }
         }
-    }
-
-    fn next_agent(&mut self, cx: &mut Context<Self>) {
-        let all = AgentKind::all();
-        let idx = all
-            .iter()
-            .position(|k| *k == self.agent_chat.selected_agent)
-            .unwrap_or(0);
-        self.agent_chat.selected_agent = all[(idx + 1) % all.len()];
-        // Drop existing session
-        self.agent_chat.session = None;
-        self.agent_chat.messages.clear();
-        self.agent_chat.is_working = false;
-        if self.agent_chat.visible {
-            self.start_agent_session(cx);
-        }
-        self.notify_sidebar(cx);
     }
 
     fn poll_agent_events(&mut self) {
@@ -1301,88 +1294,18 @@ impl HerdrGui {
         } else {
             "chevron.up"
         };
-        let is_agent_view = self.agent_chat.view == PaneView::AgentChat;
         div()
             .h(px(22.0))
             .flex()
             .items_center()
             .justify_between()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(ui_text(
-                        "agents",
-                        10,
-                        theme.muted,
-                        false,
-                        "px-2 h-[18px] flex items-center",
-                    ))
-                    // Agent view toggle button (terminal ↔ agent chat)
-                    .child(
-                        div()
-                            .w(px(18.0))
-                            .h(px(18.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .when(is_agent_view, |el| el.bg(rgb(theme.active)))
-                            .hover(move |style| style.bg(rgb(theme.hover)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, window, cx| {
-                                    this.toggle_agent_chat(&ToggleAgentChat, window, cx);
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.0))
-                                    .text_color(rgb(if is_agent_view {
-                                        theme.bg
-                                    } else {
-                                        theme.muted
-                                    }))
-                                    .child(
-                                        agent_panel::AgentKind::all()
-                                            .iter()
-                                            .position(|k| *k == self.agent_chat.selected_agent)
-                                            .map(|i| (i + 1).to_string())
-                                            .unwrap_or_else(|| "*".to_string()),
-                                    ),
-                            ),
-                    )
-                    // Agent cycle button (next agent)
-                    .when(is_agent_view, |el| {
-                        el.child(
-                            div()
-                                .w(px(18.0))
-                                .h(px(18.0))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .hover(move |style| style.bg(rgb(theme.hover)))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _window, cx| {
-                                        this.next_agent(cx);
-                                    }),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(10.0))
-                                        .text_color(rgb(theme.muted))
-                                        .child(self.agent_chat.selected_agent.icon().to_string()),
-                                ),
-                        )
-                    }),
-            )
+            .child(ui_text(
+                "agents",
+                10,
+                theme.muted,
+                false,
+                "px-2 h-[18px] flex items-center",
+            ))
             .child(
                 div()
                     .w(px(22.0))
@@ -2444,8 +2367,44 @@ fn agent_row(
             cx,
         );
     });
+    // ACP button: opens agent chat for this agent type
+    let agent_name = agent
+        .agent
+        .as_deref()
+        .or(agent.name.as_deref())
+        .unwrap_or("");
+    let acp_kind = agent_panel::AgentKind::from_herdr_agent(agent_name);
+    let acp_button = acp_kind.map(|kind| {
+        div()
+            .w(px(20.0))
+            .h(px(20.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(move |style| style.bg(rgb(theme.hover)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    this.agent_chat.selected_agent = kind;
+                    this.toggle_agent_chat(&ToggleAgentChat, window, cx);
+                }),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(theme.muted))
+                    .child(kind.icon().to_string()),
+            )
+            .into_any_element()
+    });
 
-    agent_row_element(title, subtitle, status_key, focused, theme, on_click).into_any_element()
+    agent_row_element(
+        title, subtitle, status_key, focused, theme, on_click, acp_button,
+    )
+    .into_any_element()
 }
 
 #[allow(dead_code)]
@@ -2456,6 +2415,7 @@ fn agent_row_element(
     focused: bool,
     theme: UiTheme,
     on_click: impl Fn(&crepuscularity_gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
+    acp_button: Option<AnyElement>,
 ) -> impl IntoElement {
     div()
         .px_3()
@@ -2481,9 +2441,16 @@ fn agent_row_element(
         )
         .child(
             div()
-                .w(px(8.0))
-                .h(px(8.0))
-                .bg(rgb(status_color(&status_key))),
+                .flex()
+                .items_center()
+                .gap_1()
+                .when_some(acp_button, |el, btn| el.child(btn))
+                .child(
+                    div()
+                        .w(px(8.0))
+                        .h(px(8.0))
+                        .bg(rgb(status_color(&status_key))),
+                ),
         )
         .into_any_element()
 }
