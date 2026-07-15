@@ -8,6 +8,7 @@ mod settings;
 mod terminal_view;
 mod theme;
 
+use agent_panel::{AgentKind, AgentRole, PaneView};
 use crepuscularity_gpui as gpui;
 use crepuscularity_gpui::prelude::*;
 use crepuscularity_gpui::{
@@ -385,26 +386,55 @@ impl HerdrGui {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.agent_chat.visible = !self.agent_chat.visible;
+        self.agent_chat.view = match self.agent_chat.view {
+            PaneView::Terminal => PaneView::AgentChat,
+            PaneView::AgentChat => PaneView::Terminal,
+        };
+        self.agent_chat.visible = self.agent_chat.view == PaneView::AgentChat;
         if self.agent_chat.visible && self.agent_chat.session.is_none() {
-            // Try to spawn a default agent (claude-code)
-            match acp::AcpSession::spawn("claude-code", std::env::current_dir().unwrap_or_default())
-            {
-                Ok(session) => {
-                    self.agent_chat.session = Some(session);
-                    self.agent_chat.is_working = true;
-                    self.agent_chat.messages.push(agent_panel::AgentChatMessage {
-                        role: agent_panel::AgentRole::Agent,
-                        text: "Connecting to agent…".to_string(),
+            self.start_agent_session(cx);
+        }
+        self.notify_sidebar(cx);
+    }
+
+    fn start_agent_session(&mut self, _cx: &mut Context<Self>) {
+        let kind = self.agent_chat.selected_agent;
+        let cwd = std::env::current_dir().unwrap_or_default();
+        match acp::AcpSession::spawn(kind.command(), cwd) {
+            Ok(session) => {
+                self.agent_chat.session = Some(session);
+                self.agent_chat.is_working = true;
+                self.agent_chat
+                    .messages
+                    .push(agent_panel::AgentChatMessage {
+                        role: AgentRole::Agent,
+                        text: format!("Connecting to {}…", kind.label()),
                     });
-                }
-                Err(err) => {
-                    self.agent_chat.messages.push(agent_panel::AgentChatMessage {
-                        role: agent_panel::AgentRole::Error,
-                        text: format!("Failed to start agent: {err}"),
-                    });
-                }
             }
+            Err(err) => {
+                self.agent_chat
+                    .messages
+                    .push(agent_panel::AgentChatMessage {
+                        role: AgentRole::Error,
+                        text: format!("Failed to start {}: {err}", kind.label()),
+                    });
+            }
+        }
+    }
+
+    fn next_agent(&mut self, cx: &mut Context<Self>) {
+        let all = AgentKind::all();
+        let idx = all
+            .iter()
+            .position(|k| *k == self.agent_chat.selected_agent)
+            .unwrap_or(0);
+        self.agent_chat.selected_agent = all[(idx + 1) % all.len()];
+        // Drop existing session
+        self.agent_chat.session = None;
+        self.agent_chat.messages.clear();
+        self.agent_chat.is_working = false;
+        if self.agent_chat.visible {
+            self.start_agent_session(cx);
         }
         self.notify_sidebar(cx);
     }
@@ -424,26 +454,32 @@ impl HerdrGui {
                     if let Some(last) = merged {
                         last.text.push_str(&text);
                     } else {
-                        self.agent_chat.messages.push(agent_panel::AgentChatMessage {
-                            role: agent_panel::AgentRole::Agent,
-                            text,
-                        });
+                        self.agent_chat
+                            .messages
+                            .push(agent_panel::AgentChatMessage {
+                                role: agent_panel::AgentRole::Agent,
+                                text,
+                            });
                     }
                 }
                 acp::AgentEvent::ToolCall { title } => {
-                    self.agent_chat.messages.push(agent_panel::AgentChatMessage {
-                        role: agent_panel::AgentRole::ToolCall,
-                        text: title,
-                    });
+                    self.agent_chat
+                        .messages
+                        .push(agent_panel::AgentChatMessage {
+                            role: agent_panel::AgentRole::ToolCall,
+                            text: title,
+                        });
                 }
                 acp::AgentEvent::Done => {
                     self.agent_chat.is_working = false;
                 }
                 acp::AgentEvent::Error(err) => {
-                    self.agent_chat.messages.push(agent_panel::AgentChatMessage {
-                        role: agent_panel::AgentRole::Error,
-                        text: err,
-                    });
+                    self.agent_chat
+                        .messages
+                        .push(agent_panel::AgentChatMessage {
+                            role: agent_panel::AgentRole::Error,
+                            text: err,
+                        });
                     self.agent_chat.is_working = false;
                 }
             }
@@ -1265,18 +1301,88 @@ impl HerdrGui {
         } else {
             "chevron.up"
         };
+        let is_agent_view = self.agent_chat.view == PaneView::AgentChat;
         div()
             .h(px(22.0))
             .flex()
             .items_center()
             .justify_between()
-            .child(ui_text(
-                "agents",
-                10,
-                theme.muted,
-                false,
-                "px-2 h-[18px] flex items-center",
-            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(ui_text(
+                        "agents",
+                        10,
+                        theme.muted,
+                        false,
+                        "px-2 h-[18px] flex items-center",
+                    ))
+                    // Agent view toggle button (terminal ↔ agent chat)
+                    .child(
+                        div()
+                            .w(px(18.0))
+                            .h(px(18.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .when(is_agent_view, |el| el.bg(rgb(theme.active)))
+                            .hover(move |style| style.bg(rgb(theme.hover)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.toggle_agent_chat(&ToggleAgentChat, window, cx);
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(if is_agent_view {
+                                        theme.bg
+                                    } else {
+                                        theme.muted
+                                    }))
+                                    .child(
+                                        agent_panel::AgentKind::all()
+                                            .iter()
+                                            .position(|k| *k == self.agent_chat.selected_agent)
+                                            .map(|i| (i + 1).to_string())
+                                            .unwrap_or_else(|| "*".to_string()),
+                                    ),
+                            ),
+                    )
+                    // Agent cycle button (next agent)
+                    .when(is_agent_view, |el| {
+                        el.child(
+                            div()
+                                .w(px(18.0))
+                                .h(px(18.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .hover(move |style| style.bg(rgb(theme.hover)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _window, cx| {
+                                        this.next_agent(cx);
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .text_color(rgb(theme.muted))
+                                        .child(self.agent_chat.selected_agent.icon().to_string()),
+                                ),
+                        )
+                    }),
+            )
             .child(
                 div()
                     .w(px(22.0))
@@ -1605,15 +1711,6 @@ impl HerdrGui {
             })
             .when(self.sidebar_layout == SidebarLayout::Arc, |el| {
                 el.child(self.right_workspace_sidebar(theme, cx))
-            })
-            // Agent chat panel (below sidebar content)
-            .when(self.agent_chat.visible, |el| {
-                el.child(div().h(px(1.0)).bg(rgb(theme.border)))
-                    .child(agent_panel::render_agent_chat(
-                        &self.agent_chat,
-                        theme,
-                        cx,
-                    ))
             });
         let built = if (start - target).abs() < f64::EPSILON {
             el.into_any_element()
@@ -1881,6 +1978,10 @@ impl HerdrGui {
         theme: UiTheme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // Agent chat view — render full agent panel in pane area
+        if self.agent_chat.view == PaneView::AgentChat {
+            return agent_panel::render_agent_chat(&self.agent_chat, theme, cx);
+        }
         if panes.is_empty() && pane_frame.lines.is_empty() {
             return div()
                 .flex()
