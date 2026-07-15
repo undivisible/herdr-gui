@@ -1,4 +1,5 @@
 mod acp;
+mod agent_panel;
 mod ghostty;
 mod help;
 mod herdr;
@@ -49,6 +50,7 @@ actions!(
         ToggleSpaces,
         ToggleSidebar,
         ToggleAgents,
+        ToggleAgentChat,
         ToggleSidebarLayout,
         ThemeCatppuccin,
         ThemeCatppuccinLatte,
@@ -129,6 +131,7 @@ struct HerdrGui {
     terminal_scroll_y: f64,
     scroll_active: bool,
     pending_scroll_rows: isize,
+    agent_chat: agent_panel::AgentChatState,
     focus_handle: FocusHandle,
     settings: settings::Settings,
     render_seq: u64,
@@ -267,6 +270,7 @@ impl HerdrGui {
             terminal_scroll_y: 0.0,
             scroll_active: false,
             pending_scroll_rows: 0,
+            agent_chat: agent_panel::AgentChatState::new(),
             focus_handle: cx.focus_handle(),
             settings,
             render_seq: 0,
@@ -373,6 +377,77 @@ impl HerdrGui {
         self.agents_collapsed = !self.agents_collapsed;
         self.save_settings();
         self.notify_sidebar(cx);
+    }
+
+    fn toggle_agent_chat(
+        &mut self,
+        _: &ToggleAgentChat,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.agent_chat.visible = !self.agent_chat.visible;
+        if self.agent_chat.visible && self.agent_chat.session.is_none() {
+            // Try to spawn a default agent (claude-code)
+            match acp::AcpSession::spawn("claude-code", std::env::current_dir().unwrap_or_default())
+            {
+                Ok(session) => {
+                    self.agent_chat.session = Some(session);
+                    self.agent_chat.is_working = true;
+                    self.agent_chat.messages.push(agent_panel::AgentChatMessage {
+                        role: agent_panel::AgentRole::Agent,
+                        text: "Connecting to agent…".to_string(),
+                    });
+                }
+                Err(err) => {
+                    self.agent_chat.messages.push(agent_panel::AgentChatMessage {
+                        role: agent_panel::AgentRole::Error,
+                        text: format!("Failed to start agent: {err}"),
+                    });
+                }
+            }
+        }
+        self.notify_sidebar(cx);
+    }
+
+    fn poll_agent_events(&mut self) {
+        let Some(session) = self.agent_chat.session.as_ref() else {
+            return;
+        };
+        while let Some(event) = session.try_recv() {
+            match event {
+                acp::AgentEvent::Text(text) => {
+                    let merged = self
+                        .agent_chat
+                        .messages
+                        .last_mut()
+                        .filter(|m| m.role == agent_panel::AgentRole::Agent);
+                    if let Some(last) = merged {
+                        last.text.push_str(&text);
+                    } else {
+                        self.agent_chat.messages.push(agent_panel::AgentChatMessage {
+                            role: agent_panel::AgentRole::Agent,
+                            text,
+                        });
+                    }
+                }
+                acp::AgentEvent::ToolCall { title } => {
+                    self.agent_chat.messages.push(agent_panel::AgentChatMessage {
+                        role: agent_panel::AgentRole::ToolCall,
+                        text: title,
+                    });
+                }
+                acp::AgentEvent::Done => {
+                    self.agent_chat.is_working = false;
+                }
+                acp::AgentEvent::Error(err) => {
+                    self.agent_chat.messages.push(agent_panel::AgentChatMessage {
+                        role: agent_panel::AgentRole::Error,
+                        text: err,
+                    });
+                    self.agent_chat.is_working = false;
+                }
+            }
+        }
     }
 
     fn theme_system(&mut self, _: &ThemeSystem, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1239,6 +1314,8 @@ impl Render for HerdrGui {
         let seq = self.render_seq;
         let theme = self.theme(window);
         self.sync_terminal_geometry(window, cx);
+        // Poll ACP agent events
+        self.poll_agent_events();
         if self.terminal_bg != theme.terminal {
             self.terminal_bg = theme.terminal;
             self.sync_terminal_theme(theme, cx);
@@ -1282,6 +1359,7 @@ impl Render for HerdrGui {
             .on_action(cx.listener(Self::toggle_spaces))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_agents))
+            .on_action(cx.listener(Self::toggle_agent_chat))
             .on_action(cx.listener(Self::toggle_sidebar_layout))
             .on_action(cx.listener(Self::theme_catppuccin))
             .on_action(cx.listener(Self::theme_catppuccin_latte))
@@ -1527,6 +1605,15 @@ impl HerdrGui {
             })
             .when(self.sidebar_layout == SidebarLayout::Arc, |el| {
                 el.child(self.right_workspace_sidebar(theme, cx))
+            })
+            // Agent chat panel (below sidebar content)
+            .when(self.agent_chat.visible, |el| {
+                el.child(div().h(px(1.0)).bg(rgb(theme.border)))
+                    .child(agent_panel::render_agent_chat(
+                        &self.agent_chat,
+                        theme,
+                        cx,
+                    ))
             });
         let built = if (start - target).abs() < f64::EPSILON {
             el.into_any_element()
@@ -2327,6 +2414,7 @@ fn main() {
                     MenuItem::action("Toggle Spaces", ToggleSpaces),
                     MenuItem::action("Toggle Sidebar", ToggleSidebar),
                     MenuItem::action("Toggle Agents", ToggleAgents),
+                    MenuItem::action("Toggle Agent Chat", ToggleAgentChat),
                     MenuItem::action("Toggle Sidebar Layout", ToggleSidebarLayout),
                     MenuItem::separator(),
                     MenuItem::submenu(Menu {
@@ -2371,6 +2459,7 @@ fn main() {
             KeyBinding::new("cmd-shift-s", ToggleSpaces, None),
             KeyBinding::new("cmd-b", ToggleSidebar, None),
             KeyBinding::new("cmd-shift-a", ToggleAgents, None),
+            KeyBinding::new("cmd-shift-c", ToggleAgentChat, None),
             KeyBinding::new("cmd-shift-l", ToggleSidebarLayout, None),
             KeyBinding::new("cmd-shift-r", ReloadHerdrConfig, None),
             KeyBinding::new("cmd-t", NewTab, None),
