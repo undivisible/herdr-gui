@@ -392,8 +392,33 @@ impl HerdrGui {
             PaneView::AgentChat => PaneView::Terminal,
         };
         self.agent_chat.visible = self.agent_chat.view == PaneView::AgentChat;
-        if self.agent_chat.visible && self.agent_chat.session.is_none() {
-            self.start_agent_session(cx);
+        if self.agent_chat.visible {
+            // Resume: reconnect to existing pane if we have one
+            if let Some(pane_id) = self.agent_chat.connected_pane_id.clone() {
+                if self.agent_chat.session.is_none() {
+                    let name = self
+                        .agent_chat
+                        .messages
+                        .iter()
+                        .find(|m| m.role == AgentRole::Agent && m.text.starts_with("Connected to"))
+                        .map(|m| {
+                            m.text
+                                .strip_prefix("Connected to ")
+                                .unwrap_or("agent")
+                                .to_string()
+                        })
+                        .unwrap_or_else(|| "agent".to_string());
+                    self.agent_chat.session = Some(acp::AgentSession::direct(pane_id));
+                    self.agent_chat
+                        .messages
+                        .push(agent_panel::AgentChatMessage {
+                            role: AgentRole::Agent,
+                            text: format!("Resumed session with {name}"),
+                        });
+                }
+            } else if self.agent_chat.session.is_none() {
+                self.start_agent_session(cx);
+            }
         }
         self.notify_sidebar(cx);
     }
@@ -1215,17 +1240,23 @@ impl HerdrGui {
                 return;
             }
             if key.key == "tab" {
-                // Cycle agent
+                // Cycle agent — keep message history
                 let all = agent_panel::AgentKind::all();
                 let idx = all
                     .iter()
                     .position(|k| *k == self.agent_chat.selected_agent)
                     .unwrap_or(0);
                 self.agent_chat.selected_agent = all[(idx + 1) % all.len()];
+                // Drop old session but keep messages
                 self.agent_chat.session = None;
-                self.agent_chat.messages.clear();
+                self.agent_chat.connected_pane_id = None;
                 self.agent_chat.is_working = false;
-                self.start_agent_session(cx);
+                self.agent_chat
+                    .messages
+                    .push(agent_panel::AgentChatMessage {
+                        role: AgentRole::Agent,
+                        text: format!("Switched to {}", self.agent_chat.selected_agent.label()),
+                    });
                 cx.notify();
                 return;
             }
