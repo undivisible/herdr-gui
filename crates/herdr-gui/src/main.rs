@@ -12,8 +12,8 @@ use crepuscularity_gpui::{
     actions, bounce, bounds, div, gpui_window_options, linear, point, px, rgb, size, AnyElement,
     AnyView, AnyWindowHandle, App, Application, Context, Entity, FocusHandle, Icon, IntoElement,
     KeyBinding, Keystroke, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Render, ScrollWheelEvent, SystemMenuType, TitlebarOptions, TouchPhase, Window,
-    WindowAppearance, WindowBounds,
+    MouseUpEvent, Render, ScrollDelta, ScrollWheelEvent, SystemMenuType, TitlebarOptions,
+    TouchPhase, Window, WindowAppearance, WindowBounds,
 };
 use ghostty::{TerminalFrame, TerminalLine, TerminalRun, TerminalSession};
 use help::help_overlay;
@@ -125,8 +125,8 @@ struct HerdrGui {
     theme_mode: ThemeMode,
     swipe_progress: f64,
     scroll_x: f64,
-    /// Trackpad sends many tiny wheel events; accumulate before ghostty scroll.
-    terminal_scroll_y: f64,
+    /// GPUI coalesced wheel delta (trackpad sends many tiny events).
+    terminal_scroll_delta: ScrollDelta,
     scroll_active: bool,
     pending_scroll_rows: isize,
     focus_handle: FocusHandle,
@@ -264,7 +264,7 @@ impl HerdrGui {
             theme_mode,
             swipe_progress: 0.0,
             scroll_x: 0.0,
-            terminal_scroll_y: 0.0,
+            terminal_scroll_delta: ScrollDelta::default(),
             scroll_active: false,
             pending_scroll_rows: 0,
             focus_handle: cx.focus_handle(),
@@ -733,10 +733,8 @@ impl HerdrGui {
         self.pending_scroll_rows = 0;
         let vt_drain = std::mem::take(&mut self.pending_vt);
         let want_frame = force || scroll_rows != 0 || due;
-        if self.scroll_active && scroll_rows == 0 && !force {
-            if !vt_drain.is_empty() {
-                self.pending_vt.extend_from_slice(&vt_drain);
-            }
+        // While reading history, still apply scroll + paint; only skip idle VT repaints.
+        if self.scroll_active && scroll_rows == 0 && !force && vt_drain.is_empty() {
             return;
         }
         if !want_frame || self.terminal_frame_in_flight {
@@ -1027,7 +1025,7 @@ impl HerdrGui {
     }
 
     fn reset_terminal_scroll_state(&mut self) {
-        self.terminal_scroll_y = 0.0;
+        self.terminal_scroll_delta = ScrollDelta::default();
         self.scroll_active = false;
         self.pending_scroll_rows = 0;
     }
@@ -1046,7 +1044,6 @@ impl HerdrGui {
         self.maybe_refresh_terminal_frame(cx, true);
     }
 
-    #[allow(dead_code)]
     fn handle_terminal_scroll(
         &mut self,
         event: &ScrollWheelEvent,
@@ -1054,11 +1051,12 @@ impl HerdrGui {
         cx: &mut Context<Self>,
     ) {
         let line_height = px(TERMINAL_CELL_HEIGHT as f32);
-        let delta = event.delta.pixel_delta(line_height);
+        self.terminal_scroll_delta = self.terminal_scroll_delta.coalesce(event.delta);
+        let delta = self.terminal_scroll_delta.pixel_delta(line_height);
         let dx = delta.x.to_f64().abs();
         let dy = delta.y.to_f64().abs();
         if dx > dy && dx > 2.0 {
-            self.terminal_scroll_y = 0.0;
+            self.terminal_scroll_delta = ScrollDelta::default();
             self.scroll_x += delta.x.to_f64();
             self.swipe_progress = (self.scroll_x / 80.0).clamp(-1.0, 1.0);
             if self.scroll_x.abs() < 80.0 {
@@ -1074,24 +1072,14 @@ impl HerdrGui {
         if dy < f64::EPSILON && dx < f64::EPSILON {
             return;
         }
-        self.terminal_scroll_y += delta.y.to_f64();
         let gesture_done = matches!(event.touch_phase, TouchPhase::Ended);
-        let threshold = TERMINAL_CELL_HEIGHT * 0.2;
-        let mut rows = 0_isize;
-        while self.terminal_scroll_y.abs() >= threshold && rows.abs() < 4 {
-            if self.terminal_scroll_y > 0.0 {
-                rows += 1;
-                self.terminal_scroll_y -= TERMINAL_CELL_HEIGHT;
-            } else {
-                rows -= 1;
-                self.terminal_scroll_y += TERMINAL_CELL_HEIGHT;
-            }
+        let mut rows = (delta.y.to_f64() / TERMINAL_CELL_HEIGHT).round() as isize;
+        if rows == 0 && dy >= TERMINAL_CELL_HEIGHT * 0.15 {
+            rows = if delta.y.to_f64() > 0.0 { 1 } else { -1 };
         }
-        if rows == 0 && gesture_done && self.terminal_scroll_y.abs() > 0.5 {
-            rows = if self.terminal_scroll_y > 0.0 { 1 } else { -1 };
-        }
+        rows = rows.clamp(-8, 8);
         if gesture_done {
-            self.terminal_scroll_y = 0.0;
+            self.terminal_scroll_delta = ScrollDelta::default();
         }
         self.queue_terminal_scroll_rows(rows, cx);
     }
@@ -1857,7 +1845,8 @@ impl HerdrGui {
             return div()
                 .flex_1()
                 .h_full()
-                .child(self.terminal_only_view(theme))
+                .on_scroll_wheel(cx.listener(Self::handle_terminal_scroll))
+                .child(self.terminal_only_view(theme, cx))
                 .into_any_element();
         }
 
@@ -1881,20 +1870,18 @@ impl HerdrGui {
             .h_full()
             .bg(rgb(theme.terminal))
             .cursor_pointer()
+            .on_scroll_wheel(cx.listener(Self::handle_terminal_scroll))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
                     this.focus_pane_id(pane_id.clone(), window, cx)
                 }),
             )
-            .child(self.terminal_only_view(theme))
+            .child(self.terminal_only_view(theme, cx))
             .into_any_element()
     }
 
-    fn terminal_only_view(&self, theme: UiTheme) -> AnyElement {
-        // Keep bg in sync without forcing a full parent re-render tree of terminal cells.
-        // set_bg is no-op when unchanged.
-        let _ = theme;
+    fn terminal_only_view(&self, theme: UiTheme, cx: &mut Context<Self>) -> AnyElement {
         div()
             .flex_1()
             .overflow_hidden()
@@ -1902,6 +1889,7 @@ impl HerdrGui {
             .font_family("Menlo")
             .line_height(px(18.0))
             .text_color(rgb(theme.text))
+            .on_scroll_wheel(cx.listener(Self::handle_terminal_scroll))
             .child(cached_terminal(self.terminal_pane.clone()))
             .into_any_element()
     }

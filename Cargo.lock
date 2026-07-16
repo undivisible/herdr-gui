@@ -1167,7 +1167,7 @@ dependencies = [
 
 [[package]]
 name = "crepuscularity-core"
-version = "0.4.22"
+version = "0.4.25"
 dependencies = [
  "notify",
  "serde_json",
@@ -1180,6 +1180,8 @@ dependencies = [
 [[package]]
 name = "crepuscularity-gpui"
 version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "55050c46cd1efa574b662831194f438af14d87b0c440cb0f3821a5271ac1df6e"
 dependencies = [
  "crepuscularity-core",
  "crepuscularity-runtime",
@@ -1191,7 +1193,7 @@ dependencies = [
 
 [[package]]
 name = "crepuscularity-runtime"
-version = "0.4.15"
+version = "0.4.18"
 dependencies = [
  "crepuscularity-core",
  "gpui",
@@ -1203,7 +1205,9 @@ dependencies = [
 
 [[package]]
 name = "crepuscularity_macros"
-version = "0.5.8"
+version = "0.5.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49d6c652eb167803fd0ceaa2fa2bd61ced14fe691424a3c93138047bda008974"
 dependencies = [
  "crepuscularity-core",
  "proc-macro2",
@@ -2444,7 +2448,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "herdr-gui"
-version = "0.1.6"
+version = "0.1.11"
 dependencies = [
  "crepuscularity-gpui",
  "gpui",
@@ -7318,3 +7322,7 @@ dependencies = [
  "syn 2.0.118",
  "winnow 1.0.3",
 ]
+
+[[patch.unused]]
+name = "crepuscularity-gpui"
+version = "0.5.8"
