@@ -25,6 +25,13 @@ pub fn help_overlay() -> impl IntoElement {
         .child(key_row("Cmd <-", "previous tab"))
         .child(key_row("Cmd ->", "next tab"))
         .child(key_row("Cmd W", "close pane"))
+        .child(label("Terminal", 0xc0caf5))
+        .child(key_row("Cmd V", "paste"))
+        .child(key_row("Cmd Backspace", "delete line backward"))
+        .child(key_row("Ctrl U", "kill line backward"))
+        .child(key_row("Ctrl W", "delete word backward"))
+        .child(key_row("Ctrl A / E", "line start / end"))
+        .child(key_row("Alt Backspace", "delete word backward"))
 }
 
 fn label(text: &str, color: u32) -> impl IntoElement {

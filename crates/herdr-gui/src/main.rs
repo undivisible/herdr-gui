@@ -18,7 +18,7 @@ use crepuscularity_gpui::{
 use ghostty::{TerminalFrame, TerminalLine, TerminalRun, TerminalSession};
 use help::help_overlay;
 use herdr::{Agent, HerdrClient, HerdrState, Pane, Tab, Workspace};
-use input::key_name;
+use input::{key_name, should_swallow_gui_keystroke};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{
@@ -642,9 +642,7 @@ impl HerdrGui {
     }
 
     fn focus_pane_id(&mut self, pane_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.terminal_scroll_y = 0.0;
-        self.scroll_active = false;
-        self.pending_scroll_rows = 0;
+        self.reset_terminal_scroll_state();
         self.with_client(|client| client.focus_pane(&pane_id));
         self.refresh_state();
         self.attach_focused_terminal(window, cx);
@@ -850,6 +848,7 @@ impl HerdrGui {
             self.sync_terminal_geometry(window, cx);
             return;
         }
+        self.reset_terminal_scroll_state();
         match TerminalSession::attach(&target, size.0, size.1) {
             Ok(mut session) => {
                 if let Ok(frame) = session.resize(size.0, size.1, size.2, size.3) {
@@ -970,6 +969,10 @@ impl HerdrGui {
     }
 
     fn handle_keystroke(&mut self, key: &Keystroke, cx: &mut Context<Self>) {
+        if should_swallow_gui_keystroke(key) {
+            return;
+        }
+
         let Some(client) = self.client.clone() else {
             return;
         };
@@ -996,7 +999,7 @@ impl HerdrGui {
                 | "insert"
         );
         let pane_id = pane.pane_id;
-        if key.modifiers.alt || is_named {
+        if key.modifiers.alt || key.modifiers.platform || key.modifiers.control || is_named {
             let key_str = key_name(key);
             cx.spawn(async move |this, cx| {
                 if let Err(err) = client.send_key(&pane_id, &key_str) {
@@ -1023,12 +1026,21 @@ impl HerdrGui {
         }
     }
 
+    fn reset_terminal_scroll_state(&mut self) {
+        self.terminal_scroll_y = 0.0;
+        self.scroll_active = false;
+        self.pending_scroll_rows = 0;
+    }
+
     fn queue_terminal_scroll_rows(&mut self, rows: isize, cx: &mut Context<Self>) {
         if rows == 0 || self.terminal.is_none() {
             return;
         }
+        // Arbor-style: only treat upward viewport movement as leaving live output.
         if rows > 0 {
             self.scroll_active = true;
+        } else {
+            self.scroll_active = false;
         }
         self.pending_scroll_rows += rows;
         self.maybe_refresh_terminal_frame(cx, true);
@@ -1080,9 +1092,6 @@ impl HerdrGui {
         }
         if gesture_done {
             self.terminal_scroll_y = 0.0;
-        }
-        if rows < 0 {
-            self.scroll_active = false;
         }
         self.queue_terminal_scroll_rows(rows, cx);
     }
