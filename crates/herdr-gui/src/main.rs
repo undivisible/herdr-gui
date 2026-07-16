@@ -21,7 +21,7 @@ use crepuscularity_gpui::{
 use ghostty::{TerminalFrame, TerminalLine, TerminalRun, TerminalSession};
 use help::help_overlay;
 use herdr::{Agent, HerdrClient, HerdrState, Pane, Tab, Workspace};
-use input::key_name;
+use input::{key_name, should_swallow_gui_keystroke};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{
@@ -1244,6 +1244,10 @@ impl HerdrGui {
     }
 
     fn handle_keystroke(&mut self, key: &Keystroke, cx: &mut Context<Self>) {
+        if should_swallow_gui_keystroke(key) {
+            return;
+        }
+
         // Route keystrokes to agent input when agent chat is visible
         if self.agent_chat.view == agent_panel::PaneView::AgentChat {
             if key.key == "escape" {
@@ -1329,7 +1333,7 @@ impl HerdrGui {
                 | "insert"
         );
         let pane_id = pane.pane_id;
-        if key.modifiers.alt || is_named {
+        if key.modifiers.alt || key.modifiers.platform || key.modifiers.control || is_named {
             let key_str = key_name(key);
             cx.spawn(async move |this, cx| {
                 if let Err(err) = client.send_key(&pane_id, &key_str) {
