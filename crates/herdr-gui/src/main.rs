@@ -1035,11 +1035,7 @@ impl HerdrGui {
             return;
         }
         // Arbor-style: only treat upward viewport movement as leaving live output.
-        if rows > 0 {
-            self.scroll_active = true;
-        } else {
-            self.scroll_active = false;
-        }
+        self.scroll_active = rows > 0;
         self.pending_scroll_rows += rows;
         self.maybe_refresh_terminal_frame(cx, true);
     }
