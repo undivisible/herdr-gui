@@ -375,7 +375,9 @@ impl HerdrClient {
         let response: ApiResponse<T> = serde_json::from_str(&line)?;
         let ms = started.elapsed().as_secs_f64() * 1000.0;
         let bytes = line.len();
-        lag_log(format_args!("herdr.call {method} {ms:.2}ms resp_bytes={bytes}"));
+        lag_log(format_args!(
+            "herdr.call {method} {ms:.2}ms resp_bytes={bytes}"
+        ));
         if let Some(error) = response.error {
             Err(HerdrError::Api(
                 error.message.unwrap_or_else(|| "unknown error".to_string()),
