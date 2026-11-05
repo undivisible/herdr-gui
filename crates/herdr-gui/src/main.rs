@@ -379,7 +379,7 @@ impl HerdrGui {
         let Some(client) = self.client.clone() else {
             return;
         };
-        let Some(pane) = self.focused_pane().cloned() else {
+        let Some(pane) = self.attached_focused_pane().cloned() else {
             return;
         };
         let Some(item) = cx.read_from_clipboard() else {
@@ -823,6 +823,11 @@ impl HerdrGui {
             .and_then(|pane| pane.terminal_id.clone())
             .or_else(|| pane.as_ref().map(|pane| pane.pane_id.clone()));
         if target.is_none() {
+            self.terminal_token = self.terminal_token.wrapping_add(1);
+            self.terminal = None;
+            self.terminal_target = None;
+            self.pending_vt.clear();
+            self.set_terminal_frame(Arc::new(TerminalFrame::default()), cx);
             return;
         }
         let target = match target {
@@ -833,6 +838,11 @@ impl HerdrGui {
             self.sync_terminal_geometry(window, cx);
             return;
         }
+        self.terminal_token = self.terminal_token.wrapping_add(1);
+        self.terminal = None;
+        self.terminal_target = None;
+        self.pending_vt.clear();
+        self.set_terminal_frame(Arc::new(TerminalFrame::default()), cx);
         self.reset_terminal_scroll_state();
         match TerminalSession::attach(&target, size.0, size.1) {
             Ok(mut session) => {
@@ -932,6 +942,12 @@ impl HerdrGui {
             .or_else(|| self.state.panes.first())
     }
 
+    fn attached_focused_pane(&self) -> Option<&Pane> {
+        let pane = self.focused_pane()?;
+        let target = pane.terminal_id.as_deref().unwrap_or(&pane.pane_id);
+        (self.terminal.is_some() && self.terminal_target.as_deref() == Some(target)).then_some(pane)
+    }
+
     fn handle_keystroke(&mut self, key: &Keystroke, cx: &mut Context<Self>) {
         if should_swallow_gui_keystroke(key) {
             return;
@@ -940,7 +956,7 @@ impl HerdrGui {
         let Some(client) = self.client.clone() else {
             return;
         };
-        let Some(pane) = self.focused_pane().cloned() else {
+        let Some(pane) = self.attached_focused_pane().cloned() else {
             return;
         };
         // NAMED keys always send as key events, not text.
