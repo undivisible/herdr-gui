@@ -10,10 +10,10 @@ use crepuscularity_gpui as gpui;
 use crepuscularity_gpui::prelude::*;
 use crepuscularity_gpui::{
     actions, bounce, bounds, div, gpui_window_options, linear, point, px, rgb, size, AnyElement,
-    AnyView, AnyWindowHandle, App, Application, Context, Entity, FocusHandle, Icon, IntoElement,
-    KeyBinding, Keystroke, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Render, ScrollDelta, ScrollWheelEvent, SystemMenuType, TitlebarOptions,
-    TouchPhase, Window, WindowAppearance, WindowBounds,
+    AnyView, App, Application, Context, Entity, FocusHandle, Icon, IntoElement, KeyBinding,
+    Keystroke, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render,
+    ScrollDelta, ScrollWheelEvent, SystemMenuType, TitlebarOptions, TouchPhase, Window,
+    WindowAppearance, WindowBounds,
 };
 use ghostty::{TerminalFrame, TerminalLine, TerminalRun, TerminalSession};
 use help::help_overlay;
@@ -389,28 +389,15 @@ impl HerdrGui {
             return;
         };
         let pane_id = pane.pane_id;
-        let lines: Vec<String> = text.lines().map(String::from).collect();
-        for (i, line) in lines.iter().enumerate() {
-            let line = line.clone();
-            let c = client.clone();
-            let pid = pane_id.clone();
-            cx.spawn(async move |this, cx| {
-                if let Err(err) = c.send_text(&pid, &line) {
-                    let _ = this.update(cx, |view, _| view.status = err.to_string());
-                }
-            })
-            .detach();
-            if i < lines.len() - 1 {
-                let c = client.clone();
-                let pid = pane_id.clone();
-                cx.spawn(async move |this, cx| {
-                    if let Err(err) = c.send_key(&pid, "enter") {
-                        let _ = this.update(cx, |view, _| view.status = err.to_string());
-                    }
-                })
-                .detach();
+        cx.spawn(async move |this, cx| {
+            if let Err(err) = client.paste_text(&pane_id, &text) {
+                let _ = this.update(cx, |view, cx| {
+                    view.status = err.to_string();
+                    cx.notify();
+                });
             }
-        }
+        })
+        .detach();
     }
 
     fn theme_system(&mut self, _: &ThemeSystem, _window: &mut Window, cx: &mut Context<Self>) {
@@ -868,9 +855,7 @@ impl HerdrGui {
                     self.terminal_target = Some(target.clone());
                     self.terminal_size = Some(size);
                     self.status = "connected".to_string();
-                    if let Some(window) = cx.windows().first().copied() {
-                        poll_terminal(receiver, token, target, window, cx);
-                    }
+                    poll_terminal(receiver, token, cx);
                 }
             }
             Err(err) => {
@@ -904,25 +889,6 @@ impl HerdrGui {
             .iter()
             .any(|pane| pane.workspace_id.as_deref() == Some(workspace_id.as_str()));
         if !has_panes {
-            self.with_client(|client| client.close_workspace(&workspace_id));
-            self.refresh_state();
-        }
-    }
-
-    fn close_workspace_after_terminal_exit(&mut self, target: &str) {
-        let Some(workspace_id) = self.active_workspace_id().map(str::to_string) else {
-            return;
-        };
-        let visible = self
-            .state
-            .panes
-            .iter()
-            .filter(|pane| pane.workspace_id.as_deref() == Some(workspace_id.as_str()))
-            .collect::<Vec<_>>();
-        let target_was_visible = visible.iter().any(|pane| {
-            pane.terminal_id.as_deref() == Some(target) || pane.pane_id.as_str() == target
-        });
-        if target_was_visible && visible.len() <= 1 {
             self.with_client(|client| client.close_workspace(&workspace_id));
             self.refresh_state();
         }
@@ -2452,13 +2418,7 @@ fn main() {
     });
 }
 
-fn poll_terminal(
-    receiver: Receiver<Vec<u8>>,
-    token: u64,
-    target: String,
-    window: AnyWindowHandle,
-    cx: &mut Context<HerdrGui>,
-) {
+fn poll_terminal(receiver: Receiver<Vec<u8>>, token: u64, cx: &mut Context<HerdrGui>) {
     // Feed VT continuously; extract paint frames at most ~20fps so agent output
     // cannot monopolize the UI thread (ghostty frame() walks every cell).
     let mut tick: u64 = 0;
@@ -2538,19 +2498,16 @@ fn poll_terminal(
         }
         if disconnected {
             let _ = this.update(cx, |view, cx| {
-                if view.terminal_token == token {
-                    view.terminal = None;
-                    view.terminal_target = None;
-                    view.terminal_size = None;
-                    view.refresh_state();
-                    view.close_workspace_after_terminal_exit(&target);
+                if view.terminal_token != token {
+                    return;
                 }
+                view.terminal_token = view.terminal_token.wrapping_add(1);
+                view.terminal = None;
+                view.terminal_target = None;
+                view.terminal_size = None;
+                view.refresh_state();
+                view.status = "Terminal disconnected; use Refresh to retry".to_string();
                 cx.notify();
-            });
-            let _ = cx.update_window(window, |_, window, cx| {
-                let _ = this.update(cx, |view, cx| {
-                    view.attach_focused_terminal(window, cx);
-                });
             });
             break;
         }
