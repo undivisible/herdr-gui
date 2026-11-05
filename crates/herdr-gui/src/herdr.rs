@@ -485,8 +485,11 @@ fn start_server() -> Result<(), HerdrError> {
 }
 
 fn wait_for_socket(path: &Path) -> Result<(), HerdrError> {
+    let client = HerdrClient {
+        socket_path: path.to_path_buf(),
+    };
     for _ in 0..30 {
-        if path.exists() {
+        if client.ping().is_ok() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(100));
@@ -516,12 +519,57 @@ fn socket_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_legacy_request_log, command_exists, socket_path, AgentList, HerdrClient, HerdrError,
-        PaneList, TabList, WorkspaceList,
+        clear_legacy_request_log, command_exists, socket_path, wait_for_socket, AgentList,
+        HerdrClient, HerdrError, PaneList, TabList, WorkspaceList,
     };
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
     use std::time::Duration;
+
+    #[test]
+    fn wait_for_socket_retries_stale_socket_until_ping_succeeds() {
+        let dir = std::env::temp_dir().join(format!("herdr-ready-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap_or_else(|err| panic!("{err}"));
+        let path = dir.join("socket");
+        drop(UnixListener::bind(&path).unwrap_or_else(|err| panic!("{err}")));
+        let server_path = path.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            std::fs::remove_file(&server_path).unwrap_or_else(|err| panic!("{err}"));
+            let listener = UnixListener::bind(&server_path).unwrap_or_else(|err| panic!("{err}"));
+            let (mut stream, _) = listener.accept().unwrap_or_else(|err| panic!("{err}"));
+            let mut line = String::new();
+            BufReader::new(&stream)
+                .read_line(&mut line)
+                .unwrap_or_else(|err| panic!("{err}"));
+            let request: serde_json::Value =
+                serde_json::from_str(&line).unwrap_or_else(|err| panic!("{err}"));
+            assert_eq!(request["method"], "ping");
+            writeln!(stream, "{{\"result\":{{}}}}").unwrap_or_else(|err| panic!("{err}"));
+            done_tx.send(()).unwrap_or_else(|err| panic!("{err}"));
+        });
+        let result = wait_for_socket(&path);
+        assert!(result.is_ok(), "{result:?}");
+        done_rx
+            .recv_timeout(Duration::from_secs(4))
+            .unwrap_or_else(|err| panic!("{err}"));
+        server.join().unwrap_or_else(|err| panic!("{err:?}"));
+        std::fs::remove_dir_all(dir).unwrap_or_else(|err| panic!("{err}"));
+    }
+
+    #[test]
+    fn wait_for_socket_times_out_on_stale_socket() {
+        let dir = std::env::temp_dir().join(format!("herdr-stale-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap_or_else(|err| panic!("{err}"));
+        let path = dir.join("socket");
+        drop(UnixListener::bind(&path).unwrap_or_else(|err| panic!("{err}")));
+        let result = wait_for_socket(&path);
+        std::fs::remove_dir_all(dir).unwrap_or_else(|err| panic!("{err}"));
+        assert!(
+            matches!(result, Err(HerdrError::SocketUnavailable(_, message)) if message == "timed out waiting for herdr server")
+        );
+    }
 
     #[test]
     fn call_times_out_when_server_does_not_respond() {
