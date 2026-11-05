@@ -1,8 +1,7 @@
 //! Grid geometry independent of GPUI. Run its tests without linking the app:
 //! `rustc --edition=2021 --test crates/herdr-gui/src/terminal_geometry.rs -o /tmp/terminal-geometry-tests && /tmp/terminal-geometry-tests`
 //!
-//! Coordinates and lengths must all use the same units. GPUI logical pixels are
-//! appropriate; call `scaled` when the caller instead needs device pixels.
+//! Coordinates and lengths must all use the same units, such as GPUI logical pixels.
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Point {
@@ -79,27 +78,6 @@ impl TerminalGeometry {
         )
     }
 
-    /// Scale origin, viewport and cell metrics together, without rounding.
-    pub fn scaled(self, scale: f64) -> Option<Self> {
-        if !scale.is_finite() || scale <= 0.0 {
-            return None;
-        }
-        Self::new(
-            Rect {
-                origin: Point {
-                    x: self.viewport.origin.x * scale,
-                    y: self.viewport.origin.y * scale,
-                },
-                width: self.viewport.width * scale,
-                height: self.viewport.height * scale,
-            },
-            self.cell_width * scale,
-            self.cell_height * scale,
-            self.columns,
-            self.rows,
-        )
-    }
-
     /// Hit-test half-open cells; the viewport and grid's far edges are outside.
     pub fn hit_test(self, point: Point) -> Option<Cell> {
         let x = point.x - self.viewport.origin.x;
@@ -143,28 +121,6 @@ impl TerminalGeometry {
             row: ((point.y - self.viewport.origin.y) / self.cell_height)
                 .floor()
                 .clamp(0.0, last_row) as u32,
-        })
-    }
-
-    /// Visible highlight rectangle for a cell, clipped to the viewport.
-    pub fn cell_rect(self, cell: Cell) -> Option<Rect> {
-        if cell.column >= self.columns || cell.row >= self.rows {
-            return None;
-        }
-        let x = f64::from(cell.column) * self.cell_width;
-        let y = f64::from(cell.row) * self.cell_height;
-        let width = self.cell_width.min(self.viewport.width - x);
-        let height = self.cell_height.min(self.viewport.height - y);
-        if width <= 0.0 || height <= 0.0 {
-            return None;
-        }
-        Some(Rect {
-            origin: Point {
-                x: self.viewport.origin.x + x,
-                y: self.viewport.origin.y + y,
-            },
-            width,
-            height,
         })
     }
 }
@@ -323,17 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn highlight_is_clipped_and_grid_limits_apply() {
-        let g = geometry();
-        assert_eq!(
-            g.cell_rect(Cell { column: 2, row: 1 }),
-            Some(Rect {
-                origin: Point { x: 30.0, y: 38.0 },
-                width: 5.0,
-                height: 17.0
-            })
-        );
-        assert_eq!(g.cell_rect(Cell { column: 3, row: 0 }), None);
+    fn grid_limits_apply_to_hit_testing() {
         let Some(larger) = TerminalGeometry::new(
             Rect {
                 origin: Point { x: 0.0, y: 0.0 },
@@ -349,27 +295,6 @@ mod tests {
         };
         assert_eq!(larger.hit_test(Point { x: 20.0, y: 0.0 }), None);
         assert_eq!(larger.hit_test(Point { x: 0.0, y: 18.0 }), None);
-    }
-
-    #[test]
-    fn scale_preserves_hits_and_rectangles() {
-        let Some(scaled) = geometry().scaled(2.0) else {
-            panic!("valid scale");
-        };
-        assert_eq!(
-            scaled.hit_test(Point { x: 60.0, y: 76.0 }),
-            Some(Cell { column: 2, row: 1 })
-        );
-        assert_eq!(
-            scaled.cell_rect(Cell { column: 2, row: 1 }),
-            Some(Rect {
-                origin: Point { x: 60.0, y: 76.0 },
-                width: 10.0,
-                height: 34.0
-            })
-        );
-        assert!(geometry().scaled(0.0).is_none());
-        assert!(geometry().scaled(f64::INFINITY).is_none());
     }
 
     #[test]
