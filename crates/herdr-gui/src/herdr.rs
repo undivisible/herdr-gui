@@ -31,6 +31,8 @@ pub struct HerdrState {
     pub focused_workspace_id: Option<String>,
     #[serde(default)]
     pub focused_tab_id: Option<String>,
+    /// The pane reported focused by exactly one entry in the latest pane list.
+    /// None means focus was absent or ambiguous; it must not authorize input.
     #[serde(default)]
     pub focused_pane_id: Option<String>,
     pub workspaces: Vec<Workspace>,
@@ -98,6 +100,34 @@ pub struct Pane {
     pub focused: bool,
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Debug, Deserialize)]
+pub struct PaneLayout {
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub zoomed: bool,
+    pub area: PaneLayoutRect,
+    pub focused_pane_id: String,
+    pub panes: Vec<PaneLayoutPane>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+pub struct PaneLayoutRect {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Deserialize)]
+pub struct PaneLayoutPane {
+    pub pane_id: String,
+    pub focused: bool,
+    pub rect: PaneLayoutRect,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Agent {
     pub terminal_id: String,
@@ -160,6 +190,11 @@ struct TabList {
 #[derive(Debug, Deserialize)]
 struct PaneList {
     panes: Vec<Pane>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaneLayoutResponse {
+    layout: PaneLayout,
 }
 
 #[derive(Debug, Deserialize)]
@@ -241,12 +276,11 @@ impl HerdrClient {
             .map(|tab| tab.tab_id.clone())
             .or_else(|| tabs.tabs.first().map(|tab| tab.tab_id.clone()));
         let panes: PaneList = self.call("pane.list", json!({}))?;
-        let focused_pane_id = panes
-            .panes
-            .iter()
-            .find(|pane| pane.focused)
-            .map(|pane| pane.pane_id.clone())
-            .or_else(|| panes.panes.first().map(|pane| pane.pane_id.clone()));
+        let mut focused_panes = panes.panes.iter().filter(|pane| pane.focused);
+        let focused_pane_id = match (focused_panes.next(), focused_panes.next()) {
+            (Some(pane), None) => Some(pane.pane_id.clone()),
+            _ => None,
+        };
         let (agents, agent_list_error) = match self.call::<AgentList>("agent.list", json!({})) {
             Ok(list) => (list.agents, None),
             Err(_) => (Vec::new(), Some("Failed to load agents".to_string())),
@@ -269,6 +303,13 @@ impl HerdrClient {
             json!({ "pane_id": pane_id, "direction": "right" }),
         )?;
         Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn pane_layout(&self, pane_id: &str) -> Result<PaneLayout, HerdrError> {
+        let response: PaneLayoutResponse =
+            self.call("pane.layout", json!({ "pane_id": pane_id }))?;
+        Ok(response.layout)
     }
 
     pub fn split_down(&self, pane_id: &str) -> Result<(), HerdrError> {
@@ -530,6 +571,54 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn pane_layout_reads_rectangles_zoom_and_reports_unsupported_method() {
+        let dir = std::env::temp_dir().join(format!("herdr-layout-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap_or_else(|err| panic!("{err}"));
+        let path = dir.join("socket");
+        let listener = UnixListener::bind(&path).unwrap_or_else(|err| panic!("{err}"));
+        let server = std::thread::spawn(move || {
+            for reply in [
+                r#"{"id":"herdr-gui","result":{"type":"pane_layout","layout":{"workspace_id":"w1","tab_id":"w1:t1","zoomed":false,"area":{"x":2,"y":3,"width":100,"height":40},"focused_pane_id":"p2","panes":[{"pane_id":"p1","focused":false,"rect":{"x":2,"y":3,"width":29,"height":40}},{"pane_id":"p2","focused":true,"rect":{"x":31,"y":3,"width":71,"height":40}}],"splits":[{"id":"s1","direction":"right","ratio":0.29,"rect":{"x":2,"y":3,"width":100,"height":40}}]}}}"#,
+                r#"{"id":"herdr-gui","result":{"type":"pane_layout","layout":{"workspace_id":"w1","tab_id":"w1:t1","zoomed":true,"area":{"x":2,"y":3,"width":100,"height":40},"focused_pane_id":"p2","panes":[{"pane_id":"p1","focused":false,"rect":{"x":2,"y":3,"width":29,"height":40}},{"pane_id":"p2","focused":true,"rect":{"x":31,"y":3,"width":71,"height":40}}],"splits":[]}}}"#,
+                r#"{"id":"herdr-gui","error":{"code":"unknown_method","message":"unknown method"}}"#,
+            ] {
+                let (mut stream, _) = listener.accept().unwrap_or_else(|err| panic!("{err}"));
+                let mut line = String::new();
+                BufReader::new(&stream)
+                    .read_line(&mut line)
+                    .unwrap_or_else(|err| panic!("{err}"));
+                let request: serde_json::Value =
+                    serde_json::from_str(&line).unwrap_or_else(|err| panic!("{err}"));
+                assert_eq!(request["method"], "pane.layout");
+                assert_eq!(request["params"], serde_json::json!({"pane_id":"p2"}));
+                writeln!(stream, "{reply}").unwrap_or_else(|err| panic!("{err}"));
+            }
+        });
+        let client = HerdrClient { socket_path: path };
+        let layout = client
+            .pane_layout("p2")
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert!(!layout.zoomed);
+        assert_eq!(layout.area.width, 100);
+        assert_eq!(layout.panes.len(), 2);
+        assert_eq!(layout.panes[0].rect.width, 29);
+        assert_eq!(layout.panes[1].rect.x, 31);
+        assert_eq!(layout.panes[1].rect.width, 71);
+        assert_eq!(layout.focused_pane_id, "p2");
+        let zoomed = client
+            .pane_layout("p2")
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert!(zoomed.zoomed);
+        assert_eq!(zoomed.panes.len(), 2);
+        assert_eq!(zoomed.panes[1].rect.width, 71);
+        assert!(
+            matches!(client.pane_layout("p2"), Err(HerdrError::Api(message)) if message == "unknown method")
+        );
+        server.join().unwrap_or_else(|err| panic!("{err:?}"));
+        std::fs::remove_dir_all(dir).unwrap_or_else(|err| panic!("{err}"));
+    }
+
+    #[test]
     fn state_preserves_other_data_when_agent_list_fails() {
         for (suffix, response, failed) in [
             ("error", r#"{"error":{"message":"sensitive detail"}}"#, true),
@@ -573,7 +662,7 @@ mod tests {
             std::fs::remove_dir_all(dir).unwrap_or_else(|err| panic!("{err}"));
             assert_eq!(state.focused_workspace_id.as_deref(), Some("w1"));
             assert_eq!(state.focused_tab_id.as_deref(), Some("t1"));
-            assert_eq!(state.focused_pane_id.as_deref(), Some("p1"));
+            assert_eq!(state.focused_pane_id, None);
             assert_eq!(state.workspaces.len(), 1);
             assert_eq!(state.tabs.len(), 1);
             assert_eq!(state.panes.len(), 1);
@@ -584,6 +673,61 @@ mod tests {
             assert_eq!(state.agents.len(), usize::from(suffix == "agents"));
             let serialized = serde_json::to_value(&state).unwrap_or_else(|err| panic!("{err}"));
             assert!(serialized.get("agent_list_error").is_none());
+        }
+    }
+
+    #[test]
+    fn state_only_reports_unambiguous_server_focused_pane() {
+        for (suffix, panes, expected) in [
+            (
+                "none",
+                r#"[{"pane_id":"p1"},{"pane_id":"p2","focused":false}]"#,
+                None,
+            ),
+            (
+                "one",
+                r#"[{"pane_id":"p1"},{"pane_id":"p2","focused":true}]"#,
+                Some("p2"),
+            ),
+            (
+                "multiple",
+                r#"[{"pane_id":"p1","focused":true},{"pane_id":"p2","focused":true}]"#,
+                None,
+            ),
+        ] {
+            let dir =
+                std::env::temp_dir().join(format!("herdr-focus-{}-{suffix}", std::process::id()));
+            std::fs::create_dir(&dir).unwrap_or_else(|err| panic!("{err}"));
+            let path = dir.join("socket");
+            let listener = UnixListener::bind(&path).unwrap_or_else(|err| panic!("{err}"));
+            let server = std::thread::spawn(move || {
+                for (method, reply) in [
+                    (
+                        "workspace.list",
+                        r#"{"result":{"workspaces":[]}}"#.to_string(),
+                    ),
+                    ("tab.list", r#"{"result":{"tabs":[]}}"#.to_string()),
+                    ("pane.list", format!(r#"{{"result":{{"panes":{panes}}}}}"#)),
+                    ("agent.list", r#"{"result":{"agents":[]}}"#.to_string()),
+                ] {
+                    let (mut stream, _) = listener.accept().unwrap_or_else(|err| panic!("{err}"));
+                    let mut line = String::new();
+                    BufReader::new(&stream)
+                        .read_line(&mut line)
+                        .unwrap_or_else(|err| panic!("{err}"));
+                    let request: serde_json::Value =
+                        serde_json::from_str(&line).unwrap_or_else(|err| panic!("{err}"));
+                    assert_eq!(request["method"], method);
+                    writeln!(stream, "{reply}").unwrap_or_else(|err| panic!("{err}"));
+                }
+            });
+            let state = HerdrClient { socket_path: path }
+                .state()
+                .unwrap_or_else(|err| panic!("{err}"));
+            server.join().unwrap_or_else(|err| panic!("{err:?}"));
+            std::fs::remove_dir_all(dir).unwrap_or_else(|err| panic!("{err}"));
+            assert_eq!(state.panes.len(), 2);
+            assert_eq!(state.focused_pane_id.as_deref(), expected);
         }
     }
 

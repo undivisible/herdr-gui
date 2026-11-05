@@ -1,4 +1,5 @@
 mod command_worker;
+mod focus_input;
 mod ghostty;
 mod help;
 mod herdr;
@@ -6,6 +7,7 @@ mod input;
 mod settings;
 mod terminal_view;
 mod theme;
+mod warnings;
 
 use crepuscularity_gpui as gpui;
 use crepuscularity_gpui::prelude::*;
@@ -16,6 +18,7 @@ use crepuscularity_gpui::{
     ScrollDelta, ScrollWheelEvent, SystemMenuType, TitlebarOptions, TouchPhase, Window,
     WindowAppearance, WindowBounds,
 };
+use focus_input::{FocusSnapshot, InputBuffer, PendingInput, RecoveryTarget};
 use ghostty::{TerminalFrame, TerminalLine, TerminalRun, TerminalSession};
 use help::help_overlay;
 use herdr::{Agent, HerdrClient, HerdrState, Pane, Tab, Workspace};
@@ -100,13 +103,47 @@ enum ThemeMode {
     SystemLight,
 }
 
+fn focused_pane_in_state(state: &HerdrState) -> Option<&Pane> {
+    focus_input::unique_focused(&state.panes, |pane| pane.focused)
+}
+
+fn rightward_destination(
+    layout: &herdr::PaneLayout,
+    origin: &str,
+    tab: &str,
+    workspace: Option<&str>,
+) -> Option<String> {
+    if layout.tab_id != tab || workspace.is_some_and(|id| layout.workspace_id != id) {
+        return None;
+    }
+    let source = layout.panes.iter().find(|pane| pane.pane_id == origin)?;
+    let destination = focus_input::unique_focused(&layout.panes, |pane| pane.focused)?;
+    let source_rect = source.rect;
+    let dest_rect = destination.rect;
+    let right = u32::from(source_rect.x) + u32::from(source_rect.width);
+    let source_bottom = u32::from(source_rect.y) + u32::from(source_rect.height);
+    let dest_bottom = u32::from(dest_rect.y) + u32::from(dest_rect.height);
+    (destination.pane_id == layout.focused_pane_id
+        && destination.pane_id != origin
+        && u32::from(dest_rect.x) >= right
+        && u32::from(dest_rect.y) < source_bottom
+        && u32::from(source_rect.y) < dest_bottom)
+        .then(|| destination.pane_id.clone())
+}
+
 struct HerdrGui {
     client: Option<HerdrClient>,
     command_worker: command_worker::CommandWorker,
     command_results: VecDeque<Option<Receiver<HerdrState>>>,
     focus_change_pending: bool,
+    focus_result_confirmed: bool,
+    pending_input: InputBuffer,
     reconciliation_required: bool,
     state_request_in_flight: bool,
+    refresh_pending: bool,
+    reconnect_retry_secs: u64,
+    next_state_poll: Instant,
+    bootstrap_attempted: bool,
     state_generation: u64,
     state_valid: bool,
     terminal: Option<Arc<Mutex<TerminalSession>>>,
@@ -123,6 +160,7 @@ struct HerdrGui {
     terminal_bg: u32,
     state: HerdrState,
     status: String,
+    warnings: warnings::Warnings,
     show_help: bool,
     /// Full sidebar chrome as own entity — spaces toggle must not dirty root/terminal.
     sidebar_pane: Entity<SidebarPane>,
@@ -240,8 +278,14 @@ impl HerdrGui {
             command_worker: command_worker::CommandWorker::new(),
             command_results: VecDeque::new(),
             focus_change_pending: false,
+            focus_result_confirmed: false,
+            pending_input: InputBuffer::default(),
             reconciliation_required: false,
             state_request_in_flight: false,
+            refresh_pending: false,
+            reconnect_retry_secs: 2,
+            next_state_poll: Instant::now() + Duration::from_secs(2),
+            bootstrap_attempted: false,
             state_generation: 0,
             state_valid: false,
             terminal: None,
@@ -257,6 +301,7 @@ impl HerdrGui {
             terminal_bg: 0x0a0a0a,
             state: HerdrState::default(),
             status: "connecting".to_string(),
+            warnings: warnings::Warnings::default(),
             show_help: false,
             sidebar_pane: {
                 let herdr = cx.entity();
@@ -385,17 +430,13 @@ impl HerdrGui {
     }
 
     fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(pane) = self.attached_focused_pane().cloned() else {
-            return;
-        };
         let Some(item) = cx.read_from_clipboard() else {
             return;
         };
         let Some(text) = item.text() else {
             return;
         };
-        let pane_id = pane.pane_id;
-        self.submit_command(false, move |client| client.paste_text(&pane_id, &text), cx);
+        self.send_input(PendingInput::Paste(text.to_string()), cx);
     }
 
     fn theme_system(&mut self, _: &ThemeSystem, _window: &mut Window, cx: &mut Context<Self>) {
@@ -458,19 +499,31 @@ impl HerdrGui {
     }
 
     fn request_state(&mut self, window: &mut Window, cx: &mut Context<Self>, explicit: bool) {
-        if self.state_request_in_flight || !self.command_results.is_empty() {
+        let explicit = explicit || self.refresh_pending;
+        if self.state_request_in_flight
+            || !self.command_results.is_empty()
+            || self.focus_change_pending
+        {
+            self.refresh_pending |= explicit;
             return;
         }
         if self.reconciliation_required && !explicit {
             return;
         }
         self.state_request_in_flight = true;
+        self.refresh_pending = false;
+        self.next_state_poll = Instant::now() + Duration::from_secs(self.reconnect_retry_secs);
         if self.client.is_none() {
             self.status = "connecting".to_string();
             cx.notify();
         }
         let generation = self.state_generation;
         let client = self.client.clone();
+        let reconnecting = client.is_none();
+        let allow_install = explicit || !self.bootstrap_attempted;
+        if client.is_none() {
+            self.bootstrap_attempted = true;
+        }
         let window = window.window_handle();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -478,7 +531,21 @@ impl HerdrGui {
                 .spawn(async move {
                     let client = match client {
                         Some(client) => client,
-                        None => HerdrClient::bootstrap()?,
+                        None => {
+                            if !allow_install
+                                && !std::process::Command::new("sh")
+                                    .args(["-c", "command -v herdr"])
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null())
+                                    .status()
+                                    .is_ok_and(|status| status.success())
+                            {
+                                return Err(herdr::HerdrError::InstallFailed(
+                                    "Herdr is unavailable; use Refresh to retry installation".to_string(),
+                                ));
+                            }
+                            HerdrClient::bootstrap()?
+                        }
                     };
                     let state = client.state()?;
                     Ok::<_, herdr::HerdrError>((client, state))
@@ -487,10 +554,13 @@ impl HerdrGui {
             let _ = window.update(cx, |_, window, cx| {
                 let _ = this.update(cx, |view, cx| {
                     view.state_request_in_flight = false;
+                    if result.is_ok() {
+                        view.reconnect_retry_secs = 2;
+                    } else if reconnecting {
+                        view.reconnect_retry_secs = (view.reconnect_retry_secs * 2).min(30);
+                    }
+                    view.next_state_poll = Instant::now() + Duration::from_secs(view.reconnect_retry_secs);
                     if view.state_generation != generation {
-                        if view.client.is_none() {
-                            view.request_state(window, cx, false);
-                        }
                         return;
                     }
                     match result {
@@ -532,11 +602,11 @@ impl HerdrGui {
     fn start_state_polling(window: &mut Window, cx: &mut Context<Self>) {
         let window = window.window_handle();
         cx.spawn(async move |this, cx| loop {
-            cx.background_executor().timer(Duration::from_secs(2)).await;
+            cx.background_executor().timer(Duration::from_secs(1)).await;
             if window
                 .update(cx, |_, window, cx| {
                     this.update(cx, |view, cx| {
-                        if view.client.is_some() {
+                        if Instant::now() >= view.next_state_poll {
                             view.request_state(window, cx, false);
                         }
                     })
@@ -555,7 +625,10 @@ impl HerdrGui {
         command: impl FnOnce(&HerdrClient) -> Result<(), herdr::HerdrError> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
-        if self.reconciliation_required || !self.state_valid || self.focus_change_pending {
+        if self.reject_if_focus_pending(cx) {
+            return;
+        }
+        if self.reconciliation_required || !self.state_valid {
             return;
         }
         let Some(client) = self.client.clone() else {
@@ -573,9 +646,10 @@ impl HerdrGui {
             Ok(())
         });
         if result.is_err() {
+            self.discard_pending_input();
             self.reconciliation_required = true;
             self.state_valid = false;
-            self.status = "Command worker unavailable; outcome may be unknown".to_string();
+            self.warn("Command worker unavailable; input may not have been sent; outcome may be unknown; use Refresh to reconcile");
             cx.notify();
             return;
         }
@@ -584,6 +658,26 @@ impl HerdrGui {
         self.state_generation = self.state_generation.wrapping_add(1);
         if changes_focus {
             self.focus_change_pending = true;
+            self.focus_result_confirmed = false;
+            if self.terminal.is_none() {
+                self.terminal_token = self.terminal_token.wrapping_add(1);
+                self.terminal_target = None;
+            }
+        }
+    }
+
+    fn submit_focus(
+        &mut self,
+        target: Option<RecoveryTarget>,
+        command: impl FnOnce(&HerdrClient) -> Result<(), herdr::HerdrError> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let was_pending = self.focus_change_pending;
+        self.submit_command(true, command, cx);
+        if !was_pending && self.focus_change_pending {
+            if let Some(target) = target {
+                self.pending_input.start_recovery(target);
+            }
         }
     }
 
@@ -595,15 +689,16 @@ impl HerdrGui {
                 .await;
             if window
                 .update(cx, |_, window, cx| {
-                    this.update(cx, |view, cx| loop {
+                    this.update(cx, |view, cx| {
+                      loop {
                         let completion = match view.command_worker.try_recv() {
                             Ok(completion) => completion,
                             Err(TryRecvError::Empty) => break,
                             Err(TryRecvError::Disconnected) => {
+                                view.discard_pending_input();
                                 view.reconciliation_required = true;
                                 view.state_valid = false;
-                                view.status = "Command worker unavailable; outcome may be unknown"
-                                    .to_string();
+                                view.warn("Command worker unavailable; buffered input discarded; outcome may be unknown; use Refresh to reconcile");
                                 cx.notify();
                                 break;
                             }
@@ -611,9 +706,6 @@ impl HerdrGui {
                         let Some(result) = view.command_results.pop_front() else {
                             break;
                         };
-                        if result.is_some() {
-                            view.focus_change_pending = false;
-                        }
                         match completion {
                             command_worker::Completion::Finished(Ok(())) => {
                                 if let Some(receiver) = result {
@@ -621,21 +713,43 @@ impl HerdrGui {
                                         if !view.reconciliation_required {
                                             view.state = state;
                                             view.state_valid = true;
+                                            view.focus_result_confirmed = true;
+                                            if !view.pending_input.is_blocked() {
+                                                view.status = "connected".to_string();
+                                            }
+                                            if let Some(warning) = view.pending_input.direction_layout_warning() {
+                                                view.warn(warning);
+                                            }
                                             view.attach_focused_terminal(window, cx);
                                             view.notify_sidebar(cx);
                                         }
+                                    } else {
+                                        view.discard_pending_input();
+                                        view.reconciliation_required = true;
+                                        view.state_valid = false;
+                                        view.warn("Focus result unavailable; input discarded; use Refresh to reconcile");
                                     }
                                 }
                             }
                             command_worker::Completion::Finished(Err(error)) => {
+                                if let Some(warning) = view.pending_input.direction_layout_warning() {
+                                    view.warn(warning);
+                                }
+                                view.discard_pending_input();
                                 view.reconciliation_required = true;
                                 view.state_valid = false;
                                 view.state_generation = view.state_generation.wrapping_add(1);
-                                view.status = format!("{error}; use Refresh to reconcile");
+                                view.warn(format!("{error}; buffered input discarded; use Refresh to reconcile"));
                             }
-                            command_worker::Completion::Skipped => {}
+                            command_worker::Completion::Skipped => {
+                                view.discard_pending_input();
+                            }
                         }
                         cx.notify();
+                      }
+                      if view.refresh_pending {
+                          view.request_state(window, cx, true);
+                      }
                     })
                 })
                 .is_err()
@@ -655,7 +769,40 @@ impl HerdrGui {
     }
 
     fn focus_right(&mut self, _: &FocusRight, _window: &mut Window, cx: &mut Context<Self>) {
-        self.submit_command(true, HerdrClient::focus_right, cx);
+        let expected_pane = Arc::new(Mutex::new(None));
+        let origin = self.focused_pane().and_then(|pane| {
+            Some((
+                pane.pane_id.clone(),
+                pane.tab_id.clone()?,
+                pane.workspace_id.clone(),
+            ))
+        });
+        let target = origin
+            .as_ref()
+            .map(|(pane, tab, workspace)| RecoveryTarget::Direction {
+                previous_pane: pane.clone(),
+                tab: tab.clone(),
+                workspace: workspace.clone(),
+                expected_pane: expected_pane.clone(),
+            })
+            .or(Some(RecoveryTarget::DirectionUnavailable));
+        let inspect_layout = self.pending_input.is_blocked();
+        self.submit_focus(
+            target,
+            move |client| {
+                client.focus_right()?;
+                if let (true, Some((pane, tab, workspace))) = (inspect_layout, origin) {
+                    if let Ok(layout) = client.pane_layout(&pane) {
+                        if let Ok(mut expected) = expected_pane.lock() {
+                            *expected =
+                                rightward_destination(&layout, &pane, &tab, workspace.as_deref());
+                        }
+                    }
+                }
+                Ok(())
+            },
+            cx,
+        );
     }
 
     fn resize_right(&mut self, _: &ResizeRight, _window: &mut Window, cx: &mut Context<Self>) {
@@ -663,6 +810,8 @@ impl HerdrGui {
     }
 
     fn close_pane(&mut self, _: &ClosePane, _window: &mut Window, cx: &mut Context<Self>) {
+        // Herdr 0.9.5 closes the workspace when its last pane closes. A second
+        // workspace.close after focus changes could close an unrelated workspace.
         self.with_first_pane(|client, pane| client.close_pane(&pane.pane_id), cx);
     }
 
@@ -684,6 +833,9 @@ impl HerdrGui {
     }
 
     fn close_tab(&mut self, _: &CloseTab, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reject_if_focus_pending(cx) {
+            return;
+        }
         let tab_id = self.active_tab().map(|tab| tab.tab_id.clone());
         if let Some(tab_id) = tab_id {
             self.submit_command(true, move |client| client.close_tab(&tab_id), cx);
@@ -728,18 +880,25 @@ impl HerdrGui {
     ) {
         self.sidebar_pane
             .update(cx, |pane, cx| pane.close_spaces(cx));
-        self.submit_command(
-            true,
+        self.submit_focus(
+            Some(RecoveryTarget::Workspace(workspace_id.clone())),
             move |client| client.focus_workspace(&workspace_id),
             cx,
         );
     }
 
     fn focus_tab_id(&mut self, tab_id: String, _window: &mut Window, cx: &mut Context<Self>) {
-        self.submit_command(true, move |client| client.focus_tab(&tab_id), cx);
+        self.submit_focus(
+            Some(RecoveryTarget::Tab(tab_id.clone())),
+            move |client| client.focus_tab(&tab_id),
+            cx,
+        );
     }
 
     fn focus_tab_offset(&mut self, offset: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.reject_if_focus_pending(cx) {
+            return;
+        }
         let tabs = self.visible_tabs();
         if tabs.is_empty() {
             return;
@@ -762,6 +921,9 @@ impl HerdrGui {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.reject_if_focus_pending(cx) {
+            return;
+        }
         if self.state.workspaces.is_empty() {
             return;
         }
@@ -787,8 +949,37 @@ impl HerdrGui {
     }
 
     fn focus_pane_id(&mut self, pane_id: String, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.state_valid
+            && !self.focus_change_pending
+            && !self.pending_input.is_blocked()
+            && self
+                .focused_pane()
+                .is_some_and(|pane| pane.pane_id == pane_id)
+        {
+            return;
+        }
         self.reset_terminal_scroll_state();
-        self.submit_command(true, move |client| client.focus_pane(&pane_id), cx);
+        self.submit_focus(
+            Some(RecoveryTarget::Pane(pane_id.clone())),
+            move |client| client.focus_pane(&pane_id),
+            cx,
+        );
+    }
+
+    fn warn(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.status = message.clone();
+        self.warnings.record(message);
+    }
+
+    fn reject_if_focus_pending(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.focus_change_pending || self.reconciliation_required {
+            return false;
+        }
+        self.pending_input.reject_focus();
+        self.warn("Action not sent while focus is changing; buffered input discarded. Input is blocked; after the transition finishes, choose the desired focus again.");
+        cx.notify();
+        true
     }
 
     fn focus_target(
@@ -799,8 +990,12 @@ impl HerdrGui {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.submit_command(
-            true,
+        self.submit_focus(
+            Some(RecoveryTarget::Agent {
+                pane: pane_id.clone(),
+                tab: tab_id.clone(),
+                workspace: workspace_id.clone(),
+            }),
             move |client| {
                 if let Some(workspace_id) = workspace_id {
                     client.focus_workspace(&workspace_id)?;
@@ -958,6 +1153,13 @@ impl HerdrGui {
             self.terminal_target = None;
             self.pending_vt.clear();
             self.set_terminal_frame(Arc::new(TerminalFrame::default()), cx);
+            if self.focus_result_confirmed {
+                if let Some(warning) = self.pending_input.direction_warning() {
+                    self.warn(warning);
+                }
+                self.discard_pending_input();
+                self.warn("Focused pane unavailable; buffered input discarded");
+            }
             return;
         }
         let target = match target {
@@ -966,6 +1168,9 @@ impl HerdrGui {
         };
         if self.terminal_target.as_deref() == Some(target.as_str()) {
             self.sync_terminal_geometry(window, cx);
+            if self.terminal.is_some() {
+                self.flush_pending_input(self.terminal_token, cx);
+            }
             return;
         }
         self.terminal_token = self.terminal_token.wrapping_add(1);
@@ -1001,6 +1206,14 @@ impl HerdrGui {
                 }
                 if view.focused_pane().map(|pane| &pane.pane_id) != expected_pane.as_ref() {
                     view.terminal_target = None;
+                    if view.focus_change_pending && view.focus_result_confirmed {
+                        if let Some(warning) = view.pending_input.direction_warning() {
+                            view.warn(warning);
+                        }
+                        view.discard_pending_input();
+                        view.warn("Focused pane changed during attachment; buffered input discarded; use Refresh");
+                        cx.notify();
+                    }
                     return;
                 }
                 match result {
@@ -1011,13 +1224,19 @@ impl HerdrGui {
                         if let Some(receiver) = session.output.take() {
                             view.terminal = Some(Arc::new(Mutex::new(session)));
                             view.terminal_size = Some(size);
-                            if !view.reconciliation_required {
+                            if !view.reconciliation_required && !view.pending_input.is_blocked() {
                                 view.status = "connected".to_string();
                             }
                             poll_terminal(receiver, token, cx);
+                            view.flush_pending_input(token, cx);
+                        } else {
+                            view.discard_pending_input();
+                            view.terminal_target = None;
+                            view.warn("Terminal attachment failed; buffered input discarded");
                         }
                     }
                     Err(err) => {
+                        view.discard_pending_input();
                         view.terminal_target = None;
                         view.terminal_size = None;
                         view.set_terminal_frame(
@@ -1032,9 +1251,7 @@ impl HerdrGui {
                             }),
                             cx,
                         );
-                        if !view.reconciliation_required {
-                            view.status = err;
-                        }
+                        view.warn(format!("Terminal attachment failed: {err}; buffered input discarded"));
                     }
                 }
                 cx.notify();
@@ -1048,27 +1265,19 @@ impl HerdrGui {
         f: impl FnOnce(&HerdrClient, &Pane) -> Result<(), herdr::HerdrError> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
+        if self.reject_if_focus_pending(cx) {
+            return;
+        }
         if let Some(pane) = self.focused_pane().cloned() {
             self.submit_command(true, move |client| f(client, &pane), cx);
+        } else {
+            self.warn("Action not sent; focused pane is not uniquely confirmed");
+            cx.notify();
         }
     }
 
     fn focused_pane(&self) -> Option<&Pane> {
-        if let Some(focused_id) = self.state.focused_pane_id.as_deref() {
-            if let Some(pane) = self
-                .state
-                .panes
-                .iter()
-                .find(|pane| pane.pane_id == focused_id)
-            {
-                return Some(pane);
-            }
-        }
-        self.state
-            .panes
-            .iter()
-            .find(|pane| pane.focused)
-            .or_else(|| self.state.panes.first())
+        focused_pane_in_state(&self.state)
     }
 
     fn attached_focused_pane(&self) -> Option<&Pane> {
@@ -1080,14 +1289,103 @@ impl HerdrGui {
         (self.terminal.is_some() && self.terminal_target.as_deref() == Some(target)).then_some(pane)
     }
 
+    fn discard_pending_input(&mut self) {
+        self.pending_input.discard();
+        self.focus_change_pending = false;
+        self.focus_result_confirmed = false;
+    }
+
+    fn flush_pending_input(&mut self, token: u64, cx: &mut Context<Self>) {
+        if !self.focus_change_pending
+            || !self.focus_result_confirmed
+            || self.reconciliation_required
+        {
+            return;
+        }
+        let Some(pane) = self.focused_pane() else {
+            if let Some(warning) = self.pending_input.direction_warning() {
+                self.warn(warning);
+            }
+            self.discard_pending_input();
+            self.warn("Focused pane unavailable or ambiguous; buffered input discarded");
+            cx.notify();
+            return;
+        };
+        let target = pane.terminal_id.as_deref().unwrap_or(&pane.pane_id);
+        if self.terminal.is_none() {
+            return;
+        }
+        let pane_id = pane.pane_id.clone();
+        let tab_id = pane.tab_id.clone();
+        let workspace_id = pane.workspace_id.clone();
+        let target = target.to_string();
+        let Some((pane_id, mut inputs)) = self.pending_input.take_ready(
+            true,
+            &pane_id,
+            &target,
+            self.terminal_target.as_deref(),
+            token,
+            self.terminal_token,
+        ) else {
+            return;
+        };
+        self.focus_change_pending = false;
+        self.focus_result_confirmed = false;
+        let was_blocked = self.pending_input.is_blocked();
+        if let Some(warning) = self.pending_input.finish_recovery(FocusSnapshot {
+            pane: &pane_id,
+            tab: tab_id.as_deref(),
+            workspace: workspace_id.as_deref(),
+        }) {
+            self.warn(warning);
+            cx.notify();
+        } else if was_blocked && !self.pending_input.is_blocked() {
+            self.status = "connected".to_string();
+            cx.notify();
+        }
+        while let Some(input) = inputs.pop_front() {
+            self.dispatch_input(input, pane_id.clone(), cx);
+            if self.reconciliation_required {
+                self.warn("Command worker unavailable; buffered input discarded; outcome may be unknown; use Refresh to reconcile");
+                break;
+            }
+        }
+    }
+
+    fn send_input(&mut self, input: PendingInput, cx: &mut Context<Self>) {
+        if self.reconciliation_required {
+            self.warn("Input not sent; outcome may be unknown; use Refresh to reconcile");
+            cx.notify();
+        } else if self.pending_input.is_blocked() {
+            self.warn("Input not sent; choose the desired focus after the transition finishes");
+            cx.notify();
+        } else if self.focus_change_pending {
+            self.pending_input.push(input);
+        } else if let Some(pane) = self.attached_focused_pane() {
+            self.dispatch_input(input, pane.pane_id.clone(), cx);
+        } else {
+            self.warn("Input not sent; no confirmed terminal attachment");
+            cx.notify();
+        }
+    }
+
+    fn dispatch_input(&mut self, input: PendingInput, pane_id: String, cx: &mut Context<Self>) {
+        self.submit_command(
+            false,
+            move |client| match input {
+                PendingInput::Key(key) => client.send_key(&pane_id, &key),
+                PendingInput::Text(text) => client.send_text(&pane_id, &text),
+                PendingInput::Paste(text) => client.paste_text(&pane_id, &text),
+            },
+            cx,
+        );
+    }
+
     fn handle_keystroke(&mut self, key: &Keystroke, cx: &mut Context<Self>) {
         if should_swallow_gui_keystroke(key) {
             return;
         }
 
-        let Some(pane) = self.attached_focused_pane().cloned() else {
-            return;
-        };
         // NAMED keys always send as key events, not text.
         // Enter as text=\n gets misinterpreted by the terminal (e.g. as shift+enter).
         let is_named = matches!(
@@ -1107,16 +1405,12 @@ impl HerdrGui {
                 | "pagedown"
                 | "insert"
         );
-        let pane_id = pane.pane_id;
         if key.modifiers.alt || key.modifiers.platform || key.modifiers.control || is_named {
-            let key_str = key_name(key);
-            self.submit_command(false, move |client| client.send_key(&pane_id, &key_str), cx);
+            self.send_input(PendingInput::Key(key_name(key)), cx);
         } else if let Some(text) = key.key_char.as_deref() {
-            let text = text.to_string();
-            self.submit_command(false, move |client| client.send_text(&pane_id, &text), cx);
+            self.send_input(PendingInput::Text(text.to_string()), cx);
         } else {
-            let key_str = key_name(key);
-            self.submit_command(false, move |client| client.send_key(&pane_id, &key_str), cx);
+            self.send_input(PendingInput::Key(key_name(key)), cx);
         }
     }
 
@@ -1457,13 +1751,57 @@ impl HerdrGui {
             .flex_col()
             .overflow_hidden()
             .ml(px((self.swipe_progress * 28.0) as f32))
-            .when(self.reconciliation_required, |el| {
+            .when(self.pending_input.is_blocked(), |el| {
                 el.child(
                     div()
                         .px_3()
                         .py_2()
                         .text_color(rgb(theme.label))
-                        .child(self.status.clone()),
+                        .child("Input blocked. After the current transition finishes, choose the desired focus again."),
+                )
+            })
+            .when(
+                self.reconciliation_required && !self.warnings.messages().contains(&self.status),
+                |el| {
+                    el.child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .text_color(rgb(theme.label))
+                            .child(self.status.clone()),
+                    )
+                },
+            )
+            .when(!self.warnings.messages().is_empty(), |el| {
+                el.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .flex()
+                        .items_start()
+                        .gap_2()
+                        .text_color(rgb(theme.label))
+                        .child(
+                            div().flex_1().flex().flex_col().children(
+                                self.warnings
+                                    .messages()
+                                    .iter()
+                                    .cloned()
+                                    .map(|message| div().child(message)),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.warnings.dismiss_all();
+                                        cx.notify();
+                                    }),
+                                )
+                                .child("Dismiss"),
+                        ),
                 )
             })
             .child(self.pane_grid(panes, pane_frame, theme, cx))
@@ -2672,6 +3010,80 @@ fn poll_terminal(receiver: Receiver<Vec<u8>>, token: u64, cx: &mut Context<Herdr
         }
     })
     .detach();
+}
+
+#[cfg(test)]
+mod focus_state_tests {
+    use super::{focused_pane_in_state, rightward_destination, HerdrState, Pane};
+    use crate::herdr::{PaneLayout, PaneLayoutPane, PaneLayoutRect};
+
+    #[test]
+    fn direction_recovery_requires_matching_rightward_layout() {
+        let mut layout = PaneLayout {
+            workspace_id: "w".into(),
+            tab_id: "t".into(),
+            zoomed: false,
+            area: PaneLayoutRect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 20,
+            },
+            focused_pane_id: "C".into(),
+            panes: vec![
+                PaneLayoutPane {
+                    pane_id: "B".into(),
+                    focused: false,
+                    rect: PaneLayoutRect {
+                        x: 0,
+                        y: 0,
+                        width: 40,
+                        height: 20,
+                    },
+                },
+                PaneLayoutPane {
+                    pane_id: "C".into(),
+                    focused: true,
+                    rect: PaneLayoutRect {
+                        x: 40,
+                        y: 0,
+                        width: 40,
+                        height: 20,
+                    },
+                },
+            ],
+        };
+        assert_eq!(
+            rightward_destination(&layout, "B", "t", Some("w")).as_deref(),
+            Some("C")
+        );
+        assert!(rightward_destination(&layout, "B", "other", Some("w")).is_none());
+        layout.panes[1].rect.x = 0;
+        assert!(rightward_destination(&layout, "B", "t", Some("w")).is_none());
+        layout.panes[1].rect.x = 40;
+        layout.focused_pane_id = "B".into();
+        assert!(rightward_destination(&layout, "B", "t", Some("w")).is_none());
+    }
+
+    #[test]
+    fn input_focus_ignores_fabricated_or_conflicting_ids() -> Result<(), serde_json::Error> {
+        let first: Pane = serde_json::from_value(serde_json::json!({"pane_id": "first"}))?;
+        let second: Pane = serde_json::from_value(serde_json::json!({"pane_id": "second"}))?;
+        let mut state = HerdrState {
+            focused_pane_id: Some("first".into()),
+            panes: vec![first, second],
+            ..HerdrState::default()
+        };
+        assert!(focused_pane_in_state(&state).is_none());
+        state.panes[1].focused = true;
+        assert_eq!(
+            focused_pane_in_state(&state).map(|pane| pane.pane_id.as_str()),
+            Some("second")
+        );
+        state.panes[0].focused = true;
+        assert!(focused_pane_in_state(&state).is_none());
+        Ok(())
+    }
 }
 
 #[cfg(test)]
