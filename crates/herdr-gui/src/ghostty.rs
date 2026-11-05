@@ -28,6 +28,29 @@ pub struct TerminalFrame {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TerminalLine {
     pub runs: Vec<TerminalRun>,
+    /// Inclusive viewport column range selected on this row.
+    pub selection: Option<(u16, u16)>,
+    /// One entry per grid cell, including blank cells and wide spacers.
+    pub cells: Vec<TerminalCell>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalCell {
+    pub column: u16,
+    /// Glyph width in columns; spacer entries still occupy one grid cell.
+    pub span: u16,
+    pub kind: TerminalCellKind,
+    pub text: String,
+    pub fg: u32,
+    pub bg: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalCellKind {
+    Narrow,
+    Wide,
+    SpacerTail,
+    SpacerHead,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -43,6 +66,18 @@ pub struct GhosttyTerminal {
     render_state: GhosttyRenderStateHandle,
     row_iterator: GhosttyRowIteratorHandle,
     row_cells: GhosttyRowCellsHandle,
+    drag_anchor: Option<DragAnchor>,
+}
+
+struct DragAnchor {
+    handle: *mut c_void,
+    screen: u32,
+}
+
+impl Drop for DragAnchor {
+    fn drop(&mut self) {
+        unsafe { ghostty_tracked_grid_ref_free(self.handle) }
+    }
 }
 
 type GhosttyResult = i32;
@@ -55,9 +90,11 @@ type GhosttyCell = u64;
 const GHOSTTY_SUCCESS: GhosttyResult = 0;
 const GHOSTTY_INVALID_VALUE: GhosttyResult = -2;
 const GHOSTTY_NO_VALUE: GhosttyResult = -4;
+const GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN: u32 = 6;
 const GHOSTTY_TERMINAL_DATA_COLOR_BACKGROUND_DEFAULT: u32 = 23;
 const RENDER_STATE_DATA_ROW_ITERATOR: u32 = 4;
 const RENDER_STATE_ROW_DATA_CELLS: u32 = 3;
+const RENDER_STATE_ROW_DATA_SELECTION: u32 = 4;
 const ROW_CELLS_DATA_RAW: u32 = 1;
 const ROW_CELLS_DATA_GRAPHEMES_LEN: u32 = 3;
 const ROW_CELLS_DATA_GRAPHEMES_BUF: u32 = 4;
@@ -70,6 +107,8 @@ const RENDER_STATE_DATA_CURSOR_VIEWPORT_Y: u32 = 16;
 const CELL_DATA_CODEPOINT: u32 = 1;
 const CELL_DATA_WIDE: u32 = 3;
 const CELL_DATA_HAS_TEXT: u32 = 4;
+const CELL_WIDE_NARROW: u32 = 0;
+const CELL_WIDE_WIDE: u32 = 1;
 const CELL_WIDE_SPACER_TAIL: u32 = 2;
 const CELL_WIDE_SPACER_HEAD: u32 = 3;
 const DEFAULT_FG: u32 = 0xc5ceda;
@@ -87,6 +126,89 @@ struct GhosttyColorRgb {
     r: u8,
     g: u8,
     b: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GridRef {
+    size: usize,
+    node: *mut c_void,
+    x: u16,
+    y: u16,
+}
+
+impl Default for GridRef {
+    fn default() -> Self {
+        Self {
+            size: std::mem::size_of::<Self>(),
+            node: ptr::null_mut(),
+            x: 0,
+            y: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct Selection {
+    size: usize,
+    start: GridRef,
+    end: GridRef,
+    rectangle: bool,
+}
+
+impl Selection {
+    fn new() -> Self {
+        Self {
+            size: std::mem::size_of::<Self>(),
+            ..Self::default()
+        }
+    }
+}
+
+#[repr(C)]
+struct PointCoordinate {
+    x: u16,
+    y: u32,
+}
+
+#[repr(C)]
+union PointValue {
+    coordinate: std::mem::ManuallyDrop<PointCoordinate>,
+    padding: [u64; 2],
+}
+
+#[repr(C)]
+struct Point {
+    tag: u32,
+    value: PointValue,
+}
+
+impl Point {
+    fn viewport(x: u16, y: u16) -> Self {
+        Self {
+            tag: 1,
+            value: PointValue {
+                coordinate: std::mem::ManuallyDrop::new(PointCoordinate { x, y: y.into() }),
+            },
+        }
+    }
+}
+
+#[repr(C)]
+struct SelectionFormatOptions {
+    size: usize,
+    emit: u32,
+    unwrap: bool,
+    trim: bool,
+    selection: *const Selection,
+}
+
+#[repr(C)]
+struct RowSelection {
+    size: usize,
+    start_x: u16,
+    end_x: u16,
 }
 
 type GhosttyTerminalNew =
@@ -115,6 +237,31 @@ type GhosttyRowCellsGet = unsafe extern "C" fn(GhosttyRowCellsHandle, u32, *mut 
 type GhosttyCellGet = unsafe extern "C" fn(GhosttyCell, u32, *mut c_void) -> i32;
 
 extern "C" {
+    fn ghostty_terminal_grid_ref_track(
+        terminal: GhosttyTerminalHandle,
+        point: Point,
+        out: *mut *mut c_void,
+    ) -> i32;
+    fn ghostty_tracked_grid_ref_snapshot(reference: *mut c_void, out: *mut GridRef) -> i32;
+    fn ghostty_tracked_grid_ref_free(reference: *mut c_void);
+    fn ghostty_terminal_grid_ref(
+        terminal: GhosttyTerminalHandle,
+        point: Point,
+        out: *mut GridRef,
+    ) -> i32;
+    fn ghostty_terminal_set(
+        terminal: GhosttyTerminalHandle,
+        option: u32,
+        value: *const c_void,
+    ) -> i32;
+    fn ghostty_terminal_select_all(terminal: GhosttyTerminalHandle, out: *mut Selection) -> i32;
+    fn ghostty_terminal_selection_format_buf(
+        terminal: GhosttyTerminalHandle,
+        options: SelectionFormatOptions,
+        buf: *mut u8,
+        len: usize,
+        written: *mut usize,
+    ) -> i32;
     fn ghostty_terminal_new(
         config: *const c_void,
         terminal: *mut GhosttyTerminalHandle,
@@ -396,6 +543,59 @@ impl TerminalSession {
         self.terminal.frame()
     }
 
+    /// Begin a cell drag at a viewport column and row; no selection is installed yet.
+    #[allow(dead_code)]
+    pub fn begin_selection_drag(&mut self, point: (u16, u16)) -> Result<(), String> {
+        self.terminal.begin_selection_drag(point)
+    }
+
+    /// Extend the active drag to a viewport cell. False means the anchor was lost
+    /// or cancelled, including when another screen is active.
+    #[allow(dead_code)]
+    pub fn update_selection_drag(
+        &mut self,
+        point: (u16, u16),
+        rectangle: bool,
+    ) -> Result<bool, String> {
+        self.terminal.update_selection_drag(point, rectangle)
+    }
+
+    /// End the drag without clearing its installed selection.
+    #[allow(dead_code)]
+    pub fn end_selection_drag(&mut self) {
+        self.terminal.end_selection_drag();
+    }
+
+    #[allow(dead_code)]
+    pub fn select_viewport(
+        &mut self,
+        start: (u16, u16),
+        end: (u16, u16),
+        rectangle: bool,
+    ) -> Result<(), String> {
+        self.terminal.select_viewport(start, end, rectangle)
+    }
+
+    #[allow(dead_code)]
+    pub fn select_all(&mut self) -> Result<bool, String> {
+        self.terminal.select_all()
+    }
+
+    #[allow(dead_code)]
+    pub fn clear_selection(&mut self) -> Result<(), String> {
+        self.terminal.clear_selection()
+    }
+
+    #[allow(dead_code)]
+    pub fn copy_selection(&self) -> Result<Option<String>, String> {
+        self.terminal.copy_selection()
+    }
+
+    #[allow(dead_code)]
+    pub fn selection_rows(&mut self) -> Result<Vec<Option<(u16, u16)>>, String> {
+        self.terminal.selection_rows()
+    }
+
     /// Feed VT bytes without extracting a paint frame (cheap).
     pub fn write_bytes(&mut self, data: &[u8]) {
         self.terminal.write(data);
@@ -475,6 +675,7 @@ impl GhosttyTerminal {
             render_state,
             row_iterator,
             row_cells,
+            drag_anchor: None,
         })
     }
 
@@ -482,6 +683,175 @@ impl GhosttyTerminal {
         unsafe {
             (self.api.terminal_vt_write)(self.terminal, bytes.as_ptr(), bytes.len());
         }
+    }
+
+    pub fn begin_selection_drag(&mut self, point: (u16, u16)) -> Result<(), String> {
+        self.end_selection_drag();
+        let screen = self.active_screen()?;
+        let mut handle = ptr::null_mut();
+        let result = unsafe {
+            ghostty_terminal_grid_ref_track(
+                self.terminal,
+                Point::viewport(point.0, point.1),
+                &mut handle,
+            )
+        };
+        if result != GHOSTTY_SUCCESS {
+            return Err(format!("ghostty_terminal_grid_ref_track failed: {result}"));
+        }
+        self.drag_anchor = Some(DragAnchor { handle, screen });
+        Ok(())
+    }
+
+    pub fn update_selection_drag(
+        &mut self,
+        point: (u16, u16),
+        rectangle: bool,
+    ) -> Result<bool, String> {
+        let Some(anchor) = self.drag_anchor.as_ref() else {
+            return Ok(false);
+        };
+        let screen = anchor.screen;
+        let handle = anchor.handle;
+        if self.active_screen()? != screen {
+            self.end_selection_drag();
+            return Ok(false);
+        }
+        let mut selection = Selection::new();
+        let result = unsafe { ghostty_tracked_grid_ref_snapshot(handle, &mut selection.start) };
+        if result == GHOSTTY_NO_VALUE {
+            self.end_selection_drag();
+            return Ok(false);
+        }
+        if result != GHOSTTY_SUCCESS {
+            return Err(format!(
+                "ghostty_tracked_grid_ref_snapshot failed: {result}"
+            ));
+        }
+        let result = unsafe {
+            ghostty_terminal_grid_ref(
+                self.terminal,
+                Point::viewport(point.0, point.1),
+                &mut selection.end,
+            )
+        };
+        if result != GHOSTTY_SUCCESS {
+            return Err(format!("ghostty_terminal_grid_ref failed: {result}"));
+        }
+        selection.rectangle = rectangle;
+        self.install_selection(Some(&selection))?;
+        Ok(true)
+    }
+
+    pub fn end_selection_drag(&mut self) {
+        self.drag_anchor = None;
+    }
+
+    fn active_screen(&self) -> Result<u32, String> {
+        let mut screen = 0_u32;
+        let result = unsafe {
+            (self.api.terminal_get)(
+                self.terminal,
+                GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN,
+                (&mut screen as *mut u32).cast(),
+            )
+        };
+        if result == GHOSTTY_SUCCESS {
+            Ok(screen)
+        } else {
+            Err(format!("ghostty active screen failed: {result}"))
+        }
+    }
+
+    pub fn select_viewport(
+        &mut self,
+        start: (u16, u16),
+        end: (u16, u16),
+        rectangle: bool,
+    ) -> Result<(), String> {
+        let mut selection = Selection::new();
+        for (point, out) in [(start, &mut selection.start), (end, &mut selection.end)] {
+            let result = unsafe {
+                ghostty_terminal_grid_ref(self.terminal, Point::viewport(point.0, point.1), out)
+            };
+            if result != GHOSTTY_SUCCESS {
+                return Err(format!("ghostty_terminal_grid_ref failed: {result}"));
+            }
+        }
+        selection.rectangle = rectangle;
+        self.install_selection(Some(&selection))
+    }
+
+    pub fn select_all(&mut self) -> Result<bool, String> {
+        let mut selection = Selection::new();
+        let result = unsafe { ghostty_terminal_select_all(self.terminal, &mut selection) };
+        if result == GHOSTTY_NO_VALUE {
+            return Ok(false);
+        }
+        if result != GHOSTTY_SUCCESS {
+            return Err(format!("ghostty_terminal_select_all failed: {result}"));
+        }
+        self.install_selection(Some(&selection))?;
+        Ok(true)
+    }
+
+    pub fn clear_selection(&mut self) -> Result<(), String> {
+        self.end_selection_drag();
+        self.install_selection(None)
+    }
+
+    fn install_selection(&mut self, selection: Option<&Selection>) -> Result<(), String> {
+        // Ghostty copies the snapshot into terminal-owned tracked endpoints during this call.
+        let value = selection.map_or(ptr::null(), |s| (s as *const Selection).cast());
+        let result = unsafe { ghostty_terminal_set(self.terminal, 21, value) };
+        if result == GHOSTTY_SUCCESS {
+            Ok(())
+        } else {
+            Err(format!("ghostty_terminal_set selection failed: {result}"))
+        }
+    }
+
+    pub fn copy_selection(&self) -> Result<Option<String>, String> {
+        let options = || SelectionFormatOptions {
+            size: std::mem::size_of::<SelectionFormatOptions>(),
+            emit: 0,
+            unwrap: true,
+            trim: true,
+            selection: ptr::null(),
+        };
+        let mut len = 0;
+        let result = unsafe {
+            ghostty_terminal_selection_format_buf(
+                self.terminal,
+                options(),
+                ptr::null_mut(),
+                0,
+                &mut len,
+            )
+        };
+        if result == GHOSTTY_NO_VALUE {
+            return Ok(None);
+        }
+        if result != -3 && result != GHOSTTY_SUCCESS {
+            return Err(format!("ghostty selection size failed: {result}"));
+        }
+        let mut bytes = vec![0; len];
+        let result = unsafe {
+            ghostty_terminal_selection_format_buf(
+                self.terminal,
+                options(),
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                &mut len,
+            )
+        };
+        if result != GHOSTTY_SUCCESS {
+            return Err(format!("ghostty selection format failed: {result}"));
+        }
+        bytes.truncate(len);
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|err| err.to_string())
     }
 
     pub fn scroll(&mut self, rows: isize) {
@@ -569,15 +939,14 @@ impl GhosttyTerminal {
                     "ghostty_render_state_row_get cells failed: {result}"
                 ));
             }
-            let mut line = TerminalLine::default();
+            let mut line = TerminalLine {
+                selection: self.row_selection()?,
+                ..TerminalLine::default()
+            };
             let mut x = 0_u16;
             while unsafe { (self.api.row_cells_next)(self.row_cells) } {
-                let text = self.cell_text()?;
+                let (kind, text) = self.cell_text()?;
                 let cursor_here = cursor.is_some_and(|cursor| cursor == (x, y));
-                x = x.saturating_add(1);
-                if text.is_empty() {
-                    continue;
-                }
                 let (fg, bg) = if cursor_here {
                     (0x0a0a0a, Some(0xf4f4f4))
                 } else {
@@ -587,12 +956,65 @@ impl GhosttyTerminal {
                         terminal_bg(self.cell_color(ROW_CELLS_DATA_BG_COLOR)?, default_bg),
                     )
                 };
-                push_run(&mut line.runs, text, fg, bg);
+                line.cells.push(TerminalCell {
+                    column: x,
+                    span: if kind == TerminalCellKind::Wide { 2 } else { 1 },
+                    kind,
+                    text: text.clone(),
+                    fg,
+                    bg,
+                });
+                x = x.saturating_add(1);
+                if !text.is_empty() {
+                    push_run(&mut line.runs, text, fg, bg);
+                }
             }
             lines.push(line);
             y = y.saturating_add(1);
         }
         Ok(TerminalFrame { lines })
+    }
+
+    pub fn selection_rows(&mut self) -> Result<Vec<Option<(u16, u16)>>, String> {
+        let result = unsafe { (self.api.render_state_update)(self.render_state, self.terminal) };
+        if result != GHOSTTY_SUCCESS {
+            return Err(format!("ghostty render update failed: {result}"));
+        }
+        let result = unsafe {
+            (self.api.render_state_get)(
+                self.render_state,
+                RENDER_STATE_DATA_ROW_ITERATOR,
+                (&mut self.row_iterator as *mut GhosttyRowIteratorHandle).cast(),
+            )
+        };
+        if result != GHOSTTY_SUCCESS {
+            return Err(format!("ghostty row iterator failed: {result}"));
+        }
+        let mut rows = Vec::new();
+        while unsafe { (self.api.row_iterator_next)(self.row_iterator) } {
+            rows.push(self.row_selection()?);
+        }
+        Ok(rows)
+    }
+
+    fn row_selection(&self) -> Result<Option<(u16, u16)>, String> {
+        let mut selection = RowSelection {
+            size: std::mem::size_of::<RowSelection>(),
+            start_x: 0,
+            end_x: 0,
+        };
+        let result = unsafe {
+            (self.api.row_get)(
+                self.row_iterator,
+                RENDER_STATE_ROW_DATA_SELECTION,
+                (&mut selection as *mut RowSelection).cast(),
+            )
+        };
+        match result {
+            GHOSTTY_SUCCESS => Ok(Some((selection.start_x, selection.end_x))),
+            GHOSTTY_NO_VALUE => Ok(None),
+            _ => Err(format!("ghostty row selection failed: {result}")),
+        }
     }
 
     fn cursor(&self) -> Result<Option<(u16, u16)>, String> {
@@ -631,7 +1053,7 @@ impl GhosttyTerminal {
         }
     }
 
-    fn cell_text(&self) -> Result<String, String> {
+    fn cell_text(&self) -> Result<(TerminalCellKind, String), String> {
         let mut raw = GhosttyCell::default();
         let result = unsafe {
             (self.api.row_cells_get)(
@@ -650,8 +1072,18 @@ impl GhosttyTerminal {
         if result != GHOSTTY_SUCCESS {
             return Err(format!("ghostty cell wide failed: {result}"));
         }
-        if wide == CELL_WIDE_SPACER_TAIL || wide == CELL_WIDE_SPACER_HEAD {
-            return Ok(String::new());
+        let kind = match wide {
+            CELL_WIDE_NARROW => TerminalCellKind::Narrow,
+            CELL_WIDE_WIDE => TerminalCellKind::Wide,
+            CELL_WIDE_SPACER_TAIL => TerminalCellKind::SpacerTail,
+            CELL_WIDE_SPACER_HEAD => TerminalCellKind::SpacerHead,
+            _ => return Err(format!("unknown ghostty cell width: {wide}")),
+        };
+        if matches!(
+            kind,
+            TerminalCellKind::SpacerTail | TerminalCellKind::SpacerHead
+        ) {
+            return Ok((kind, String::new()));
         }
 
         let mut len = 0_u32;
@@ -677,10 +1109,15 @@ impl GhosttyTerminal {
             if result != GHOSTTY_SUCCESS {
                 return Err(format!("ghostty row cell grapheme buffer failed: {result}"));
             }
-            return Ok(codepoints
-                .into_iter()
-                .map(|codepoint| char::from_u32(codepoint).unwrap_or(char::REPLACEMENT_CHARACTER))
-                .collect());
+            return Ok((
+                kind,
+                codepoints
+                    .into_iter()
+                    .map(|codepoint| {
+                        char::from_u32(codepoint).unwrap_or(char::REPLACEMENT_CHARACTER)
+                    })
+                    .collect(),
+            ));
         }
 
         let mut has_text = false;
@@ -691,7 +1128,7 @@ impl GhosttyTerminal {
             return Err(format!("ghostty cell has text failed: {result}"));
         }
         if !has_text {
-            return Ok(" ".to_string());
+            return Ok((kind, " ".to_string()));
         }
         let mut codepoint = 0_u32;
         let result = unsafe {
@@ -704,9 +1141,12 @@ impl GhosttyTerminal {
         if result != GHOSTTY_SUCCESS {
             return Err(format!("ghostty cell codepoint failed: {result}"));
         }
-        Ok(char::from_u32(codepoint)
-            .unwrap_or(char::REPLACEMENT_CHARACTER)
-            .to_string())
+        Ok((
+            kind,
+            char::from_u32(codepoint)
+                .unwrap_or(char::REPLACEMENT_CHARACTER)
+                .to_string(),
+        ))
     }
 
     fn cell_color(&self, data: u32) -> Result<Option<u32>, String> {
@@ -728,6 +1168,7 @@ impl GhosttyTerminal {
 
 impl Drop for GhosttyTerminal {
     fn drop(&mut self) {
+        self.end_selection_drag();
         unsafe {
             (self.api.row_cells_free)(self.row_cells);
             (self.api.row_iterator_free)(self.row_iterator);
@@ -813,6 +1254,106 @@ mod tests {
     use super::{
         push_run, terminal_bg, GhosttyRuntime, GhosttyTerminal, TerminalFrame, TerminalLine,
     };
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn drag_anchor_tracks_viewport_scroll() -> Result<(), String> {
+        let mut terminal = GhosttyTerminal::new(GhosttyRuntime::detect()?.load_api()?, 8, 3)?;
+        terminal.write(b"one\r\ntwo\r\nthree\r\nfour");
+        terminal.scroll(-1);
+        terminal.begin_selection_drag((0, 0))?;
+        terminal.write(b"");
+        terminal.scroll(1);
+        assert!(terminal.update_selection_drag((2, 0), false)?);
+        assert_eq!(terminal.copy_selection()?.as_deref(), Some("one\ntwo"));
+        terminal.end_selection_drag();
+        assert!(!terminal.update_selection_drag((0, 0), false)?);
+        assert_eq!(terminal.copy_selection()?.as_deref(), Some("one\ntwo"));
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn drag_survives_output_and_screen_roundtrip() -> Result<(), String> {
+        let mut terminal = GhosttyTerminal::new(GhosttyRuntime::detect()?.load_api()?, 8, 3)?;
+        terminal.write(b"primary");
+        terminal.begin_selection_drag((0, 0))?;
+        terminal.write(b"x");
+        assert!(terminal.update_selection_drag((6, 0), false)?);
+        assert_eq!(terminal.copy_selection()?.as_deref(), Some("primary"));
+        terminal.write(b"\x1b[?1049hother\x1b[?1049l");
+        assert!(terminal.update_selection_drag((6, 0), false)?);
+        assert_eq!(terminal.copy_selection()?.as_deref(), Some("primary"));
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn drag_rejects_anchor_after_screen_reset() -> Result<(), String> {
+        let mut terminal = GhosttyTerminal::new(GhosttyRuntime::detect()?.load_api()?, 8, 3)?;
+        terminal.write(b"\x1b[?1049halternate");
+        terminal.begin_selection_drag((0, 0))?;
+        terminal.write(b"\x1bc\x1b[?1049h");
+        assert!(!terminal.update_selection_drag((1, 0), false)?);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn drag_cancels_when_screen_changes() -> Result<(), String> {
+        let mut terminal = GhosttyTerminal::new(GhosttyRuntime::detect()?.load_api()?, 8, 3)?;
+        terminal.write(b"primary");
+        terminal.begin_selection_drag((0, 0))?;
+        terminal.write(b"\x1b[?1049h");
+        assert!(!terminal.update_selection_drag((0, 0), false)?);
+        terminal.write(b"\x1b[?1049l");
+        assert!(!terminal.update_selection_drag((0, 0), false)?);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn selection_copy_render_and_clear() -> Result<(), String> {
+        let mut terminal = GhosttyTerminal::new(GhosttyRuntime::detect()?.load_api()?, 12, 3)?;
+        terminal.write(b"hello world\r\nsecond");
+        terminal.select_viewport((4, 0), (0, 0), false)?;
+        assert_eq!(terminal.copy_selection()?.as_deref(), Some("hello"));
+        assert_eq!(terminal.selection_rows()?[0], Some((0, 4)));
+        assert_eq!(terminal.frame()?.lines[0].selection, Some((0, 4)));
+        terminal.write(b"!");
+        assert_eq!(terminal.copy_selection()?.as_deref(), Some("hello"));
+        terminal.clear_selection()?;
+        assert_eq!(terminal.copy_selection()?, None);
+        assert!(terminal.selection_rows()?.iter().all(Option::is_none));
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn frame_preserves_cell_columns_and_wide_spacers() -> Result<(), String> {
+        use super::TerminalCellKind;
+
+        let mut terminal = GhosttyTerminal::new(GhosttyRuntime::detect()?.load_api()?, 8, 2)?;
+        terminal.write("a 界b".as_bytes());
+        terminal.select_viewport((1, 0), (3, 0), false)?;
+        let frame = terminal.frame()?;
+        let line = &frame.lines[0];
+        assert_eq!(line.selection, Some((1, 3)));
+        assert_eq!(line.cells.len(), 8);
+        assert_eq!(line.cells[0].text, "a");
+        assert_eq!(line.cells[1].text, " ");
+        assert_eq!(line.cells[2].column, 2);
+        assert_eq!(line.cells[2].text, "界");
+        assert_eq!(line.cells[2].kind, TerminalCellKind::Wide);
+        assert_eq!(line.cells[2].span, 2);
+        assert_eq!(line.cells[3].column, 3);
+        assert_eq!(line.cells[3].kind, TerminalCellKind::SpacerTail);
+        assert!(line.cells[3].text.is_empty());
+        assert_eq!(line.cells[4].column, 4);
+        assert_eq!(line.cells[4].text, "b");
+        assert_eq!(line.cells[7].text, " ");
+        Ok(())
+    }
 
     #[test]
     fn detect_should_find_local_ghostty_checkout() {

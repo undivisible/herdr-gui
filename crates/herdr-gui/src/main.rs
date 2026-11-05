@@ -1,3 +1,5 @@
+mod command_worker;
+mod focus_input;
 mod ghostty;
 mod help;
 mod herdr;
@@ -5,16 +7,18 @@ mod input;
 mod settings;
 mod terminal_view;
 mod theme;
+mod warnings;
 
 use crepuscularity_gpui as gpui;
 use crepuscularity_gpui::prelude::*;
 use crepuscularity_gpui::{
     actions, bounce, bounds, div, gpui_window_options, linear, point, px, rgb, size, AnyElement,
-    AnyView, App, Application, Context, Entity, FocusHandle, Icon, IntoElement, KeyBinding,
-    Keystroke, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render,
-    ScrollDelta, ScrollWheelEvent, SystemMenuType, TitlebarOptions, TouchPhase, Window,
-    WindowAppearance, WindowBounds,
+    AnyView, App, Application, ClipboardItem, Context, Entity, FocusHandle, Icon, IntoElement,
+    KeyBinding, Keystroke, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Render, ScrollDelta, ScrollWheelEvent, SystemMenuType, TitlebarOptions,
+    TouchPhase, Window, WindowAppearance, WindowBounds,
 };
+use focus_input::{FocusSnapshot, InputBuffer, PendingInput, RecoveryTarget};
 use ghostty::{TerminalFrame, TerminalLine, TerminalRun, TerminalSession};
 use help::help_overlay;
 use herdr::{Agent, HerdrClient, HerdrState, Pane, Tab, Workspace};
@@ -22,6 +26,7 @@ use input::{key_name, should_swallow_gui_keystroke};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{
+    collections::VecDeque,
     sync::mpsc::{Receiver, TryRecvError},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -34,6 +39,7 @@ actions!(
         ToggleHelp,
         Refresh,
         Paste,
+        CopySelection,
         SplitRight,
         SplitDown,
         FocusRight,
@@ -98,22 +104,69 @@ enum ThemeMode {
     SystemLight,
 }
 
+fn focused_pane_in_state(state: &HerdrState) -> Option<&Pane> {
+    focus_input::unique_focused(&state.panes, |pane| pane.focused)
+}
+
+fn rightward_destination(
+    layout: &herdr::PaneLayout,
+    origin: &str,
+    tab: &str,
+    workspace: Option<&str>,
+) -> Option<String> {
+    if layout.tab_id != tab || workspace.is_some_and(|id| layout.workspace_id != id) {
+        return None;
+    }
+    let source = layout.panes.iter().find(|pane| pane.pane_id == origin)?;
+    let destination = focus_input::unique_focused(&layout.panes, |pane| pane.focused)?;
+    let source_rect = source.rect;
+    let dest_rect = destination.rect;
+    let right = u32::from(source_rect.x) + u32::from(source_rect.width);
+    let source_bottom = u32::from(source_rect.y) + u32::from(source_rect.height);
+    let dest_bottom = u32::from(dest_rect.y) + u32::from(dest_rect.height);
+    (destination.pane_id == layout.focused_pane_id
+        && destination.pane_id != origin
+        && u32::from(dest_rect.x) >= right
+        && u32::from(dest_rect.y) < source_bottom
+        && u32::from(source_rect.y) < dest_bottom)
+        .then(|| destination.pane_id.clone())
+}
+
 struct HerdrGui {
     client: Option<HerdrClient>,
+    command_worker: command_worker::CommandWorker,
+    command_results: VecDeque<Option<Receiver<HerdrState>>>,
+    focus_change_pending: bool,
+    focus_result_confirmed: bool,
+    pending_input: InputBuffer,
+    reconciliation_required: bool,
+    state_request_in_flight: bool,
+    refresh_pending: bool,
+    reconnect_retry_secs: u64,
+    next_state_poll: Instant,
+    bootstrap_attempted: bool,
+    state_generation: u64,
+    state_valid: bool,
     terminal: Option<Arc<Mutex<TerminalSession>>>,
     terminal_target: Option<String>,
     terminal_size: Option<TerminalSize>,
+    terminal_resize_in_flight: bool,
     terminal_token: u64,
     terminal_frame: Arc<TerminalFrame>,
     terminal_pane: Entity<TerminalPane>,
+    selection_drag: Option<(u64, (u16, u16), bool)>,
+    selection_queue: SelectionQueue,
+    terminal_revision: u64,
     last_terminal_frame_at: Option<Instant>,
     terminal_pending_frame: bool,
+    terminal_force_frame: bool,
     terminal_frame_in_flight: bool,
     /// VT bytes waiting while ghostty frame() holds the session lock.
     pending_vt: Vec<u8>,
     terminal_bg: u32,
     state: HerdrState,
     status: String,
+    warnings: warnings::Warnings,
     show_help: bool,
     /// Full sidebar chrome as own entity — spaces toggle must not dirty root/terminal.
     sidebar_pane: Entity<SidebarPane>,
@@ -186,20 +239,7 @@ impl SidebarAnimation {
 const SIDEBAR_MIN_WIDTH: f64 = 180.0;
 const SIDEBAR_MAX_WIDTH: f64 = 360.0;
 const SIDEBAR_COLLAPSED_WIDTH: f64 = 6.0;
-const TERMINAL_MIN_WIDTH: f64 = 320.0;
-const TERMINAL_MIN_HEIGHT: f64 = 240.0;
-const TERMINAL_CELL_WIDTH: f64 = 7.2;
 const TERMINAL_CELL_HEIGHT: f64 = 18.0;
-const TERMINAL_MIN_COLS: f64 = 40.0;
-const TERMINAL_MAX_COLS: f64 = 500.0;
-const TERMINAL_MIN_ROWS: f64 = 12.0;
-const TERMINAL_MAX_ROWS: f64 = 180.0;
-const RESIZE_HANDLE_WIDTH: f64 = 4.0;
-/// Unified titlebar above GPUI content (macOS).
-#[cfg(target_os = "macos")]
-const MACOS_TITLEBAR_HEIGHT: f64 = 28.0;
-#[cfg(not(target_os = "macos"))]
-const MACOS_TITLEBAR_HEIGHT: f64 = 0.0;
 const TOP_TAB_BAR_HEIGHT: f64 = 34.0;
 /// macOS traffic-light cluster width + inset; keeps Arc top tabs aligned with sidebar.
 const TRAFFIC_LIGHT_INSET_X: f64 = 78.0;
@@ -210,15 +250,122 @@ const TRAFFIC_LIGHT_Y: f64 = 8.0;
 
 type TerminalSize = (u16, u16, u16, u16);
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SelectionCommand {
+    Begin((f64, f64)),
+    Move((f64, f64), bool),
+    End,
+    Copy,
+}
+
+#[derive(Default)]
+struct SelectionQueue {
+    target: Option<(u64, String)>,
+    commands: VecDeque<SelectionCommand>,
+    pointer_down: bool,
+    revision: Option<u64>,
+    geometry: Option<terminal_view::geometry::TerminalGeometry>,
+    deadline: Option<Instant>,
+}
+
+impl SelectionQueue {
+    fn push(&mut self, token: u64, target: &str, command: SelectionCommand) {
+        if self
+            .target
+            .as_ref()
+            .is_some_and(|id| id.0 != token || id.1 != target)
+        {
+            *self = Self::default();
+        }
+        self.target = Some((token, target.to_string()));
+        match command {
+            SelectionCommand::Begin(_) => self.pointer_down = true,
+            SelectionCommand::Move(_, _) if !self.pointer_down => return,
+            SelectionCommand::Move(_, _)
+                if matches!(self.commands.back(), Some(SelectionCommand::Move(_, _))) =>
+            {
+                self.commands.pop_back();
+            }
+            SelectionCommand::End if !self.pointer_down => return,
+            SelectionCommand::End => self.pointer_down = false,
+            _ => {}
+        }
+        if self.deadline.is_none() {
+            self.deadline = Some(Instant::now() + Duration::from_secs(1));
+        }
+        self.commands.push_back(command);
+    }
+
+    fn matches_frame(
+        &self,
+        revision: u64,
+        geometry: Option<terminal_view::geometry::TerminalGeometry>,
+    ) -> bool {
+        self.revision == Some(revision) && self.geometry == geometry && geometry.is_some()
+    }
+
+    fn next(
+        &mut self,
+        token: u64,
+        target: Option<&str>,
+        frame_current: bool,
+        revision: u64,
+        geometry: Option<terminal_view::geometry::TerminalGeometry>,
+        now: Instant,
+    ) -> Result<Option<SelectionCommand>, ()> {
+        if self
+            .target
+            .as_ref()
+            .is_none_or(|(queued_token, queued_target)| {
+                *queued_token != token || Some(queued_target.as_str()) != target
+            })
+            || !self.matches_frame(revision, geometry)
+            || self.deadline.is_some_and(|deadline| now >= deadline)
+        {
+            return Err(());
+        }
+        Ok(frame_current
+            .then(|| self.commands.front().copied())
+            .flatten())
+    }
+}
+
+fn terminal_frame_due(
+    force: bool,
+    scroll_rows: isize,
+    due: bool,
+    scroll_active: bool,
+    pending_output: bool,
+) -> Option<bool> {
+    if scroll_active && !pending_output && scroll_rows == 0 && !force {
+        return None;
+    }
+    Some(force || scroll_rows != 0 || due)
+}
+
+#[derive(Default)]
+struct SelectionFrameStatus {
+    painted: bool,
+    size_matches: bool,
+    pending_output: bool,
+    pending_scroll: bool,
+    frame_in_flight: bool,
+    resize_in_flight: bool,
+}
+
+impl SelectionFrameStatus {
+    fn current(&self) -> bool {
+        self.painted
+            && self.size_matches
+            && !self.pending_output
+            && !self.pending_scroll
+            && !self.frame_in_flight
+            && !self.resize_in_flight
+    }
+}
+
 impl HerdrGui {
     fn new(cx: &mut Context<Self>) -> Self {
-        let (client, state, status) = match HerdrClient::bootstrap() {
-            Ok(client) => match client.state() {
-                Ok(state) => (Some(client), state, "connected".to_string()),
-                Err(err) => (Some(client), HerdrState::default(), err.to_string()),
-            },
-            Err(err) => (None, HerdrState::default(), err.to_string()),
-        };
         let settings = settings::Settings::load();
         let sidebar_layout = match settings.sidebar_layout.as_str() {
             "warp" => SidebarLayout::Warp,
@@ -234,20 +381,39 @@ impl HerdrGui {
             .sidebar_width
             .clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
         Self {
-            client,
+            client: None,
+            command_worker: command_worker::CommandWorker::new(),
+            command_results: VecDeque::new(),
+            focus_change_pending: false,
+            focus_result_confirmed: false,
+            pending_input: InputBuffer::default(),
+            reconciliation_required: false,
+            state_request_in_flight: false,
+            refresh_pending: false,
+            reconnect_retry_secs: 2,
+            next_state_poll: Instant::now() + Duration::from_secs(2),
+            bootstrap_attempted: false,
+            state_generation: 0,
+            state_valid: false,
             terminal: None,
             terminal_target: None,
             terminal_size: None,
+            terminal_resize_in_flight: false,
             terminal_token: 0,
             terminal_frame: Arc::new(TerminalFrame::default()),
             terminal_pane: cx.new(TerminalPane::new),
+            selection_drag: None,
+            selection_queue: SelectionQueue::default(),
+            terminal_revision: 0,
             last_terminal_frame_at: None,
             terminal_pending_frame: false,
+            terminal_force_frame: false,
             terminal_frame_in_flight: false,
             pending_vt: Vec::new(),
             terminal_bg: 0x0a0a0a,
-            state,
-            status,
+            state: HerdrState::default(),
+            status: "connecting".to_string(),
+            warnings: warnings::Warnings::default(),
             show_help: false,
             sidebar_pane: {
                 let herdr = cx.entity();
@@ -376,28 +542,17 @@ impl HerdrGui {
     }
 
     fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client.clone() else {
-            return;
-        };
-        let Some(pane) = self.focused_pane().cloned() else {
-            return;
-        };
         let Some(item) = cx.read_from_clipboard() else {
             return;
         };
         let Some(text) = item.text() else {
             return;
         };
-        let pane_id = pane.pane_id;
-        cx.spawn(async move |this, cx| {
-            if let Err(err) = client.paste_text(&pane_id, &text) {
-                let _ = this.update(cx, |view, cx| {
-                    view.status = err.to_string();
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
+        self.send_input(PendingInput::Paste(text.to_string()), cx);
+    }
+
+    fn copy_selection(&mut self, _: &CopySelection, _window: &mut Window, cx: &mut Context<Self>) {
+        self.enqueue_selection(SelectionCommand::Copy, cx);
     }
 
     fn theme_system(&mut self, _: &ThemeSystem, _window: &mut Window, cx: &mut Context<Self>) {
@@ -434,9 +589,7 @@ impl HerdrGui {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.with_client(HerdrClient::reload_config);
-        self.refresh_state();
-        cx.notify();
+        self.submit_command(true, HerdrClient::reload_config, cx);
     }
 
     fn save_settings(&mut self) {
@@ -458,43 +611,327 @@ impl HerdrGui {
     }
 
     fn refresh(&mut self, _: &Refresh, window: &mut Window, cx: &mut Context<Self>) {
-        self.refresh_state();
-        self.attach_focused_terminal(window, cx);
-        self.notify_sidebar(cx);
-        cx.notify();
+        self.request_state(window, cx, true);
+    }
+
+    fn request_state(&mut self, window: &mut Window, cx: &mut Context<Self>, explicit: bool) {
+        let explicit = explicit || self.refresh_pending;
+        if self.state_request_in_flight
+            || !self.command_results.is_empty()
+            || self.focus_change_pending
+        {
+            self.refresh_pending |= explicit;
+            return;
+        }
+        if self.reconciliation_required && !explicit {
+            return;
+        }
+        self.state_request_in_flight = true;
+        self.refresh_pending = false;
+        self.next_state_poll = Instant::now() + Duration::from_secs(self.reconnect_retry_secs);
+        if self.client.is_none() {
+            self.status = "connecting".to_string();
+            cx.notify();
+        }
+        let generation = self.state_generation;
+        let client = self.client.clone();
+        let reconnecting = client.is_none();
+        let allow_install = explicit || !self.bootstrap_attempted;
+        if client.is_none() {
+            self.bootstrap_attempted = true;
+        }
+        let window = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let client = match client {
+                        Some(client) => client,
+                        None => {
+                            if !allow_install
+                                && !std::process::Command::new("sh")
+                                    .args(["-c", "command -v herdr"])
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null())
+                                    .status()
+                                    .is_ok_and(|status| status.success())
+                            {
+                                return Err(herdr::HerdrError::InstallFailed(
+                                    "Herdr is unavailable; use Refresh to retry installation".to_string(),
+                                ));
+                            }
+                            HerdrClient::bootstrap()?
+                        }
+                    };
+                    let state = client.state()?;
+                    Ok::<_, herdr::HerdrError>((client, state))
+                })
+                .await;
+            let _ = window.update(cx, |_, window, cx| {
+                let _ = this.update(cx, |view, cx| {
+                    view.state_request_in_flight = false;
+                    if result.is_ok() {
+                        view.reconnect_retry_secs = 2;
+                    } else if reconnecting {
+                        view.reconnect_retry_secs = (view.reconnect_retry_secs * 2).min(30);
+                    }
+                    view.next_state_poll = Instant::now() + Duration::from_secs(view.reconnect_retry_secs);
+                    if view.state_generation != generation {
+                        return;
+                    }
+                    match result {
+                        Ok((client, state)) => {
+                            if view.reconciliation_required {
+                                if view.command_worker.resume().is_err() {
+                                    view.status = "Command worker unavailable".to_string();
+                                    cx.notify();
+                                    return;
+                                }
+                                view.reconciliation_required = false;
+                            }
+                            view.client = Some(client);
+                            view.state = state;
+                            view.state_valid = true;
+                            view.status = "connected".to_string();
+                            view.attach_focused_terminal(window, cx);
+                        }
+                        Err(err) => {
+                            view.client = None;
+                            view.state = HerdrState::default();
+                            view.state_valid = false;
+                            view.status = if view.reconciliation_required {
+                                format!("Outcome may be unknown; reconciliation failed: {err}; use Refresh to retry")
+                            } else {
+                                format!("{err}; use Refresh to retry")
+                            };
+                            view.attach_focused_terminal(window, cx);
+                        }
+                    }
+                    view.notify_sidebar(cx);
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn start_state_polling(window: &mut Window, cx: &mut Context<Self>) {
+        let window = window.window_handle();
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            if window
+                .update(cx, |_, window, cx| {
+                    this.update(cx, |view, cx| {
+                        if Instant::now() >= view.next_state_poll {
+                            view.request_state(window, cx, false);
+                        }
+                    })
+                })
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    fn submit_command(
+        &mut self,
+        changes_focus: bool,
+        command: impl FnOnce(&HerdrClient) -> Result<(), herdr::HerdrError> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        if self.reject_if_focus_pending(cx) {
+            return;
+        }
+        if self.reconciliation_required || !self.state_valid {
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let result = self.command_worker.submit(move || {
+            command(&client).map_err(|_| "Command failed; outcome may be unknown".to_string())?;
+            if changes_focus {
+                let state = client
+                    .state()
+                    .map_err(|_| "State refresh failed; outcome may be unknown".to_string())?;
+                let _ = sender.send(state);
+            }
+            Ok(())
+        });
+        if result.is_err() {
+            self.discard_pending_input();
+            self.reconciliation_required = true;
+            self.state_valid = false;
+            self.warn("Command worker unavailable; input may not have been sent; outcome may be unknown; use Refresh to reconcile");
+            cx.notify();
+            return;
+        }
+        self.command_results
+            .push_back(changes_focus.then_some(receiver));
+        self.state_generation = self.state_generation.wrapping_add(1);
+        if changes_focus {
+            self.invalidate_selection(cx);
+            self.focus_change_pending = true;
+            self.focus_result_confirmed = false;
+            if self.terminal.is_none() {
+                self.terminal_token = self.terminal_token.wrapping_add(1);
+                self.terminal_target = None;
+            }
+        }
+    }
+
+    fn submit_focus(
+        &mut self,
+        target: Option<RecoveryTarget>,
+        command: impl FnOnce(&HerdrClient) -> Result<(), herdr::HerdrError> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let was_pending = self.focus_change_pending;
+        self.submit_command(true, command, cx);
+        if !was_pending && self.focus_change_pending {
+            if let Some(target) = target {
+                self.pending_input.start_recovery(target);
+            }
+        }
+    }
+
+    fn start_command_polling(window: &mut Window, cx: &mut Context<Self>) {
+        let window = window.window_handle();
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(16))
+                .await;
+            if window
+                .update(cx, |_, window, cx| {
+                    this.update(cx, |view, cx| {
+                      view.sync_terminal_geometry(window, cx);
+                      view.process_selection_queue(cx);
+                      loop {
+                        let completion = match view.command_worker.try_recv() {
+                            Ok(completion) => completion,
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => {
+                                view.discard_pending_input();
+                                view.reconciliation_required = true;
+                                view.state_valid = false;
+                                view.warn("Command worker unavailable; buffered input discarded; outcome may be unknown; use Refresh to reconcile");
+                                cx.notify();
+                                break;
+                            }
+                        };
+                        let Some(result) = view.command_results.pop_front() else {
+                            break;
+                        };
+                        match completion {
+                            command_worker::Completion::Finished(Ok(())) => {
+                                if let Some(receiver) = result {
+                                    if let Ok(state) = receiver.try_recv() {
+                                        if !view.reconciliation_required {
+                                            view.state = state;
+                                            view.state_valid = true;
+                                            view.focus_result_confirmed = true;
+                                            if !view.pending_input.is_blocked() {
+                                                view.status = "connected".to_string();
+                                            }
+                                            if let Some(warning) = view.pending_input.direction_layout_warning() {
+                                                view.warn(warning);
+                                            }
+                                            view.attach_focused_terminal(window, cx);
+                                            view.notify_sidebar(cx);
+                                        }
+                                    } else {
+                                        view.discard_pending_input();
+                                        view.reconciliation_required = true;
+                                        view.state_valid = false;
+                                        view.warn("Focus result unavailable; input discarded; use Refresh to reconcile");
+                                    }
+                                }
+                            }
+                            command_worker::Completion::Finished(Err(error)) => {
+                                if let Some(warning) = view.pending_input.direction_layout_warning() {
+                                    view.warn(warning);
+                                }
+                                view.discard_pending_input();
+                                view.reconciliation_required = true;
+                                view.state_valid = false;
+                                view.state_generation = view.state_generation.wrapping_add(1);
+                                view.warn(format!("{error}; buffered input discarded; use Refresh to reconcile"));
+                            }
+                            command_worker::Completion::Skipped => {
+                                view.discard_pending_input();
+                            }
+                        }
+                        cx.notify();
+                      }
+                      if view.refresh_pending {
+                          view.request_state(window, cx, true);
+                      }
+                    })
+                })
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
     }
 
     fn split_right(&mut self, _: &SplitRight, _window: &mut Window, cx: &mut Context<Self>) {
-        self.with_first_pane(|client, pane| client.split_right(&pane.pane_id));
-        self.refresh_state();
-        cx.notify();
+        self.with_first_pane(|client, pane| client.split_right(&pane.pane_id), cx);
     }
 
     fn split_down(&mut self, _: &SplitDown, _window: &mut Window, cx: &mut Context<Self>) {
-        self.with_first_pane(|client, pane| client.split_down(&pane.pane_id));
-        self.refresh_state();
-        cx.notify();
+        self.with_first_pane(|client, pane| client.split_down(&pane.pane_id), cx);
     }
 
-    fn focus_right(&mut self, _: &FocusRight, window: &mut Window, cx: &mut Context<Self>) {
-        self.with_client(HerdrClient::focus_right);
-        self.refresh_state();
-        self.attach_focused_terminal(window, cx);
-        cx.notify();
+    fn focus_right(&mut self, _: &FocusRight, _window: &mut Window, cx: &mut Context<Self>) {
+        let expected_pane = Arc::new(Mutex::new(None));
+        let origin = self.focused_pane().and_then(|pane| {
+            Some((
+                pane.pane_id.clone(),
+                pane.tab_id.clone()?,
+                pane.workspace_id.clone(),
+            ))
+        });
+        let target = origin
+            .as_ref()
+            .map(|(pane, tab, workspace)| RecoveryTarget::Direction {
+                previous_pane: pane.clone(),
+                tab: tab.clone(),
+                workspace: workspace.clone(),
+                expected_pane: expected_pane.clone(),
+            })
+            .or(Some(RecoveryTarget::DirectionUnavailable));
+        let inspect_layout = self.pending_input.is_blocked();
+        self.submit_focus(
+            target,
+            move |client| {
+                client.focus_right()?;
+                if let (true, Some((pane, tab, workspace))) = (inspect_layout, origin) {
+                    if let Ok(layout) = client.pane_layout(&pane) {
+                        if let Ok(mut expected) = expected_pane.lock() {
+                            *expected =
+                                rightward_destination(&layout, &pane, &tab, workspace.as_deref());
+                        }
+                    }
+                }
+                Ok(())
+            },
+            cx,
+        );
     }
 
     fn resize_right(&mut self, _: &ResizeRight, _window: &mut Window, cx: &mut Context<Self>) {
-        self.with_first_pane(|client, pane| client.resize_right(&pane.pane_id));
-        self.refresh_state();
-        cx.notify();
+        self.with_first_pane(|client, pane| client.resize_right(&pane.pane_id), cx);
     }
 
-    fn close_pane(&mut self, _: &ClosePane, window: &mut Window, cx: &mut Context<Self>) {
-        self.with_first_pane(|client, pane| client.close_pane(&pane.pane_id));
-        self.refresh_state();
-        self.close_active_workspace_if_empty();
-        self.attach_focused_terminal(window, cx);
-        cx.notify();
+    fn close_pane(&mut self, _: &ClosePane, _window: &mut Window, cx: &mut Context<Self>) {
+        // Herdr 0.9.5 closes the workspace when its last pane closes. A second
+        // workspace.close after focus changes could close an unrelated workspace.
+        self.with_first_pane(|client, pane| client.close_pane(&pane.pane_id), cx);
     }
 
     fn previous_tab(&mut self, _: &PreviousTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -505,44 +942,40 @@ impl HerdrGui {
         self.focus_tab_offset(1, window, cx);
     }
 
-    fn new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
+    fn new_tab(&mut self, _: &NewTab, _window: &mut Window, cx: &mut Context<Self>) {
         let workspace_id = self.active_workspace_id().map(str::to_string);
-        self.with_client(|client| client.create_tab(workspace_id.as_deref()));
-        self.refresh_state();
-        self.attach_focused_terminal(window, cx);
-        self.notify_sidebar(cx);
-        cx.notify();
+        self.submit_command(
+            true,
+            move |client| client.create_tab(workspace_id.as_deref()),
+            cx,
+        );
     }
 
-    fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+    fn close_tab(&mut self, _: &CloseTab, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reject_if_focus_pending(cx) {
+            return;
+        }
         let tab_id = self.active_tab().map(|tab| tab.tab_id.clone());
         if let Some(tab_id) = tab_id {
-            self.with_client(|client| client.close_tab(&tab_id));
-            self.refresh_state();
-            self.attach_focused_terminal(window, cx);
-            cx.notify();
+            self.submit_command(true, move |client| client.close_tab(&tab_id), cx);
         }
     }
 
-    fn new_workspace(&mut self, _: &NewWorkspace, window: &mut Window, cx: &mut Context<Self>) {
-        self.with_client(HerdrClient::create_workspace);
-        self.refresh_state();
-        self.attach_focused_terminal(window, cx);
-        cx.notify();
+    fn new_workspace(&mut self, _: &NewWorkspace, _window: &mut Window, cx: &mut Context<Self>) {
+        self.submit_command(true, HerdrClient::create_workspace, cx);
     }
 
     fn close_workspace_id(
         &mut self,
         workspace_id: String,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.with_client(|client| client.close_workspace(&workspace_id));
-        self.refresh_state();
-        self.terminal_target = None;
-        self.terminal_size = None;
-        self.attach_focused_terminal(window, cx);
-        cx.notify();
+        self.submit_command(
+            true,
+            move |client| client.close_workspace(&workspace_id),
+            cx,
+        );
     }
 
     fn previous_workspace(
@@ -561,27 +994,30 @@ impl HerdrGui {
     fn focus_workspace_id(
         &mut self,
         workspace_id: String,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.sidebar_pane
             .update(cx, |pane, cx| pane.close_spaces(cx));
-        self.with_client(|client| client.focus_workspace(&workspace_id));
-        self.refresh_state();
-        self.attach_focused_terminal(window, cx);
-        self.notify_sidebar(cx);
-        cx.notify();
+        self.submit_focus(
+            Some(RecoveryTarget::Workspace(workspace_id.clone())),
+            move |client| client.focus_workspace(&workspace_id),
+            cx,
+        );
     }
 
-    fn focus_tab_id(&mut self, tab_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.with_client(|client| client.focus_tab(&tab_id));
-        self.refresh_state();
-        self.attach_focused_terminal(window, cx);
-        self.notify_sidebar(cx);
-        cx.notify();
+    fn focus_tab_id(&mut self, tab_id: String, _window: &mut Window, cx: &mut Context<Self>) {
+        self.submit_focus(
+            Some(RecoveryTarget::Tab(tab_id.clone())),
+            move |client| client.focus_tab(&tab_id),
+            cx,
+        );
     }
 
     fn focus_tab_offset(&mut self, offset: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.reject_if_focus_pending(cx) {
+            return;
+        }
         let tabs = self.visible_tabs();
         if tabs.is_empty() {
             return;
@@ -604,6 +1040,9 @@ impl HerdrGui {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.reject_if_focus_pending(cx) {
+            return;
+        }
         if self.state.workspaces.is_empty() {
             return;
         }
@@ -628,13 +1067,38 @@ impl HerdrGui {
         );
     }
 
-    fn focus_pane_id(&mut self, pane_id: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn focus_pane_id(&mut self, pane_id: String, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.state_valid
+            && !self.focus_change_pending
+            && !self.pending_input.is_blocked()
+            && self
+                .focused_pane()
+                .is_some_and(|pane| pane.pane_id == pane_id)
+        {
+            return;
+        }
         self.reset_terminal_scroll_state();
-        self.with_client(|client| client.focus_pane(&pane_id));
-        self.refresh_state();
-        self.attach_focused_terminal(window, cx);
-        self.maybe_refresh_terminal_frame(cx, true);
+        self.submit_focus(
+            Some(RecoveryTarget::Pane(pane_id.clone())),
+            move |client| client.focus_pane(&pane_id),
+            cx,
+        );
+    }
+
+    fn warn(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.status = message.clone();
+        self.warnings.record(message);
+    }
+
+    fn reject_if_focus_pending(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.focus_change_pending || self.reconciliation_required {
+            return false;
+        }
+        self.pending_input.reject_focus();
+        self.warn("Action not sent while focus is changing; buffered input discarded. Input is blocked; after the transition finishes, choose the desired focus again.");
         cx.notify();
+        true
     }
 
     fn focus_target(
@@ -642,50 +1106,29 @@ impl HerdrGui {
         workspace_id: Option<String>,
         tab_id: Option<String>,
         pane_id: Option<String>,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(workspace_id) = workspace_id {
-            self.with_client(|client| client.focus_workspace(&workspace_id));
-        }
-        if let Some(tab_id) = tab_id {
-            self.with_client(|client| client.focus_tab(&tab_id));
-        }
-        if let Some(pane_id) = pane_id {
-            self.with_client(|client| client.focus_pane(&pane_id));
-        }
-        self.refresh_state();
-        self.attach_focused_terminal(window, cx);
-        cx.notify();
-    }
-
-    fn refresh_state(&mut self) {
-        let started = Instant::now();
-        if let Some(client) = &self.client {
-            match client.state() {
-                Ok(state) => {
-                    lag_log(format_args!(
-                        "refresh_state ok workspaces={} tabs={} panes={} agents={} {:.2}ms",
-                        state.workspaces.len(),
-                        state.tabs.len(),
-                        state.panes.len(),
-                        state.agents.len(),
-                        started.elapsed().as_secs_f64() * 1000.0,
-                    ));
-                    self.state = state;
-                    self.status = "connected".to_string();
+        self.submit_focus(
+            Some(RecoveryTarget::Agent {
+                pane: pane_id.clone(),
+                tab: tab_id.clone(),
+                workspace: workspace_id.clone(),
+            }),
+            move |client| {
+                if let Some(workspace_id) = workspace_id {
+                    client.focus_workspace(&workspace_id)?;
                 }
-                Err(err) => {
-                    lag_log(format_args!(
-                        "refresh_state err {err} {:.2}ms",
-                        started.elapsed().as_secs_f64() * 1000.0
-                    ));
-                    self.status = err.to_string();
+                if let Some(tab_id) = tab_id {
+                    client.focus_tab(&tab_id)?;
                 }
-            }
-        } else {
-            lag_log(format_args!("refresh_state skipped no client"));
-        }
+                if let Some(pane_id) = pane_id {
+                    client.focus_pane(&pane_id)?;
+                }
+                Ok(())
+            },
+            cx,
+        );
     }
 
     fn set_terminal_frame(&mut self, frame: Arc<TerminalFrame>, cx: &mut Context<Self>) {
@@ -696,10 +1139,42 @@ impl HerdrGui {
         }
         self.terminal_frame = frame.clone();
         self.last_terminal_frame_at = Some(Instant::now());
-        self.terminal_pending_frame = false;
         // Only notify TerminalPane — never root/sidebar (cached siblings stay cold).
         self.terminal_pane
             .update(cx, |pane, cx| pane.set_frame(frame, cx));
+    }
+
+    fn selection_frame_current(&self, cx: &App) -> bool {
+        SelectionFrameStatus {
+            painted: self
+                .terminal_pane
+                .read(cx)
+                .has_painted(&self.terminal_frame),
+            size_matches: self.terminal_size.is_some()
+                && self.terminal_size == self.terminal_size(cx),
+            pending_output: self.terminal_pending_frame || !self.pending_vt.is_empty(),
+            pending_scroll: self.pending_scroll_rows != 0,
+            frame_in_flight: self.terminal_frame_in_flight,
+            resize_in_flight: self.terminal_resize_in_flight,
+        }
+        .current()
+    }
+
+    fn cancel_selection(&mut self, cx: &mut Context<Self>) {
+        self.selection_queue = SelectionQueue::default();
+        self.selection_drag = None;
+        self.warn("Selection cancelled because the terminal changed or was busy; try again.");
+        cx.notify();
+    }
+
+    fn invalidate_selection(&mut self, cx: &mut Context<Self>) {
+        self.terminal_revision = self.terminal_revision.wrapping_add(1);
+        if self.selection_queue.pointer_down
+            || !self.selection_queue.commands.is_empty()
+            || self.selection_drag.is_some()
+        {
+            self.cancel_selection(cx);
+        }
     }
 
     fn notify_sidebar(&self, cx: &mut Context<Self>) {
@@ -719,21 +1194,27 @@ impl HerdrGui {
         let scroll_rows = self.pending_scroll_rows;
         self.pending_scroll_rows = 0;
         let vt_drain = std::mem::take(&mut self.pending_vt);
-        let want_frame = force || scroll_rows != 0 || due;
-        // While reading history, still apply scroll + paint; only skip idle VT repaints.
-        if self.scroll_active && scroll_rows == 0 && !force && vt_drain.is_empty() {
+        let Some(want_frame) = terminal_frame_due(
+            force,
+            scroll_rows,
+            due,
+            self.scroll_active,
+            self.terminal_pending_frame || !vt_drain.is_empty(),
+        ) else {
             return;
-        }
+        };
         if !want_frame || self.terminal_frame_in_flight {
             self.pending_scroll_rows = self.pending_scroll_rows.saturating_add(scroll_rows);
             if !vt_drain.is_empty() {
                 self.pending_vt.extend_from_slice(&vt_drain);
             }
             self.terminal_pending_frame = true;
+            self.terminal_force_frame |= force;
             return;
         }
         self.terminal_frame_in_flight = true;
         self.terminal_pending_frame = false;
+        self.terminal_force_frame = false;
         self.last_terminal_frame_at = Some(Instant::now());
         let token = self.terminal_token;
         cx.spawn(async move |this, cx| {
@@ -760,37 +1241,39 @@ impl HerdrGui {
                 lag_log(format_args!("terminal.frame extract {ms:.1}ms (bg)"));
             }
             let _ = this.update(cx, |view, cx| {
-                view.terminal_frame_in_flight = false;
                 if view.terminal_token != token {
                     return;
                 }
-                if let Ok(frame) = frame {
-                    view.set_terminal_frame(Arc::new(frame), cx);
+                view.terminal_frame_in_flight = false;
+                match frame {
+                    Ok(frame) => view.set_terminal_frame(Arc::new(frame), cx),
+                    Err(_) => {
+                        view.terminal_pending_frame = true;
+                        view.terminal_force_frame = true;
+                        return;
+                    }
                 }
                 if view.terminal_pending_frame || view.pending_scroll_rows != 0 {
-                    view.maybe_refresh_terminal_frame(cx, false);
+                    view.maybe_refresh_terminal_frame(cx, view.terminal_force_frame);
                 }
             });
         })
         .detach();
     }
 
-    fn sync_terminal_geometry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn sync_terminal_geometry(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(terminal) = self.terminal.clone() else {
             return;
         };
-        let size = self.terminal_size(window);
-        if self.terminal_size == Some(size) {
+        let Some(size) = self.terminal_size(cx) else {
+            return;
+        };
+        if self.terminal_size == Some(size) || self.terminal_resize_in_flight {
             return;
         }
+        self.invalidate_selection(cx);
         let token = self.terminal_token;
-        if let Ok(mut session) = terminal.try_lock() {
-            if let Ok(frame) = session.resize(size.0, size.1, size.2, size.3) {
-                self.set_terminal_frame(Arc::new(frame), cx);
-            }
-            self.terminal_size = Some(size);
-            return;
-        }
+        self.terminal_resize_in_flight = true;
         cx.spawn(async move |this, cx| {
             let frame = cx
                 .background_executor()
@@ -805,24 +1288,43 @@ impl HerdrGui {
                 if view.terminal_token != token {
                     return;
                 }
+                view.terminal_resize_in_flight = false;
                 if let Ok(frame) = frame {
                     view.set_terminal_frame(Arc::new(frame), cx);
+                    view.terminal_size = Some(size);
+                    view.maybe_refresh_terminal_frame(cx, true);
+                } else {
+                    view.terminal_pending_frame = true;
+                    view.terminal_force_frame = true;
                 }
-                view.terminal_size = Some(size);
-                cx.notify();
             });
         })
         .detach();
     }
 
     fn attach_focused_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let size = self.terminal_size(window);
+        let size = self.terminal_size(cx).unwrap_or((80, 24, 0, 0));
         let pane = self.focused_pane().cloned();
         let target = pane
             .as_ref()
             .and_then(|pane| pane.terminal_id.clone())
             .or_else(|| pane.as_ref().map(|pane| pane.pane_id.clone()));
         if target.is_none() {
+            self.invalidate_selection(cx);
+            self.terminal_token = self.terminal_token.wrapping_add(1);
+            self.terminal_frame_in_flight = false;
+            self.terminal_resize_in_flight = false;
+            self.terminal = None;
+            self.terminal_target = None;
+            self.pending_vt.clear();
+            self.set_terminal_frame(Arc::new(TerminalFrame::default()), cx);
+            if self.focus_result_confirmed {
+                if let Some(warning) = self.pending_input.direction_warning() {
+                    self.warn(warning);
+                }
+                self.discard_pending_input();
+                self.warn("Focused pane unavailable; buffered input discarded");
+            }
             return;
         }
         let target = match target {
@@ -831,105 +1333,221 @@ impl HerdrGui {
         };
         if self.terminal_target.as_deref() == Some(target.as_str()) {
             self.sync_terminal_geometry(window, cx);
+            if self.terminal.is_some() {
+                self.flush_pending_input(self.terminal_token, cx);
+            }
             return;
         }
+        self.invalidate_selection(cx);
+        self.terminal_token = self.terminal_token.wrapping_add(1);
+        self.terminal_frame_in_flight = false;
+        self.terminal_resize_in_flight = false;
+        self.terminal = None;
+        self.terminal_target = None;
+        self.pending_vt.clear();
+        self.set_terminal_frame(Arc::new(TerminalFrame::default()), cx);
         self.reset_terminal_scroll_state();
-        match TerminalSession::attach(&target, size.0, size.1) {
-            Ok(mut session) => {
-                if let Ok(frame) = session.resize(size.0, size.1, size.2, size.3) {
-                    self.set_terminal_frame(Arc::new(frame), cx);
-                }
-                if let Some(receiver) = session.output.take() {
-                    self.terminal_token = self.terminal_token.wrapping_add(1);
-                    let token = self.terminal_token;
-                    if self.terminal_frame.lines.is_empty() {
-                        if let (Some(client), Some(pane)) = (&self.client, pane.as_ref()) {
+        let token = self.terminal_token;
+        self.terminal_target = Some(target.clone());
+        let expected_pane = pane.as_ref().map(|pane| pane.pane_id.clone());
+        let client = self.client.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut session = TerminalSession::attach(&target, size.0, size.1)?;
+                    let mut frame = session.resize(size.0, size.1, size.2, size.3).ok();
+                    if frame.as_ref().is_none_or(|frame| frame.lines.is_empty()) {
+                        if let (Some(client), Some(pane)) = (client, pane) {
                             if let Ok(ansi) = client.read_pane_ansi(&pane.pane_id) {
-                                if let Ok(frame) = TerminalFrame::from_ansi(size.0, size.1, &ansi) {
-                                    self.set_terminal_frame(Arc::new(frame), cx);
-                                }
+                                frame = TerminalFrame::from_ansi(size.0, size.1, &ansi).ok();
                             }
                         }
                     }
-                    self.terminal = Some(Arc::new(Mutex::new(session)));
-                    self.terminal_target = Some(target.clone());
-                    self.terminal_size = Some(size);
-                    self.status = "connected".to_string();
-                    poll_terminal(receiver, token, cx);
+                    Ok::<_, String>((session, frame))
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.terminal_token != token {
+                    return;
                 }
-            }
-            Err(err) => {
-                self.terminal = None;
-                self.terminal_target = None;
-                self.terminal_size = None;
-                self.set_terminal_frame(
-                    Arc::new(TerminalFrame {
-                        lines: vec![TerminalLine {
-                            runs: vec![TerminalRun {
-                                text: err.clone(),
-                                fg: 0xfca5a5,
-                                bg: None,
-                            }],
-                        }],
-                    }),
-                    cx,
-                );
-                self.status = err;
-            }
-        }
-    }
-
-    fn close_active_workspace_if_empty(&mut self) {
-        let Some(workspace_id) = self.active_workspace_id().map(str::to_string) else {
-            return;
-        };
-        let has_panes = self
-            .state
-            .panes
-            .iter()
-            .any(|pane| pane.workspace_id.as_deref() == Some(workspace_id.as_str()));
-        if !has_panes {
-            self.with_client(|client| client.close_workspace(&workspace_id));
-            self.refresh_state();
-        }
-    }
-
-    fn with_client(&mut self, f: impl FnOnce(&HerdrClient) -> Result<(), herdr::HerdrError>) {
-        if let Some(client) = &self.client {
-            if let Err(err) = f(client) {
-                self.status = err.to_string();
-            }
-        }
+                if view.focused_pane().map(|pane| &pane.pane_id) != expected_pane.as_ref() {
+                    view.terminal_target = None;
+                    if view.focus_change_pending && view.focus_result_confirmed {
+                        if let Some(warning) = view.pending_input.direction_warning() {
+                            view.warn(warning);
+                        }
+                        view.discard_pending_input();
+                        view.warn("Focused pane changed during attachment; buffered input discarded; use Refresh");
+                        cx.notify();
+                    }
+                    return;
+                }
+                match result {
+                    Ok((mut session, frame)) => {
+                        if let Some(frame) = frame {
+                            view.set_terminal_frame(Arc::new(frame), cx);
+                        }
+                        if let Some(receiver) = session.output.take() {
+                            view.terminal = Some(Arc::new(Mutex::new(session)));
+                            view.terminal_size = Some(size);
+                            if !view.reconciliation_required && !view.pending_input.is_blocked() {
+                                view.status = "connected".to_string();
+                            }
+                            poll_terminal(receiver, token, cx);
+                            view.flush_pending_input(token, cx);
+                            view.maybe_refresh_terminal_frame(cx, true);
+                        } else {
+                            view.discard_pending_input();
+                            view.terminal_target = None;
+                            view.warn("Terminal attachment failed; buffered input discarded");
+                        }
+                    }
+                    Err(err) => {
+                        view.discard_pending_input();
+                        view.terminal_target = None;
+                        view.terminal_size = None;
+                        view.set_terminal_frame(
+                            Arc::new(TerminalFrame {
+                                lines: vec![TerminalLine {
+                                    runs: vec![TerminalRun {
+                                        text: err.clone(),
+                                        fg: 0xfca5a5,
+                                        bg: None,
+                                    }],
+                                    ..TerminalLine::default()
+                                }],
+                            }),
+                            cx,
+                        );
+                        view.warn(format!("Terminal attachment failed: {err}; buffered input discarded"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn with_first_pane(
         &mut self,
-        f: impl FnOnce(&HerdrClient, &Pane) -> Result<(), herdr::HerdrError>,
+        f: impl FnOnce(&HerdrClient, &Pane) -> Result<(), herdr::HerdrError> + Send + 'static,
+        cx: &mut Context<Self>,
     ) {
-        let pane = self.focused_pane().cloned();
-        if let (Some(client), Some(pane)) = (&self.client, pane) {
-            if let Err(err) = f(client, &pane) {
-                self.status = err.to_string();
-            }
+        if self.reject_if_focus_pending(cx) {
+            return;
+        }
+        if let Some(pane) = self.focused_pane().cloned() {
+            self.submit_command(true, move |client| f(client, &pane), cx);
+        } else {
+            self.warn("Action not sent; focused pane is not uniquely confirmed");
+            cx.notify();
         }
     }
 
     fn focused_pane(&self) -> Option<&Pane> {
-        if let Some(focused_id) = self.state.focused_pane_id.as_deref() {
-            if let Some(pane) = self
-                .state
-                .panes
-                .iter()
-                .find(|pane| pane.pane_id == focused_id)
-            {
-                return Some(pane);
+        focused_pane_in_state(&self.state)
+    }
+
+    fn attached_focused_pane(&self) -> Option<&Pane> {
+        if !self.state_valid {
+            return None;
+        }
+        let pane = self.focused_pane()?;
+        let target = pane.terminal_id.as_deref().unwrap_or(&pane.pane_id);
+        (self.terminal.is_some() && self.terminal_target.as_deref() == Some(target)).then_some(pane)
+    }
+
+    fn discard_pending_input(&mut self) {
+        self.pending_input.discard();
+        self.focus_change_pending = false;
+        self.focus_result_confirmed = false;
+    }
+
+    fn flush_pending_input(&mut self, token: u64, cx: &mut Context<Self>) {
+        if !self.focus_change_pending
+            || !self.focus_result_confirmed
+            || self.reconciliation_required
+        {
+            return;
+        }
+        let Some(pane) = self.focused_pane() else {
+            if let Some(warning) = self.pending_input.direction_warning() {
+                self.warn(warning);
+            }
+            self.discard_pending_input();
+            self.warn("Focused pane unavailable or ambiguous; buffered input discarded");
+            cx.notify();
+            return;
+        };
+        let target = pane.terminal_id.as_deref().unwrap_or(&pane.pane_id);
+        if self.terminal.is_none() {
+            return;
+        }
+        let pane_id = pane.pane_id.clone();
+        let tab_id = pane.tab_id.clone();
+        let workspace_id = pane.workspace_id.clone();
+        let target = target.to_string();
+        let Some((pane_id, mut inputs)) = self.pending_input.take_ready(
+            true,
+            &pane_id,
+            &target,
+            self.terminal_target.as_deref(),
+            token,
+            self.terminal_token,
+        ) else {
+            return;
+        };
+        self.focus_change_pending = false;
+        self.focus_result_confirmed = false;
+        let was_blocked = self.pending_input.is_blocked();
+        if let Some(warning) = self.pending_input.finish_recovery(FocusSnapshot {
+            pane: &pane_id,
+            tab: tab_id.as_deref(),
+            workspace: workspace_id.as_deref(),
+        }) {
+            self.warn(warning);
+            cx.notify();
+        } else if was_blocked && !self.pending_input.is_blocked() {
+            self.status = "connected".to_string();
+            cx.notify();
+        }
+        while let Some(input) = inputs.pop_front() {
+            self.dispatch_input(input, pane_id.clone(), cx);
+            if self.reconciliation_required {
+                self.warn("Command worker unavailable; buffered input discarded; outcome may be unknown; use Refresh to reconcile");
+                break;
             }
         }
-        self.state
-            .panes
-            .iter()
-            .find(|pane| pane.focused)
-            .or_else(|| self.state.panes.first())
+    }
+
+    fn send_input(&mut self, input: PendingInput, cx: &mut Context<Self>) {
+        if self.reconciliation_required {
+            self.warn("Input not sent; outcome may be unknown; use Refresh to reconcile");
+            cx.notify();
+        } else if self.pending_input.is_blocked() {
+            self.warn("Input not sent; choose the desired focus after the transition finishes");
+            cx.notify();
+        } else if self.focus_change_pending {
+            self.pending_input.push(input);
+        } else if let Some(pane) = self.attached_focused_pane() {
+            self.dispatch_input(input, pane.pane_id.clone(), cx);
+        } else {
+            self.warn("Input not sent; no confirmed terminal attachment");
+            cx.notify();
+        }
+    }
+
+    fn dispatch_input(&mut self, input: PendingInput, pane_id: String, cx: &mut Context<Self>) {
+        self.submit_command(
+            false,
+            move |client| match input {
+                PendingInput::Key(key) => client.send_key(&pane_id, &key),
+                PendingInput::Text(text) => client.send_text(&pane_id, &text),
+                PendingInput::Paste(text) => client.paste_text(&pane_id, &text),
+            },
+            cx,
+        );
     }
 
     fn handle_keystroke(&mut self, key: &Keystroke, cx: &mut Context<Self>) {
@@ -937,12 +1555,6 @@ impl HerdrGui {
             return;
         }
 
-        let Some(client) = self.client.clone() else {
-            return;
-        };
-        let Some(pane) = self.focused_pane().cloned() else {
-            return;
-        };
         // NAMED keys always send as key events, not text.
         // Enter as text=\n gets misinterpreted by the terminal (e.g. as shift+enter).
         let is_named = matches!(
@@ -962,31 +1574,12 @@ impl HerdrGui {
                 | "pagedown"
                 | "insert"
         );
-        let pane_id = pane.pane_id;
         if key.modifiers.alt || key.modifiers.platform || key.modifiers.control || is_named {
-            let key_str = key_name(key);
-            cx.spawn(async move |this, cx| {
-                if let Err(err) = client.send_key(&pane_id, &key_str) {
-                    let _ = this.update(cx, |view, _cx| view.status = err.to_string());
-                }
-            })
-            .detach();
+            self.send_input(PendingInput::Key(key_name(key)), cx);
         } else if let Some(text) = key.key_char.as_deref() {
-            let text = text.to_string();
-            cx.spawn(async move |this, cx| {
-                if let Err(err) = client.send_text(&pane_id, &text) {
-                    let _ = this.update(cx, |view, _cx| view.status = err.to_string());
-                }
-            })
-            .detach();
+            self.send_input(PendingInput::Text(text.to_string()), cx);
         } else {
-            let key_str = key_name(key);
-            cx.spawn(async move |this, cx| {
-                if let Err(err) = client.send_key(&pane_id, &key_str) {
-                    let _ = this.update(cx, |view, _cx| view.status = err.to_string());
-                }
-            })
-            .detach();
+            self.send_input(PendingInput::Key(key_name(key)), cx);
         }
     }
 
@@ -1000,6 +1593,7 @@ impl HerdrGui {
         if rows == 0 || self.terminal.is_none() {
             return;
         }
+        self.invalidate_selection(cx);
         // Arbor-style: only treat upward viewport movement as leaving live output.
         self.scroll_active = rows > 0;
         self.pending_scroll_rows += rows;
@@ -1082,6 +1676,200 @@ impl HerdrGui {
     set_theme!(theme_vesper, ThemeVesper, "vesper");
     set_theme!(theme_oled, ThemeOled, "oled");
 
+    fn selection_cell(&self, position: (f64, f64), clamp: bool, cx: &App) -> Option<(u16, u16)> {
+        let geometry = self.terminal_pane.read(cx).geometry()?;
+        let point = terminal_view::geometry::Point {
+            x: position.0,
+            y: position.1,
+        };
+        let cell = if clamp {
+            geometry.hit_test_clamped(point)?
+        } else {
+            geometry.hit_test(point)?
+        };
+        Some((
+            u16::try_from(cell.column).ok()?,
+            u16::try_from(cell.row).ok()?,
+        ))
+    }
+
+    fn start_selection(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let position = (event.position.x.to_f64(), event.position.y.to_f64());
+        if self.selection_cell(position, false, cx).is_some() {
+            self.enqueue_selection(SelectionCommand::Begin(position), cx);
+        }
+    }
+
+    fn enqueue_selection(&mut self, command: SelectionCommand, cx: &mut Context<Self>) {
+        if self.focus_change_pending
+            || self.reconciliation_required
+            || self.pending_input.is_blocked()
+            || self.attached_focused_pane().is_none()
+        {
+            return;
+        }
+        let Some(target) = self.terminal_target.clone() else {
+            return;
+        };
+        if matches!(
+            command,
+            SelectionCommand::Move(_, _) | SelectionCommand::End
+        ) && !self.selection_queue.pointer_down
+        {
+            return;
+        }
+        let geometry = self.terminal_pane.read(cx).geometry();
+        let active = self.selection_queue.pointer_down
+            || !self.selection_queue.commands.is_empty()
+            || self.selection_drag.is_some();
+        if active {
+            if !self
+                .selection_queue
+                .matches_frame(self.terminal_revision, geometry)
+                || self
+                    .selection_queue
+                    .target
+                    .as_ref()
+                    .is_none_or(|(token, old_target)| {
+                        *token != self.terminal_token || old_target != &target
+                    })
+            {
+                self.cancel_selection(cx);
+                return;
+            }
+        } else {
+            if !self.selection_frame_current(cx) || geometry.is_none() {
+                self.cancel_selection(cx);
+                return;
+            }
+            self.selection_queue = SelectionQueue::default();
+            self.selection_queue.revision = Some(self.terminal_revision);
+            self.selection_queue.geometry = geometry;
+        }
+        self.selection_queue
+            .push(self.terminal_token, &target, command);
+        self.process_selection_queue(cx);
+    }
+
+    fn process_selection_queue(&mut self, cx: &mut Context<Self>) {
+        if self.selection_queue.commands.is_empty() {
+            return;
+        }
+        if self.focus_change_pending
+            || self.reconciliation_required
+            || self.pending_input.is_blocked()
+            || self.attached_focused_pane().is_none()
+        {
+            self.cancel_selection(cx);
+            return;
+        }
+        let current = self.selection_frame_current(cx);
+        let result = self.selection_queue.next(
+            self.terminal_token,
+            self.terminal_target.as_deref(),
+            current,
+            self.terminal_revision,
+            self.terminal_pane.read(cx).geometry(),
+            Instant::now(),
+        );
+        let command = match result {
+            Ok(Some(command)) => command,
+            Ok(None) => return,
+            Err(()) => {
+                self.cancel_selection(cx);
+                return;
+            }
+        };
+        let cell = match command {
+            SelectionCommand::Begin(position) => self.selection_cell(position, false, cx),
+            SelectionCommand::Move(position, _) => self.selection_cell(position, true, cx),
+            _ => None,
+        };
+        let Some(terminal) = self.terminal.clone() else {
+            return;
+        };
+        let Ok(mut session) = terminal.try_lock() else {
+            return;
+        };
+        self.selection_queue.commands.pop_front();
+        if self.selection_queue.commands.is_empty() {
+            self.selection_queue.deadline = None;
+        }
+        let mut refresh = false;
+        let mut cancel = false;
+        let mut copied = None;
+        let result = match command {
+            SelectionCommand::Begin(_) => {
+                self.selection_drag = None;
+                if let Some(cell) = cell {
+                    refresh = true;
+                    let result = session
+                        .clear_selection()
+                        .and_then(|()| session.begin_selection_drag(cell));
+                    if result.is_ok() {
+                        self.selection_drag = Some((self.terminal_token, cell, false));
+                    }
+                    result
+                } else {
+                    cancel = true;
+                    Ok(())
+                }
+            }
+            SelectionCommand::Move(_, rectangle) => {
+                if let (Some(cell), Some((token, anchor, moved))) = (cell, self.selection_drag) {
+                    if cell == anchor && !moved {
+                        Ok(())
+                    } else {
+                        refresh = true;
+                        match session.update_selection_drag(cell, rectangle) {
+                            Ok(true) => {
+                                self.selection_drag = Some((token, anchor, true));
+                                Ok(())
+                            }
+                            Ok(false) => {
+                                self.selection_drag = None;
+                                cancel = true;
+                                Ok(())
+                            }
+                            Err(err) => {
+                                self.selection_drag = None;
+                                Err(err)
+                            }
+                        }
+                    }
+                } else {
+                    Ok(())
+                }
+            }
+            SelectionCommand::End => {
+                session.end_selection_drag();
+                self.selection_drag = None;
+                Ok(())
+            }
+            SelectionCommand::Copy => match session.copy_selection() {
+                Ok(text) => {
+                    copied = text;
+                    Ok(())
+                }
+                Err(err) => Err(err),
+            },
+        };
+        drop(session);
+        if let Some(text) = copied {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+        if let Err(err) = result {
+            self.warn(format!("Selection failed: {err}"));
+            cancel = true;
+        }
+        if cancel {
+            self.cancel_selection(cx);
+        }
+        if refresh {
+            self.maybe_refresh_terminal_frame(cx, true);
+        }
+    }
+
     #[allow(dead_code)]
     fn handle_mouse_move(
         &mut self,
@@ -1089,23 +1877,20 @@ impl HerdrGui {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if event.dragging() {
+            self.enqueue_selection(
+                SelectionCommand::Move(
+                    (event.position.x.to_f64(), event.position.y.to_f64()),
+                    event.modifiers.alt,
+                ),
+                cx,
+            );
+        }
         if self.sidebar_resizing && event.dragging() {
             let width = event.position.x.to_f64();
             self.sidebar_animation.width = width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
             self.sidebar_animation.start = self.sidebar_animation.width;
             self.sidebar_animation.target = self.sidebar_animation.width;
-            let size = self.terminal_size(_window);
-            if self.terminal_size != Some(size) {
-                if let Some(terminal) = self.terminal.clone() {
-                    let frame = terminal.try_lock().ok().and_then(|mut terminal| {
-                        terminal.resize(size.0, size.1, size.2, size.3).ok()
-                    });
-                    if let Some(frame) = frame {
-                        self.set_terminal_frame(Arc::new(frame), cx);
-                    }
-                }
-                self.terminal_size = Some(size);
-            }
             cx.notify();
             return;
         }
@@ -1118,7 +1903,22 @@ impl HerdrGui {
     }
 
     #[allow(dead_code)]
-    fn handle_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_mouse_up(
+        &mut self,
+        event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button == MouseButton::Left {
+            self.enqueue_selection(
+                SelectionCommand::Move(
+                    (event.position.x.to_f64(), event.position.y.to_f64()),
+                    event.modifiers.alt,
+                ),
+                cx,
+            );
+            self.enqueue_selection(SelectionCommand::End, cx);
+        }
         if self.sidebar_resizing {
             self.sidebar_resizing = false;
             self.save_settings();
@@ -1193,7 +1993,11 @@ impl HerdrGui {
             .items_center()
             .justify_between()
             .child(ui_text(
-                "agents",
+                if self.state.agent_list_error.is_some() {
+                    "agents unavailable"
+                } else {
+                    "agents"
+                },
                 10,
                 theme.muted,
                 false,
@@ -1262,6 +2066,7 @@ impl Render for HerdrGui {
 
         root.key_context("HerdrGui")
             .track_focus(&self.focus_handle)
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::handle_mouse_up))
             .on_action(cx.listener(Self::toggle_help))
             .on_action(cx.listener(Self::refresh))
             .on_action(cx.listener(Self::split_right))
@@ -1280,6 +2085,7 @@ impl Render for HerdrGui {
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_agents))
             .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::toggle_sidebar_layout))
             .on_action(cx.listener(Self::theme_catppuccin))
             .on_action(cx.listener(Self::theme_catppuccin_latte))
@@ -1319,8 +2125,63 @@ impl HerdrGui {
         let tabs = self.visible_tabs();
         let pane_container = div()
             .flex_1()
+            .flex()
+            .flex_col()
             .overflow_hidden()
             .ml(px((self.swipe_progress * 28.0) as f32))
+            .when(self.pending_input.is_blocked(), |el| {
+                el.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .text_color(rgb(theme.label))
+                        .child("Input blocked. After the current transition finishes, choose the desired focus again."),
+                )
+            })
+            .when(
+                self.reconciliation_required && !self.warnings.messages().contains(&self.status),
+                |el| {
+                    el.child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .text_color(rgb(theme.label))
+                            .child(self.status.clone()),
+                    )
+                },
+            )
+            .when(!self.warnings.messages().is_empty(), |el| {
+                el.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .flex()
+                        .items_start()
+                        .gap_2()
+                        .text_color(rgb(theme.label))
+                        .child(
+                            div().flex_1().flex().flex_col().children(
+                                self.warnings
+                                    .messages()
+                                    .iter()
+                                    .cloned()
+                                    .map(|message| div().child(message)),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.warnings.dismiss_all();
+                                        cx.notify();
+                                    }),
+                                )
+                                .child("Dismiss"),
+                        ),
+                )
+            })
             .child(self.pane_grid(panes, pane_frame, theme, cx))
             .into_any_element();
         let show_top_tabs = self.sidebar_layout == SidebarLayout::Arc;
@@ -1459,27 +2320,11 @@ impl HerdrGui {
         }
     }
 
-    fn chrome_height(&self) -> f64 {
-        let mut chrome = MACOS_TITLEBAR_HEIGHT;
-        if self.sidebar_layout == SidebarLayout::Arc {
-            chrome += TOP_TAB_BAR_HEIGHT;
-        }
-        chrome
-    }
-
-    fn terminal_size(&self, window: &Window) -> TerminalSize {
-        let size = window.bounds().size;
-        let width = (size.width.to_f64() - self.sidebar_width() - RESIZE_HANDLE_WIDTH)
-            .max(TERMINAL_MIN_WIDTH);
-        let height = (size.height.to_f64() - self.chrome_height()).max(TERMINAL_MIN_HEIGHT);
-        let cols = (width / TERMINAL_CELL_WIDTH)
-            .floor()
-            .clamp(TERMINAL_MIN_COLS, TERMINAL_MAX_COLS) as u16;
-        let paint_fudge = 2.0;
-        let rows = ((height - paint_fudge) / TERMINAL_CELL_HEIGHT)
-            .floor()
-            .clamp(TERMINAL_MIN_ROWS, TERMINAL_MAX_ROWS) as u16;
-        (cols, rows, width.round() as u16, height.round() as u16)
+    fn terminal_size(&self, cx: &App) -> Option<TerminalSize> {
+        self.terminal_pane
+            .read(cx)
+            .geometry()
+            .map(|geometry| geometry.pty_size())
     }
 
     /// Built inside SidebarPane::render so spaces toggle reflows tabs in-pane only.
@@ -1679,10 +2524,7 @@ impl HerdrGui {
                         this.focus_tab_id(id.clone(), window, cx)
                     }),
                     cx.listener(move |this, _, window, cx| {
-                        this.with_client(|client| client.close_tab(&close_id));
-                        this.refresh_state();
-                        this.attach_focused_terminal(window, cx);
-                        cx.notify();
+                        this.close_tab_by_id(close_id.clone(), window, cx);
                     }),
                 )
             }))
@@ -1704,11 +2546,8 @@ impl HerdrGui {
             )
     }
 
-    fn close_tab_by_id(&mut self, tab_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.with_client(|client| client.close_tab(&tab_id));
-        self.refresh_state();
-        self.attach_focused_terminal(window, cx);
-        cx.notify();
+    fn close_tab_by_id(&mut self, tab_id: String, _window: &mut Window, cx: &mut Context<Self>) {
+        self.submit_command(true, move |client| client.close_tab(&tab_id), cx);
     }
 
     #[allow(dead_code)]
@@ -1792,6 +2631,21 @@ impl HerdrGui {
         theme: UiTheme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if !panes.is_empty()
+            && pane_frame.lines.is_empty()
+            && self.terminal.is_none()
+            && self.terminal_target.is_none()
+        {
+            return div()
+                .flex()
+                .flex_1()
+                .h_full()
+                .items_center()
+                .justify_center()
+                .child(ui_text(&self.status, 12, theme.muted, false, ""))
+                .into_any_element();
+        }
+
         if panes.is_empty() && pane_frame.lines.is_empty() {
             return div()
                 .flex()
@@ -1852,6 +2706,7 @@ impl HerdrGui {
             .line_height(px(18.0))
             .text_color(rgb(theme.text))
             .on_scroll_wheel(cx.listener(Self::handle_terminal_scroll))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::start_selection))
             .child(cached_terminal(self.terminal_pane.clone()))
             .into_any_element()
     }
@@ -2370,6 +3225,7 @@ fn main() {
             KeyBinding::new("cmd-b", ToggleSidebar, None),
             KeyBinding::new("cmd-shift-a", ToggleAgents, None),
             KeyBinding::new("cmd-v", Paste, None),
+            KeyBinding::new("cmd-c", CopySelection, None),
             KeyBinding::new("cmd-shift-l", ToggleSidebarLayout, None),
             KeyBinding::new("cmd-shift-r", ReloadHerdrConfig, None),
             KeyBinding::new("cmd-t", NewTab, None),
@@ -2402,7 +3258,9 @@ fn main() {
         let window = cx.open_window(options, |_window, cx| cx.new(HerdrGui::new));
         if let Ok(window) = window {
             let _ = window.update(cx, |view, window, cx| {
-                view.attach_focused_terminal(window, cx)
+                view.request_state(window, cx, false);
+                HerdrGui::start_state_polling(window, cx);
+                HerdrGui::start_command_polling(window, cx);
             });
             let view = window.update(cx, |_, _, cx| cx.entity());
             if let Ok(view) = view {
@@ -2449,6 +3307,7 @@ fn poll_terminal(receiver: Receiver<Vec<u8>>, token: u64, cx: &mut Context<Herdr
                     return;
                 }
                 if !accumulated.is_empty() {
+                    view.invalidate_selection(cx);
                     bytes_window = bytes_window.saturating_add(accumulated.len());
                     writes_window = writes_window.wrapping_add(1);
                     if let Some(terminal) = view.terminal.clone() {
@@ -2469,6 +3328,7 @@ fn poll_terminal(receiver: Receiver<Vec<u8>>, token: u64, cx: &mut Context<Herdr
                                     view.pending_vt.len() + accumulated.len(),
                                 ));
                                 view.pending_vt.extend_from_slice(&accumulated);
+                                view.terminal_pending_frame = true;
                             }
                         }
                     }
@@ -2501,18 +3361,249 @@ fn poll_terminal(receiver: Receiver<Vec<u8>>, token: u64, cx: &mut Context<Herdr
                 if view.terminal_token != token {
                     return;
                 }
+                view.invalidate_selection(cx);
                 view.terminal_token = view.terminal_token.wrapping_add(1);
+                view.terminal_frame_in_flight = false;
+                view.terminal_resize_in_flight = false;
                 view.terminal = None;
                 view.terminal_target = None;
                 view.terminal_size = None;
-                view.refresh_state();
-                view.status = "Terminal disconnected; use Refresh to retry".to_string();
+                view.set_terminal_frame(Arc::new(TerminalFrame::default()), cx);
+                if !view.reconciliation_required {
+                    view.status = "Terminal disconnected; use Refresh to retry".to_string();
+                }
                 cx.notify();
             });
             break;
         }
     })
     .detach();
+}
+
+#[cfg(test)]
+mod focus_state_tests {
+    use super::{
+        focused_pane_in_state, rightward_destination, terminal_frame_due, HerdrState, Pane,
+        SelectionCommand, SelectionFrameStatus, SelectionQueue,
+    };
+    use crate::herdr::{PaneLayout, PaneLayoutPane, PaneLayoutRect};
+    use crate::terminal_view::geometry::{Point, Rect, TerminalGeometry};
+
+    #[test]
+    fn release_and_copy_wait_for_current_frames_in_order() {
+        let mut queue = SelectionQueue::default();
+        let geometry = TerminalGeometry::new(
+            Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                width: 800.0,
+                height: 400.0,
+            },
+            8.0,
+            20.0,
+            100,
+            20,
+        );
+        queue.revision = Some(7);
+        queue.geometry = geometry;
+        let now = std::time::Instant::now();
+        queue.push(1, "a", SelectionCommand::Begin((1.0, 2.0)));
+        queue.push(1, "a", SelectionCommand::Move((2.0, 3.0), false));
+        queue.push(1, "a", SelectionCommand::Move((9.0, 8.0), true));
+        queue.push(1, "a", SelectionCommand::End);
+        queue.push(1, "a", SelectionCommand::Copy);
+        assert_eq!(queue.next(1, Some("a"), false, 7, geometry, now), Ok(None));
+        for command in [
+            SelectionCommand::Begin((1.0, 2.0)),
+            SelectionCommand::Move((9.0, 8.0), true),
+            SelectionCommand::End,
+            SelectionCommand::Copy,
+        ] {
+            assert_eq!(
+                queue.next(1, Some("a"), true, 7, geometry, now),
+                Ok(Some(command))
+            );
+            queue.commands.pop_front();
+            assert_eq!(queue.next(1, Some("a"), false, 7, geometry, now), Ok(None));
+        }
+        queue.push(1, "a", SelectionCommand::Copy);
+        assert_eq!(queue.next(2, Some("a"), true, 7, geometry, now), Err(()));
+        assert_eq!(queue.next(1, Some("b"), true, 7, geometry, now), Err(()));
+    }
+
+    #[test]
+    fn queued_pointer_rejects_scroll_resize_and_unbounded_wait() {
+        let mut queue = SelectionQueue::default();
+        let geometry = TerminalGeometry::new(
+            Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                width: 800.0,
+                height: 400.0,
+            },
+            8.0,
+            20.0,
+            100,
+            20,
+        );
+        let resized = TerminalGeometry::new(
+            Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                width: 400.0,
+                height: 400.0,
+            },
+            8.0,
+            20.0,
+            100,
+            20,
+        );
+        queue.revision = Some(7);
+        queue.geometry = geometry;
+        queue.push(1, "a", SelectionCommand::Begin((20.0, 20.0)));
+        queue.push(1, "a", SelectionCommand::Move((100.0, 20.0), false));
+        queue.push(1, "a", SelectionCommand::End);
+        queue.push(1, "a", SelectionCommand::Copy);
+        let now = std::time::Instant::now();
+        assert_eq!(queue.next(1, Some("a"), true, 8, geometry, now), Err(()));
+        for revision in 8..1008 {
+            assert_eq!(
+                queue.next(1, Some("a"), false, revision, geometry, now),
+                Err(())
+            );
+        }
+        assert_eq!(queue.next(1, Some("a"), true, 7, resized, now), Err(()));
+        assert_eq!(queue.next(1, Some("a"), false, 7, geometry, now), Ok(None));
+        assert_eq!(
+            queue.next(
+                1,
+                Some("a"),
+                false,
+                7,
+                geometry,
+                now + std::time::Duration::from_secs(2)
+            ),
+            Err(())
+        );
+        assert_eq!(queue.commands.len(), 4);
+    }
+
+    #[test]
+    fn scrollback_output_still_requests_a_frame() {
+        assert_eq!(terminal_frame_due(false, 0, true, true, true), Some(true));
+        assert_eq!(terminal_frame_due(false, 0, false, true, true), Some(false));
+        assert_eq!(terminal_frame_due(false, 0, true, true, false), None);
+    }
+
+    #[test]
+    fn selection_waits_for_output_resize_scroll_and_paint() {
+        let mut status = SelectionFrameStatus {
+            painted: true,
+            size_matches: true,
+            ..Default::default()
+        };
+        assert!(status.current());
+        status.pending_output = true;
+        assert!(!status.current());
+        status.pending_output = false;
+        status.frame_in_flight = true;
+        assert!(!status.current());
+        status.frame_in_flight = false;
+        status.painted = false;
+        assert!(!status.current());
+        status.painted = true;
+        status.resize_in_flight = true;
+        assert!(!status.current());
+        status.resize_in_flight = false;
+        status.size_matches = false;
+        assert!(!status.current());
+        status.size_matches = true;
+        status.pending_scroll = true;
+        assert!(!status.current());
+        status.pending_scroll = false;
+        assert!(status.current());
+    }
+
+    #[test]
+    fn pty_dimensions_follow_viewport_not_previous_frame_size() {
+        let geometry = TerminalGeometry::new(
+            Rect {
+                origin: Point { x: 200.0, y: 40.0 },
+                width: 803.0,
+                height: 421.0,
+            },
+            8.0,
+            20.0,
+            80,
+            24,
+        );
+        assert_eq!(geometry.map(|g| g.pty_size()), Some((100, 21, 803, 421)));
+    }
+
+    #[test]
+    fn direction_recovery_requires_matching_rightward_layout() {
+        let mut layout = PaneLayout {
+            workspace_id: "w".into(),
+            tab_id: "t".into(),
+            zoomed: false,
+            area: PaneLayoutRect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 20,
+            },
+            focused_pane_id: "C".into(),
+            panes: vec![
+                PaneLayoutPane {
+                    pane_id: "B".into(),
+                    focused: false,
+                    rect: PaneLayoutRect {
+                        x: 0,
+                        y: 0,
+                        width: 40,
+                        height: 20,
+                    },
+                },
+                PaneLayoutPane {
+                    pane_id: "C".into(),
+                    focused: true,
+                    rect: PaneLayoutRect {
+                        x: 40,
+                        y: 0,
+                        width: 40,
+                        height: 20,
+                    },
+                },
+            ],
+        };
+        assert_eq!(
+            rightward_destination(&layout, "B", "t", Some("w")).as_deref(),
+            Some("C")
+        );
+        assert!(rightward_destination(&layout, "B", "other", Some("w")).is_none());
+        layout.panes[1].rect.x = 0;
+        assert!(rightward_destination(&layout, "B", "t", Some("w")).is_none());
+        layout.panes[1].rect.x = 40;
+        layout.focused_pane_id = "B".into();
+        assert!(rightward_destination(&layout, "B", "t", Some("w")).is_none());
+    }
+
+    #[test]
+    fn input_focus_ignores_fabricated_or_conflicting_ids() -> Result<(), serde_json::Error> {
+        let first: Pane = serde_json::from_value(serde_json::json!({"pane_id": "first"}))?;
+        let second: Pane = serde_json::from_value(serde_json::json!({"pane_id": "second"}))?;
+        let mut state = HerdrState {
+            focused_pane_id: Some("first".into()),
+            panes: vec![first, second],
+            ..HerdrState::default()
+        };
+        assert!(focused_pane_in_state(&state).is_none());
+        state.panes[1].focused = true;
+        assert_eq!(
+            focused_pane_in_state(&state).map(|pane| pane.pane_id.as_str()),
+            Some("second")
+        );
+        state.panes[0].focused = true;
+        assert!(focused_pane_in_state(&state).is_none());
+        Ok(())
+    }
 }
 
 #[cfg(test)]
