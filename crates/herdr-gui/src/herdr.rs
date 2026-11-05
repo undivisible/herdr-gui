@@ -2,8 +2,8 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     env,
-    io::{BufRead, BufReader, Write},
-    os::unix::net::UnixStream,
+    io::{BufRead, BufReader, Read, Write},
+    os::unix::{fs::MetadataExt, fs::OpenOptionsExt, net::UnixStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -193,6 +193,9 @@ pub struct HerdrClient {
 
 impl HerdrClient {
     pub fn bootstrap() -> Result<Self, HerdrError> {
+        if let Err(err) = clear_legacy_request_log(Path::new("/tmp/herdr-gui-lag.log")) {
+            eprintln!("failed to clear legacy Herdr GUI request log: {err}");
+        }
         ensure_herdr_installed()?;
         let socket_path = socket_path();
         if !socket_path.exists()
@@ -345,6 +348,14 @@ impl HerdrClient {
         Ok(())
     }
 
+    pub fn paste_text(&self, pane_id: &str, text: &str) -> Result<(), HerdrError> {
+        let _: Value = self.call(
+            "pane.send_input",
+            json!({ "pane_id": pane_id, "text": text, "keys": [] }),
+        )?;
+        Ok(())
+    }
+
     pub fn resize_right(&self, pane_id: &str) -> Result<(), HerdrError> {
         let _: Value = self.call(
             "pane.resize",
@@ -368,6 +379,8 @@ impl HerdrClient {
         let mut stream = UnixStream::connect(&self.socket_path).map_err(|err| {
             HerdrError::SocketUnavailable(self.socket_path.display().to_string(), err.to_string())
         })?;
+        stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+        stream.set_write_timeout(Some(Duration::from_millis(500)))?;
         let request = json!({ "id": "herdr-gui", "method": method, "params": params });
         writeln!(stream, "{request}")?;
         let mut line = String::new();
@@ -388,6 +401,36 @@ impl HerdrClient {
             Err(HerdrError::Api("missing result".to_string()))
         }
     }
+}
+
+fn clear_legacy_request_log(path: &Path) -> std::io::Result<()> {
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "legacy log is not a singly linked file owned by the current user",
+        ));
+    }
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)?;
+    if contents.split(|byte| *byte == b'\n').any(|line| {
+        line.windows(11).any(|part| part == b"herdr.call ")
+            && line.windows(8).any(|part| part == b" params=")
+    }) {
+        file.set_len(0)?;
+    }
+    Ok(())
 }
 
 fn lag_log(args: std::fmt::Arguments<'_>) {
@@ -472,7 +515,99 @@ fn socket_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_exists, socket_path, AgentList, PaneList, TabList, WorkspaceList};
+    use super::{
+        clear_legacy_request_log, command_exists, socket_path, AgentList, HerdrClient, HerdrError,
+        PaneList, TabList, WorkspaceList,
+    };
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::time::Duration;
+
+    #[test]
+    fn call_times_out_when_server_does_not_respond() {
+        let dir = std::env::temp_dir().join(format!("herdr-timeout-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap_or_else(|err| panic!("{err}"));
+        let path = dir.join("socket");
+        let listener = UnixListener::bind(&path).unwrap_or_else(|err| panic!("{err}"));
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap_or_else(|err| panic!("{err}"));
+            let mut line = String::new();
+            BufReader::new(&stream)
+                .read_line(&mut line)
+                .unwrap_or_else(|err| panic!("{err}"));
+            std::thread::sleep(Duration::from_secs(2));
+        });
+        let result = HerdrClient { socket_path: path }.ping();
+        server.join().unwrap_or_else(|err| panic!("{err:?}"));
+        std::fs::remove_dir_all(dir).unwrap_or_else(|err| panic!("{err}"));
+        assert!(
+            matches!(result, Err(HerdrError::Io(err)) if matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut))
+        );
+    }
+
+    #[test]
+    fn paste_text_sends_input_and_reports_server_error() {
+        let dir = std::env::temp_dir().join(format!("herdr-paste-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap_or_else(|err| panic!("{err}"));
+        let path = dir.join("socket");
+        let listener = UnixListener::bind(&path).unwrap_or_else(|err| panic!("{err}"));
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap_or_else(|err| panic!("{err}"));
+            let mut line = String::new();
+            BufReader::new(&stream)
+                .read_line(&mut line)
+                .unwrap_or_else(|err| panic!("{err}"));
+            let request: serde_json::Value =
+                serde_json::from_str(&line).unwrap_or_else(|err| panic!("{err}"));
+            writeln!(stream, "{{\"error\":{{\"message\":\"unknown method\"}}}}")
+                .unwrap_or_else(|err| panic!("{err}"));
+            request
+        });
+        let result = HerdrClient { socket_path: path }.paste_text("pane-1", "hello\nworld");
+        let request = server.join().unwrap_or_else(|err| panic!("{err:?}"));
+        std::fs::remove_dir_all(dir).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(request["method"], "pane.send_input");
+        assert_eq!(
+            request["params"],
+            serde_json::json!({"pane_id": "pane-1", "text": "hello\nworld", "keys": []})
+        );
+        assert!(matches!(result, Err(HerdrError::Api(message)) if message == "unknown method"));
+    }
+
+    #[test]
+    fn legacy_log_cleanup_removes_request_parameters_without_following_symlinks() {
+        let dir = std::env::temp_dir().join(format!("herdr-gui-log-test-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap_or_else(|err| panic!("{err}"));
+        let log = dir.join("log");
+        let link = dir.join("link");
+        let sensitive =
+            b"[1] herdr.call pane.send_text 1ms resp_bytes=1 params={\"text\":\"secret\"}\n";
+        std::fs::write(&log, sensitive).unwrap_or_else(|err| panic!("{err}"));
+        std::os::unix::fs::symlink(&log, &link).unwrap_or_else(|err| panic!("{err}"));
+        assert!(clear_legacy_request_log(&link).is_err());
+        assert_eq!(
+            std::fs::read(&log).ok().as_deref(),
+            Some(sensitive.as_slice())
+        );
+        let hard_link = dir.join("hard-link");
+        std::fs::hard_link(&log, &hard_link).unwrap_or_else(|err| panic!("{err}"));
+        assert!(clear_legacy_request_log(&log).is_err());
+        assert_eq!(
+            std::fs::read(&hard_link).ok().as_deref(),
+            Some(sensitive.as_slice())
+        );
+        std::fs::remove_file(&hard_link).unwrap_or_else(|err| panic!("{err}"));
+        clear_legacy_request_log(&log).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(std::fs::read(&log).ok().as_deref(), Some(&[][..]));
+        let unrelated = b"unrelated log contents\n";
+        std::fs::write(&log, unrelated).unwrap_or_else(|err| panic!("{err}"));
+        clear_legacy_request_log(&log).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(
+            std::fs::read(&log).ok().as_deref(),
+            Some(unrelated.as_slice())
+        );
+        std::fs::remove_dir_all(&dir).unwrap_or_else(|err| panic!("{err}"));
+    }
 
     #[test]
     fn socket_path_should_default_to_config_dir() {
