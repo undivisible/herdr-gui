@@ -37,6 +37,8 @@ pub struct HerdrState {
     pub tabs: Vec<Tab>,
     pub panes: Vec<Pane>,
     pub agents: Vec<Agent>,
+    #[serde(skip)]
+    pub agent_list_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -245,10 +247,10 @@ impl HerdrClient {
             .find(|pane| pane.focused)
             .map(|pane| pane.pane_id.clone())
             .or_else(|| panes.panes.first().map(|pane| pane.pane_id.clone()));
-        let agents = self
-            .call::<AgentList>("agent.list", json!({}))
-            .map(|list| list.agents)
-            .unwrap_or_default();
+        let (agents, agent_list_error) = match self.call::<AgentList>("agent.list", json!({})) {
+            Ok(list) => (list.agents, None),
+            Err(_) => (Vec::new(), Some("Failed to load agents".to_string())),
+        };
         Ok(HerdrState {
             focused_workspace_id,
             focused_tab_id,
@@ -257,6 +259,7 @@ impl HerdrClient {
             tabs: tabs.tabs,
             panes: panes.panes,
             agents,
+            agent_list_error,
         })
     }
 
@@ -525,6 +528,64 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
     use std::time::Duration;
+
+    #[test]
+    fn state_preserves_other_data_when_agent_list_fails() {
+        for (suffix, response, failed) in [
+            ("error", r#"{"error":{"message":"sensitive detail"}}"#, true),
+            ("empty", r#"{"result":{"agents":[]}}"#, false),
+            (
+                "agents",
+                r#"{"result":{"agents":[{"terminal_id":"term1"}]}}"#,
+                false,
+            ),
+        ] {
+            let dir =
+                std::env::temp_dir().join(format!("herdr-state-{}-{suffix}", std::process::id()));
+            std::fs::create_dir(&dir).unwrap_or_else(|err| panic!("{err}"));
+            let path = dir.join("socket");
+            let listener = UnixListener::bind(&path).unwrap_or_else(|err| panic!("{err}"));
+            let server = std::thread::spawn(move || {
+                for (method, reply) in [
+                    (
+                        "workspace.list",
+                        r#"{"result":{"workspaces":[{"workspace_id":"w1"}]}}"#,
+                    ),
+                    ("tab.list", r#"{"result":{"tabs":[{"tab_id":"t1"}]}}"#),
+                    ("pane.list", r#"{"result":{"panes":[{"pane_id":"p1"}]}}"#),
+                    ("agent.list", response),
+                ] {
+                    let (mut stream, _) = listener.accept().unwrap_or_else(|err| panic!("{err}"));
+                    let mut line = String::new();
+                    BufReader::new(&stream)
+                        .read_line(&mut line)
+                        .unwrap_or_else(|err| panic!("{err}"));
+                    let request: serde_json::Value =
+                        serde_json::from_str(&line).unwrap_or_else(|err| panic!("{err}"));
+                    assert_eq!(request["method"], method);
+                    writeln!(stream, "{reply}").unwrap_or_else(|err| panic!("{err}"));
+                }
+            });
+            let state = HerdrClient { socket_path: path }
+                .state()
+                .unwrap_or_else(|err| panic!("{err}"));
+            server.join().unwrap_or_else(|err| panic!("{err:?}"));
+            std::fs::remove_dir_all(dir).unwrap_or_else(|err| panic!("{err}"));
+            assert_eq!(state.focused_workspace_id.as_deref(), Some("w1"));
+            assert_eq!(state.focused_tab_id.as_deref(), Some("t1"));
+            assert_eq!(state.focused_pane_id.as_deref(), Some("p1"));
+            assert_eq!(state.workspaces.len(), 1);
+            assert_eq!(state.tabs.len(), 1);
+            assert_eq!(state.panes.len(), 1);
+            assert_eq!(
+                state.agent_list_error.as_deref(),
+                failed.then_some("Failed to load agents")
+            );
+            assert_eq!(state.agents.len(), usize::from(suffix == "agents"));
+            let serialized = serde_json::to_value(&state).unwrap_or_else(|err| panic!("{err}"));
+            assert!(serialized.get("agent_list_error").is_none());
+        }
+    }
 
     #[test]
     fn wait_for_socket_retries_stale_socket_until_ping_succeeds() {

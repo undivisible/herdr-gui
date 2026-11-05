@@ -100,6 +100,9 @@ enum ThemeMode {
 
 struct HerdrGui {
     client: Option<HerdrClient>,
+    state_request_in_flight: bool,
+    state_generation: u64,
+    state_valid: bool,
     terminal: Option<Arc<Mutex<TerminalSession>>>,
     terminal_target: Option<String>,
     terminal_size: Option<TerminalSize>,
@@ -212,13 +215,6 @@ type TerminalSize = (u16, u16, u16, u16);
 
 impl HerdrGui {
     fn new(cx: &mut Context<Self>) -> Self {
-        let (client, state, status) = match HerdrClient::bootstrap() {
-            Ok(client) => match client.state() {
-                Ok(state) => (Some(client), state, "connected".to_string()),
-                Err(err) => (Some(client), HerdrState::default(), err.to_string()),
-            },
-            Err(err) => (None, HerdrState::default(), err.to_string()),
-        };
         let settings = settings::Settings::load();
         let sidebar_layout = match settings.sidebar_layout.as_str() {
             "warp" => SidebarLayout::Warp,
@@ -234,7 +230,10 @@ impl HerdrGui {
             .sidebar_width
             .clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
         Self {
-            client,
+            client: None,
+            state_request_in_flight: false,
+            state_generation: 0,
+            state_valid: false,
             terminal: None,
             terminal_target: None,
             terminal_size: None,
@@ -246,8 +245,8 @@ impl HerdrGui {
             terminal_frame_in_flight: false,
             pending_vt: Vec::new(),
             terminal_bg: 0x0a0a0a,
-            state,
-            status,
+            state: HerdrState::default(),
+            status: "connecting".to_string(),
             show_help: false,
             sidebar_pane: {
                 let herdr = cx.entity();
@@ -458,10 +457,84 @@ impl HerdrGui {
     }
 
     fn refresh(&mut self, _: &Refresh, window: &mut Window, cx: &mut Context<Self>) {
-        self.refresh_state();
-        self.attach_focused_terminal(window, cx);
-        self.notify_sidebar(cx);
-        cx.notify();
+        self.request_state(window, cx);
+    }
+
+    fn request_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state_request_in_flight {
+            return;
+        }
+        self.state_request_in_flight = true;
+        if self.client.is_none() {
+            self.status = "connecting".to_string();
+            cx.notify();
+        }
+        let generation = self.state_generation;
+        let client = self.client.clone();
+        let window = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let client = match client {
+                        Some(client) => client,
+                        None => HerdrClient::bootstrap()?,
+                    };
+                    let state = client.state()?;
+                    Ok::<_, herdr::HerdrError>((client, state))
+                })
+                .await;
+            let _ = window.update(cx, |_, window, cx| {
+                let _ = this.update(cx, |view, cx| {
+                    view.state_request_in_flight = false;
+                    if view.state_generation != generation {
+                        if view.client.is_none() {
+                            view.request_state(window, cx);
+                        }
+                        return;
+                    }
+                    match result {
+                        Ok((client, state)) => {
+                            view.client = Some(client);
+                            view.state = state;
+                            view.state_valid = true;
+                            view.status = "connected".to_string();
+                            view.attach_focused_terminal(window, cx);
+                        }
+                        Err(err) => {
+                            view.client = None;
+                            view.state = HerdrState::default();
+                            view.state_valid = false;
+                            view.status = format!("{err}; use Refresh to retry");
+                            view.attach_focused_terminal(window, cx);
+                        }
+                    }
+                    view.notify_sidebar(cx);
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn start_state_polling(window: &mut Window, cx: &mut Context<Self>) {
+        let window = window.window_handle();
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            if window
+                .update(cx, |_, window, cx| {
+                    this.update(cx, |view, cx| {
+                        if view.client.is_some() {
+                            view.request_state(window, cx);
+                        }
+                    })
+                })
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
     }
 
     fn split_right(&mut self, _: &SplitRight, _window: &mut Window, cx: &mut Context<Self>) {
@@ -660,6 +733,7 @@ impl HerdrGui {
     }
 
     fn refresh_state(&mut self) {
+        self.state_generation = self.state_generation.wrapping_add(1);
         let started = Instant::now();
         if let Some(client) = &self.client {
             match client.state() {
@@ -673,9 +747,11 @@ impl HerdrGui {
                         started.elapsed().as_secs_f64() * 1000.0,
                     ));
                     self.state = state;
+                    self.state_valid = true;
                     self.status = "connected".to_string();
                 }
                 Err(err) => {
+                    self.state_valid = false;
                     lag_log(format_args!(
                         "refresh_state err {err} {:.2}ms",
                         started.elapsed().as_secs_f64() * 1000.0
@@ -760,10 +836,10 @@ impl HerdrGui {
                 lag_log(format_args!("terminal.frame extract {ms:.1}ms (bg)"));
             }
             let _ = this.update(cx, |view, cx| {
-                view.terminal_frame_in_flight = false;
                 if view.terminal_token != token {
                     return;
                 }
+                view.terminal_frame_in_flight = false;
                 if let Ok(frame) = frame {
                     view.set_terminal_frame(Arc::new(frame), cx);
                 }
@@ -824,6 +900,7 @@ impl HerdrGui {
             .or_else(|| pane.as_ref().map(|pane| pane.pane_id.clone()));
         if target.is_none() {
             self.terminal_token = self.terminal_token.wrapping_add(1);
+            self.terminal_frame_in_flight = false;
             self.terminal = None;
             self.terminal_target = None;
             self.pending_vt.clear();
@@ -839,54 +916,74 @@ impl HerdrGui {
             return;
         }
         self.terminal_token = self.terminal_token.wrapping_add(1);
+        self.terminal_frame_in_flight = false;
         self.terminal = None;
         self.terminal_target = None;
         self.pending_vt.clear();
         self.set_terminal_frame(Arc::new(TerminalFrame::default()), cx);
         self.reset_terminal_scroll_state();
-        match TerminalSession::attach(&target, size.0, size.1) {
-            Ok(mut session) => {
-                if let Ok(frame) = session.resize(size.0, size.1, size.2, size.3) {
-                    self.set_terminal_frame(Arc::new(frame), cx);
-                }
-                if let Some(receiver) = session.output.take() {
-                    self.terminal_token = self.terminal_token.wrapping_add(1);
-                    let token = self.terminal_token;
-                    if self.terminal_frame.lines.is_empty() {
-                        if let (Some(client), Some(pane)) = (&self.client, pane.as_ref()) {
+        let token = self.terminal_token;
+        self.terminal_target = Some(target.clone());
+        let expected_pane = pane.as_ref().map(|pane| pane.pane_id.clone());
+        let client = self.client.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut session = TerminalSession::attach(&target, size.0, size.1)?;
+                    let mut frame = session.resize(size.0, size.1, size.2, size.3).ok();
+                    if frame.as_ref().is_none_or(|frame| frame.lines.is_empty()) {
+                        if let (Some(client), Some(pane)) = (client, pane) {
                             if let Ok(ansi) = client.read_pane_ansi(&pane.pane_id) {
-                                if let Ok(frame) = TerminalFrame::from_ansi(size.0, size.1, &ansi) {
-                                    self.set_terminal_frame(Arc::new(frame), cx);
-                                }
+                                frame = TerminalFrame::from_ansi(size.0, size.1, &ansi).ok();
                             }
                         }
                     }
-                    self.terminal = Some(Arc::new(Mutex::new(session)));
-                    self.terminal_target = Some(target.clone());
-                    self.terminal_size = Some(size);
-                    self.status = "connected".to_string();
-                    poll_terminal(receiver, token, cx);
+                    Ok::<_, String>((session, frame))
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.terminal_token != token {
+                    return;
                 }
-            }
-            Err(err) => {
-                self.terminal = None;
-                self.terminal_target = None;
-                self.terminal_size = None;
-                self.set_terminal_frame(
-                    Arc::new(TerminalFrame {
-                        lines: vec![TerminalLine {
-                            runs: vec![TerminalRun {
-                                text: err.clone(),
-                                fg: 0xfca5a5,
-                                bg: None,
-                            }],
-                        }],
-                    }),
-                    cx,
-                );
-                self.status = err;
-            }
-        }
+                if view.focused_pane().map(|pane| &pane.pane_id) != expected_pane.as_ref() {
+                    view.terminal_target = None;
+                    return;
+                }
+                match result {
+                    Ok((mut session, frame)) => {
+                        if let Some(frame) = frame {
+                            view.set_terminal_frame(Arc::new(frame), cx);
+                        }
+                        if let Some(receiver) = session.output.take() {
+                            view.terminal = Some(Arc::new(Mutex::new(session)));
+                            view.terminal_size = Some(size);
+                            view.status = "connected".to_string();
+                            poll_terminal(receiver, token, cx);
+                        }
+                    }
+                    Err(err) => {
+                        view.terminal_target = None;
+                        view.terminal_size = None;
+                        view.set_terminal_frame(
+                            Arc::new(TerminalFrame {
+                                lines: vec![TerminalLine {
+                                    runs: vec![TerminalRun {
+                                        text: err.clone(),
+                                        fg: 0xfca5a5,
+                                        bg: None,
+                                    }],
+                                }],
+                            }),
+                            cx,
+                        );
+                        view.status = err;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn close_active_workspace_if_empty(&mut self) {
@@ -905,6 +1002,7 @@ impl HerdrGui {
     }
 
     fn with_client(&mut self, f: impl FnOnce(&HerdrClient) -> Result<(), herdr::HerdrError>) {
+        self.state_generation = self.state_generation.wrapping_add(1);
         if let Some(client) = &self.client {
             if let Err(err) = f(client) {
                 self.status = err.to_string();
@@ -916,6 +1014,7 @@ impl HerdrGui {
         &mut self,
         f: impl FnOnce(&HerdrClient, &Pane) -> Result<(), herdr::HerdrError>,
     ) {
+        self.state_generation = self.state_generation.wrapping_add(1);
         let pane = self.focused_pane().cloned();
         if let (Some(client), Some(pane)) = (&self.client, pane) {
             if let Err(err) = f(client, &pane) {
@@ -943,6 +1042,9 @@ impl HerdrGui {
     }
 
     fn attached_focused_pane(&self) -> Option<&Pane> {
+        if !self.state_valid {
+            return None;
+        }
         let pane = self.focused_pane()?;
         let target = pane.terminal_id.as_deref().unwrap_or(&pane.pane_id);
         (self.terminal.is_some() && self.terminal_target.as_deref() == Some(target)).then_some(pane)
@@ -1209,7 +1311,11 @@ impl HerdrGui {
             .items_center()
             .justify_between()
             .child(ui_text(
-                "agents",
+                if self.state.agent_list_error.is_some() {
+                    "agents unavailable"
+                } else {
+                    "agents"
+                },
                 10,
                 theme.muted,
                 false,
@@ -2418,7 +2524,8 @@ fn main() {
         let window = cx.open_window(options, |_window, cx| cx.new(HerdrGui::new));
         if let Ok(window) = window {
             let _ = window.update(cx, |view, window, cx| {
-                view.attach_focused_terminal(window, cx)
+                view.request_state(window, cx);
+                HerdrGui::start_state_polling(window, cx);
             });
             let view = window.update(cx, |_, _, cx| cx.entity());
             if let Ok(view) = view {
@@ -2518,10 +2625,11 @@ fn poll_terminal(receiver: Receiver<Vec<u8>>, token: u64, cx: &mut Context<Herdr
                     return;
                 }
                 view.terminal_token = view.terminal_token.wrapping_add(1);
+                view.terminal_frame_in_flight = false;
                 view.terminal = None;
                 view.terminal_target = None;
                 view.terminal_size = None;
-                view.refresh_state();
+                view.set_terminal_frame(Arc::new(TerminalFrame::default()), cx);
                 view.status = "Terminal disconnected; use Refresh to retry".to_string();
                 cx.notify();
             });
