@@ -2,8 +2,8 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     env,
-    io::{BufRead, BufReader, Write},
-    os::unix::net::UnixStream,
+    io::{BufRead, BufReader, Read, Write},
+    os::unix::{fs::MetadataExt, fs::OpenOptionsExt, net::UnixStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -193,6 +193,9 @@ pub struct HerdrClient {
 
 impl HerdrClient {
     pub fn bootstrap() -> Result<Self, HerdrError> {
+        if let Err(err) = clear_legacy_request_log(Path::new("/tmp/herdr-gui-lag.log")) {
+            eprintln!("failed to clear legacy Herdr GUI request log: {err}");
+        }
         ensure_herdr_installed()?;
         let socket_path = socket_path();
         if !socket_path.exists()
@@ -390,6 +393,36 @@ impl HerdrClient {
     }
 }
 
+fn clear_legacy_request_log(path: &Path) -> std::io::Result<()> {
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "legacy log is not a singly linked file owned by the current user",
+        ));
+    }
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)?;
+    if contents.split(|byte| *byte == b'\n').any(|line| {
+        line.windows(11).any(|part| part == b"herdr.call ")
+            && line.windows(8).any(|part| part == b" params=")
+    }) {
+        file.set_len(0)?;
+    }
+    Ok(())
+}
+
 fn lag_log(args: std::fmt::Arguments<'_>) {
     use std::io::Write;
     let ts = SystemTime::now()
@@ -472,7 +505,30 @@ fn socket_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_exists, socket_path, AgentList, PaneList, TabList, WorkspaceList};
+    use super::{
+        clear_legacy_request_log, command_exists, socket_path, AgentList, PaneList, TabList,
+        WorkspaceList,
+    };
+
+    #[test]
+    fn legacy_log_cleanup_removes_request_parameters_without_following_symlinks() {
+        let dir = std::env::temp_dir().join(format!("herdr-gui-log-test-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap_or_else(|err| panic!("{err}"));
+        let log = dir.join("log");
+        let link = dir.join("link");
+        let sensitive =
+            b"[1] herdr.call pane.send_text 1ms resp_bytes=1 params={\"text\":\"secret\"}\n";
+        std::fs::write(&log, sensitive).unwrap_or_else(|err| panic!("{err}"));
+        std::os::unix::fs::symlink(&log, &link).unwrap_or_else(|err| panic!("{err}"));
+        assert!(clear_legacy_request_log(&link).is_err());
+        assert_eq!(
+            std::fs::read(&log).ok().as_deref(),
+            Some(sensitive.as_slice())
+        );
+        clear_legacy_request_log(&log).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(std::fs::read(&log).ok().as_deref(), Some(&[][..]));
+        std::fs::remove_dir_all(&dir).unwrap_or_else(|err| panic!("{err}"));
+    }
 
     #[test]
     fn socket_path_should_default_to_config_dir() {
