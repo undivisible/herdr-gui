@@ -9,8 +9,8 @@
 
 ## Terminal and workspace capabilities
 
-- Render simultaneous split panes if Herdr exposes their layout. Split commands exist, but `pane_grid` renders only the focused or first pane.
-- Add terminal selection and copy, measured cell geometry, and scrollback search. Check wide characters, styles, and real terminal applications on macOS.
+- Render simultaneous split panes using Herdr's `pane.layout` where supported. Split commands exist, but `pane_grid` renders only the focused or first pane; live splits need a terminal session and geometry for each pane.
+- Add terminal selection and copy, measured cell geometry, and scrollback search. Check the bundled libghostty selection API and handle wide characters, combining characters, wraps, and scrollback on macOS.
 - Explore a needs-attention view of Herdr agents that navigates to the relevant pane. Keep status and process ownership in Herdr.
 - Make Windows support a separate, tested port. PR #2 explores named pipes and an interim snapshot terminal, but the latter lacks scrollback and accurate cursor state, and its input paths need validation.
 
