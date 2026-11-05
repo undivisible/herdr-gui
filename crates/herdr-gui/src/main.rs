@@ -13,10 +13,10 @@ use crepuscularity_gpui as gpui;
 use crepuscularity_gpui::prelude::*;
 use crepuscularity_gpui::{
     actions, bounce, bounds, div, gpui_window_options, linear, point, px, rgb, size, AnyElement,
-    AnyView, App, Application, Context, Entity, FocusHandle, Icon, IntoElement, KeyBinding,
-    Keystroke, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render,
-    ScrollDelta, ScrollWheelEvent, SystemMenuType, TitlebarOptions, TouchPhase, Window,
-    WindowAppearance, WindowBounds,
+    AnyView, App, Application, ClipboardItem, Context, Entity, FocusHandle, Icon, IntoElement,
+    KeyBinding, Keystroke, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Render, ScrollDelta, ScrollWheelEvent, SystemMenuType, TitlebarOptions,
+    TouchPhase, Window, WindowAppearance, WindowBounds,
 };
 use focus_input::{FocusSnapshot, InputBuffer, PendingInput, RecoveryTarget};
 use ghostty::{TerminalFrame, TerminalLine, TerminalRun, TerminalSession};
@@ -39,6 +39,7 @@ actions!(
         ToggleHelp,
         Refresh,
         Paste,
+        CopySelection,
         SplitRight,
         SplitDown,
         FocusRight,
@@ -149,11 +150,16 @@ struct HerdrGui {
     terminal: Option<Arc<Mutex<TerminalSession>>>,
     terminal_target: Option<String>,
     terminal_size: Option<TerminalSize>,
+    terminal_resize_in_flight: bool,
     terminal_token: u64,
     terminal_frame: Arc<TerminalFrame>,
     terminal_pane: Entity<TerminalPane>,
+    selection_drag: Option<(u64, (u16, u16), bool)>,
+    selection_queue: SelectionQueue,
+    terminal_revision: u64,
     last_terminal_frame_at: Option<Instant>,
     terminal_pending_frame: bool,
+    terminal_force_frame: bool,
     terminal_frame_in_flight: bool,
     /// VT bytes waiting while ghostty frame() holds the session lock.
     pending_vt: Vec<u8>,
@@ -233,20 +239,7 @@ impl SidebarAnimation {
 const SIDEBAR_MIN_WIDTH: f64 = 180.0;
 const SIDEBAR_MAX_WIDTH: f64 = 360.0;
 const SIDEBAR_COLLAPSED_WIDTH: f64 = 6.0;
-const TERMINAL_MIN_WIDTH: f64 = 320.0;
-const TERMINAL_MIN_HEIGHT: f64 = 240.0;
-const TERMINAL_CELL_WIDTH: f64 = 7.2;
 const TERMINAL_CELL_HEIGHT: f64 = 18.0;
-const TERMINAL_MIN_COLS: f64 = 40.0;
-const TERMINAL_MAX_COLS: f64 = 500.0;
-const TERMINAL_MIN_ROWS: f64 = 12.0;
-const TERMINAL_MAX_ROWS: f64 = 180.0;
-const RESIZE_HANDLE_WIDTH: f64 = 4.0;
-/// Unified titlebar above GPUI content (macOS).
-#[cfg(target_os = "macos")]
-const MACOS_TITLEBAR_HEIGHT: f64 = 28.0;
-#[cfg(not(target_os = "macos"))]
-const MACOS_TITLEBAR_HEIGHT: f64 = 0.0;
 const TOP_TAB_BAR_HEIGHT: f64 = 34.0;
 /// macOS traffic-light cluster width + inset; keeps Arc top tabs aligned with sidebar.
 const TRAFFIC_LIGHT_INSET_X: f64 = 78.0;
@@ -256,6 +249,120 @@ const TRAFFIC_LIGHT_PADDING: f64 = 40.0;
 const TRAFFIC_LIGHT_Y: f64 = 8.0;
 
 type TerminalSize = (u16, u16, u16, u16);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SelectionCommand {
+    Begin((f64, f64)),
+    Move((f64, f64), bool),
+    End,
+    Copy,
+}
+
+#[derive(Default)]
+struct SelectionQueue {
+    target: Option<(u64, String)>,
+    commands: VecDeque<SelectionCommand>,
+    pointer_down: bool,
+    revision: Option<u64>,
+    geometry: Option<terminal_view::geometry::TerminalGeometry>,
+    deadline: Option<Instant>,
+}
+
+impl SelectionQueue {
+    fn push(&mut self, token: u64, target: &str, command: SelectionCommand) {
+        if self
+            .target
+            .as_ref()
+            .is_some_and(|id| id.0 != token || id.1 != target)
+        {
+            *self = Self::default();
+        }
+        self.target = Some((token, target.to_string()));
+        match command {
+            SelectionCommand::Begin(_) => self.pointer_down = true,
+            SelectionCommand::Move(_, _) if !self.pointer_down => return,
+            SelectionCommand::Move(_, _)
+                if matches!(self.commands.back(), Some(SelectionCommand::Move(_, _))) =>
+            {
+                self.commands.pop_back();
+            }
+            SelectionCommand::End if !self.pointer_down => return,
+            SelectionCommand::End => self.pointer_down = false,
+            _ => {}
+        }
+        if self.deadline.is_none() {
+            self.deadline = Some(Instant::now() + Duration::from_secs(1));
+        }
+        self.commands.push_back(command);
+    }
+
+    fn matches_frame(
+        &self,
+        revision: u64,
+        geometry: Option<terminal_view::geometry::TerminalGeometry>,
+    ) -> bool {
+        self.revision == Some(revision) && self.geometry == geometry && geometry.is_some()
+    }
+
+    fn next(
+        &mut self,
+        token: u64,
+        target: Option<&str>,
+        frame_current: bool,
+        revision: u64,
+        geometry: Option<terminal_view::geometry::TerminalGeometry>,
+        now: Instant,
+    ) -> Result<Option<SelectionCommand>, ()> {
+        if self
+            .target
+            .as_ref()
+            .is_none_or(|(queued_token, queued_target)| {
+                *queued_token != token || Some(queued_target.as_str()) != target
+            })
+            || !self.matches_frame(revision, geometry)
+            || self.deadline.is_some_and(|deadline| now >= deadline)
+        {
+            return Err(());
+        }
+        Ok(frame_current
+            .then(|| self.commands.front().copied())
+            .flatten())
+    }
+}
+
+fn terminal_frame_due(
+    force: bool,
+    scroll_rows: isize,
+    due: bool,
+    scroll_active: bool,
+    pending_output: bool,
+) -> Option<bool> {
+    if scroll_active && !pending_output && scroll_rows == 0 && !force {
+        return None;
+    }
+    Some(force || scroll_rows != 0 || due)
+}
+
+#[derive(Default)]
+struct SelectionFrameStatus {
+    painted: bool,
+    size_matches: bool,
+    pending_output: bool,
+    pending_scroll: bool,
+    frame_in_flight: bool,
+    resize_in_flight: bool,
+}
+
+impl SelectionFrameStatus {
+    fn current(&self) -> bool {
+        self.painted
+            && self.size_matches
+            && !self.pending_output
+            && !self.pending_scroll
+            && !self.frame_in_flight
+            && !self.resize_in_flight
+    }
+}
 
 impl HerdrGui {
     fn new(cx: &mut Context<Self>) -> Self {
@@ -291,11 +398,16 @@ impl HerdrGui {
             terminal: None,
             terminal_target: None,
             terminal_size: None,
+            terminal_resize_in_flight: false,
             terminal_token: 0,
             terminal_frame: Arc::new(TerminalFrame::default()),
             terminal_pane: cx.new(TerminalPane::new),
+            selection_drag: None,
+            selection_queue: SelectionQueue::default(),
+            terminal_revision: 0,
             last_terminal_frame_at: None,
             terminal_pending_frame: false,
+            terminal_force_frame: false,
             terminal_frame_in_flight: false,
             pending_vt: Vec::new(),
             terminal_bg: 0x0a0a0a,
@@ -437,6 +549,10 @@ impl HerdrGui {
             return;
         };
         self.send_input(PendingInput::Paste(text.to_string()), cx);
+    }
+
+    fn copy_selection(&mut self, _: &CopySelection, _window: &mut Window, cx: &mut Context<Self>) {
+        self.enqueue_selection(SelectionCommand::Copy, cx);
     }
 
     fn theme_system(&mut self, _: &ThemeSystem, _window: &mut Window, cx: &mut Context<Self>) {
@@ -657,6 +773,7 @@ impl HerdrGui {
             .push_back(changes_focus.then_some(receiver));
         self.state_generation = self.state_generation.wrapping_add(1);
         if changes_focus {
+            self.invalidate_selection(cx);
             self.focus_change_pending = true;
             self.focus_result_confirmed = false;
             if self.terminal.is_none() {
@@ -690,6 +807,8 @@ impl HerdrGui {
             if window
                 .update(cx, |_, window, cx| {
                     this.update(cx, |view, cx| {
+                      view.sync_terminal_geometry(window, cx);
+                      view.process_selection_queue(cx);
                       loop {
                         let completion = match view.command_worker.try_recv() {
                             Ok(completion) => completion,
@@ -1020,10 +1139,42 @@ impl HerdrGui {
         }
         self.terminal_frame = frame.clone();
         self.last_terminal_frame_at = Some(Instant::now());
-        self.terminal_pending_frame = false;
         // Only notify TerminalPane — never root/sidebar (cached siblings stay cold).
         self.terminal_pane
             .update(cx, |pane, cx| pane.set_frame(frame, cx));
+    }
+
+    fn selection_frame_current(&self, cx: &App) -> bool {
+        SelectionFrameStatus {
+            painted: self
+                .terminal_pane
+                .read(cx)
+                .has_painted(&self.terminal_frame),
+            size_matches: self.terminal_size.is_some()
+                && self.terminal_size == self.terminal_size(cx),
+            pending_output: self.terminal_pending_frame || !self.pending_vt.is_empty(),
+            pending_scroll: self.pending_scroll_rows != 0,
+            frame_in_flight: self.terminal_frame_in_flight,
+            resize_in_flight: self.terminal_resize_in_flight,
+        }
+        .current()
+    }
+
+    fn cancel_selection(&mut self, cx: &mut Context<Self>) {
+        self.selection_queue = SelectionQueue::default();
+        self.selection_drag = None;
+        self.warn("Selection cancelled because the terminal changed or was busy; try again.");
+        cx.notify();
+    }
+
+    fn invalidate_selection(&mut self, cx: &mut Context<Self>) {
+        self.terminal_revision = self.terminal_revision.wrapping_add(1);
+        if self.selection_queue.pointer_down
+            || !self.selection_queue.commands.is_empty()
+            || self.selection_drag.is_some()
+        {
+            self.cancel_selection(cx);
+        }
     }
 
     fn notify_sidebar(&self, cx: &mut Context<Self>) {
@@ -1043,21 +1194,27 @@ impl HerdrGui {
         let scroll_rows = self.pending_scroll_rows;
         self.pending_scroll_rows = 0;
         let vt_drain = std::mem::take(&mut self.pending_vt);
-        let want_frame = force || scroll_rows != 0 || due;
-        // While reading history, still apply scroll + paint; only skip idle VT repaints.
-        if self.scroll_active && scroll_rows == 0 && !force && vt_drain.is_empty() {
+        let Some(want_frame) = terminal_frame_due(
+            force,
+            scroll_rows,
+            due,
+            self.scroll_active,
+            self.terminal_pending_frame || !vt_drain.is_empty(),
+        ) else {
             return;
-        }
+        };
         if !want_frame || self.terminal_frame_in_flight {
             self.pending_scroll_rows = self.pending_scroll_rows.saturating_add(scroll_rows);
             if !vt_drain.is_empty() {
                 self.pending_vt.extend_from_slice(&vt_drain);
             }
             self.terminal_pending_frame = true;
+            self.terminal_force_frame |= force;
             return;
         }
         self.terminal_frame_in_flight = true;
         self.terminal_pending_frame = false;
+        self.terminal_force_frame = false;
         self.last_terminal_frame_at = Some(Instant::now());
         let token = self.terminal_token;
         cx.spawn(async move |this, cx| {
@@ -1088,33 +1245,35 @@ impl HerdrGui {
                     return;
                 }
                 view.terminal_frame_in_flight = false;
-                if let Ok(frame) = frame {
-                    view.set_terminal_frame(Arc::new(frame), cx);
+                match frame {
+                    Ok(frame) => view.set_terminal_frame(Arc::new(frame), cx),
+                    Err(_) => {
+                        view.terminal_pending_frame = true;
+                        view.terminal_force_frame = true;
+                        return;
+                    }
                 }
                 if view.terminal_pending_frame || view.pending_scroll_rows != 0 {
-                    view.maybe_refresh_terminal_frame(cx, false);
+                    view.maybe_refresh_terminal_frame(cx, view.terminal_force_frame);
                 }
             });
         })
         .detach();
     }
 
-    fn sync_terminal_geometry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn sync_terminal_geometry(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(terminal) = self.terminal.clone() else {
             return;
         };
-        let size = self.terminal_size(window);
-        if self.terminal_size == Some(size) {
+        let Some(size) = self.terminal_size(cx) else {
+            return;
+        };
+        if self.terminal_size == Some(size) || self.terminal_resize_in_flight {
             return;
         }
+        self.invalidate_selection(cx);
         let token = self.terminal_token;
-        if let Ok(mut session) = terminal.try_lock() {
-            if let Ok(frame) = session.resize(size.0, size.1, size.2, size.3) {
-                self.set_terminal_frame(Arc::new(frame), cx);
-            }
-            self.terminal_size = Some(size);
-            return;
-        }
+        self.terminal_resize_in_flight = true;
         cx.spawn(async move |this, cx| {
             let frame = cx
                 .background_executor()
@@ -1129,26 +1288,32 @@ impl HerdrGui {
                 if view.terminal_token != token {
                     return;
                 }
+                view.terminal_resize_in_flight = false;
                 if let Ok(frame) = frame {
                     view.set_terminal_frame(Arc::new(frame), cx);
+                    view.terminal_size = Some(size);
+                    view.maybe_refresh_terminal_frame(cx, true);
+                } else {
+                    view.terminal_pending_frame = true;
+                    view.terminal_force_frame = true;
                 }
-                view.terminal_size = Some(size);
-                cx.notify();
             });
         })
         .detach();
     }
 
     fn attach_focused_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let size = self.terminal_size(window);
+        let size = self.terminal_size(cx).unwrap_or((80, 24, 0, 0));
         let pane = self.focused_pane().cloned();
         let target = pane
             .as_ref()
             .and_then(|pane| pane.terminal_id.clone())
             .or_else(|| pane.as_ref().map(|pane| pane.pane_id.clone()));
         if target.is_none() {
+            self.invalidate_selection(cx);
             self.terminal_token = self.terminal_token.wrapping_add(1);
             self.terminal_frame_in_flight = false;
+            self.terminal_resize_in_flight = false;
             self.terminal = None;
             self.terminal_target = None;
             self.pending_vt.clear();
@@ -1173,8 +1338,10 @@ impl HerdrGui {
             }
             return;
         }
+        self.invalidate_selection(cx);
         self.terminal_token = self.terminal_token.wrapping_add(1);
         self.terminal_frame_in_flight = false;
+        self.terminal_resize_in_flight = false;
         self.terminal = None;
         self.terminal_target = None;
         self.pending_vt.clear();
@@ -1229,6 +1396,7 @@ impl HerdrGui {
                             }
                             poll_terminal(receiver, token, cx);
                             view.flush_pending_input(token, cx);
+                            view.maybe_refresh_terminal_frame(cx, true);
                         } else {
                             view.discard_pending_input();
                             view.terminal_target = None;
@@ -1247,6 +1415,7 @@ impl HerdrGui {
                                         fg: 0xfca5a5,
                                         bg: None,
                                     }],
+                                    ..TerminalLine::default()
                                 }],
                             }),
                             cx,
@@ -1424,6 +1593,7 @@ impl HerdrGui {
         if rows == 0 || self.terminal.is_none() {
             return;
         }
+        self.invalidate_selection(cx);
         // Arbor-style: only treat upward viewport movement as leaving live output.
         self.scroll_active = rows > 0;
         self.pending_scroll_rows += rows;
@@ -1506,6 +1676,200 @@ impl HerdrGui {
     set_theme!(theme_vesper, ThemeVesper, "vesper");
     set_theme!(theme_oled, ThemeOled, "oled");
 
+    fn selection_cell(&self, position: (f64, f64), clamp: bool, cx: &App) -> Option<(u16, u16)> {
+        let geometry = self.terminal_pane.read(cx).geometry()?;
+        let point = terminal_view::geometry::Point {
+            x: position.0,
+            y: position.1,
+        };
+        let cell = if clamp {
+            geometry.hit_test_clamped(point)?
+        } else {
+            geometry.hit_test(point)?
+        };
+        Some((
+            u16::try_from(cell.column).ok()?,
+            u16::try_from(cell.row).ok()?,
+        ))
+    }
+
+    fn start_selection(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let position = (event.position.x.to_f64(), event.position.y.to_f64());
+        if self.selection_cell(position, false, cx).is_some() {
+            self.enqueue_selection(SelectionCommand::Begin(position), cx);
+        }
+    }
+
+    fn enqueue_selection(&mut self, command: SelectionCommand, cx: &mut Context<Self>) {
+        if self.focus_change_pending
+            || self.reconciliation_required
+            || self.pending_input.is_blocked()
+            || self.attached_focused_pane().is_none()
+        {
+            return;
+        }
+        let Some(target) = self.terminal_target.clone() else {
+            return;
+        };
+        if matches!(
+            command,
+            SelectionCommand::Move(_, _) | SelectionCommand::End
+        ) && !self.selection_queue.pointer_down
+        {
+            return;
+        }
+        let geometry = self.terminal_pane.read(cx).geometry();
+        let active = self.selection_queue.pointer_down
+            || !self.selection_queue.commands.is_empty()
+            || self.selection_drag.is_some();
+        if active {
+            if !self
+                .selection_queue
+                .matches_frame(self.terminal_revision, geometry)
+                || self
+                    .selection_queue
+                    .target
+                    .as_ref()
+                    .is_none_or(|(token, old_target)| {
+                        *token != self.terminal_token || old_target != &target
+                    })
+            {
+                self.cancel_selection(cx);
+                return;
+            }
+        } else {
+            if !self.selection_frame_current(cx) || geometry.is_none() {
+                self.cancel_selection(cx);
+                return;
+            }
+            self.selection_queue = SelectionQueue::default();
+            self.selection_queue.revision = Some(self.terminal_revision);
+            self.selection_queue.geometry = geometry;
+        }
+        self.selection_queue
+            .push(self.terminal_token, &target, command);
+        self.process_selection_queue(cx);
+    }
+
+    fn process_selection_queue(&mut self, cx: &mut Context<Self>) {
+        if self.selection_queue.commands.is_empty() {
+            return;
+        }
+        if self.focus_change_pending
+            || self.reconciliation_required
+            || self.pending_input.is_blocked()
+            || self.attached_focused_pane().is_none()
+        {
+            self.cancel_selection(cx);
+            return;
+        }
+        let current = self.selection_frame_current(cx);
+        let result = self.selection_queue.next(
+            self.terminal_token,
+            self.terminal_target.as_deref(),
+            current,
+            self.terminal_revision,
+            self.terminal_pane.read(cx).geometry(),
+            Instant::now(),
+        );
+        let command = match result {
+            Ok(Some(command)) => command,
+            Ok(None) => return,
+            Err(()) => {
+                self.cancel_selection(cx);
+                return;
+            }
+        };
+        let cell = match command {
+            SelectionCommand::Begin(position) => self.selection_cell(position, false, cx),
+            SelectionCommand::Move(position, _) => self.selection_cell(position, true, cx),
+            _ => None,
+        };
+        let Some(terminal) = self.terminal.clone() else {
+            return;
+        };
+        let Ok(mut session) = terminal.try_lock() else {
+            return;
+        };
+        self.selection_queue.commands.pop_front();
+        if self.selection_queue.commands.is_empty() {
+            self.selection_queue.deadline = None;
+        }
+        let mut refresh = false;
+        let mut cancel = false;
+        let mut copied = None;
+        let result = match command {
+            SelectionCommand::Begin(_) => {
+                self.selection_drag = None;
+                if let Some(cell) = cell {
+                    refresh = true;
+                    let result = session
+                        .clear_selection()
+                        .and_then(|()| session.begin_selection_drag(cell));
+                    if result.is_ok() {
+                        self.selection_drag = Some((self.terminal_token, cell, false));
+                    }
+                    result
+                } else {
+                    cancel = true;
+                    Ok(())
+                }
+            }
+            SelectionCommand::Move(_, rectangle) => {
+                if let (Some(cell), Some((token, anchor, moved))) = (cell, self.selection_drag) {
+                    if cell == anchor && !moved {
+                        Ok(())
+                    } else {
+                        refresh = true;
+                        match session.update_selection_drag(cell, rectangle) {
+                            Ok(true) => {
+                                self.selection_drag = Some((token, anchor, true));
+                                Ok(())
+                            }
+                            Ok(false) => {
+                                self.selection_drag = None;
+                                cancel = true;
+                                Ok(())
+                            }
+                            Err(err) => {
+                                self.selection_drag = None;
+                                Err(err)
+                            }
+                        }
+                    }
+                } else {
+                    Ok(())
+                }
+            }
+            SelectionCommand::End => {
+                session.end_selection_drag();
+                self.selection_drag = None;
+                Ok(())
+            }
+            SelectionCommand::Copy => match session.copy_selection() {
+                Ok(text) => {
+                    copied = text;
+                    Ok(())
+                }
+                Err(err) => Err(err),
+            },
+        };
+        drop(session);
+        if let Some(text) = copied {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+        if let Err(err) = result {
+            self.warn(format!("Selection failed: {err}"));
+            cancel = true;
+        }
+        if cancel {
+            self.cancel_selection(cx);
+        }
+        if refresh {
+            self.maybe_refresh_terminal_frame(cx, true);
+        }
+    }
+
     #[allow(dead_code)]
     fn handle_mouse_move(
         &mut self,
@@ -1513,23 +1877,20 @@ impl HerdrGui {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if event.dragging() {
+            self.enqueue_selection(
+                SelectionCommand::Move(
+                    (event.position.x.to_f64(), event.position.y.to_f64()),
+                    event.modifiers.alt,
+                ),
+                cx,
+            );
+        }
         if self.sidebar_resizing && event.dragging() {
             let width = event.position.x.to_f64();
             self.sidebar_animation.width = width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
             self.sidebar_animation.start = self.sidebar_animation.width;
             self.sidebar_animation.target = self.sidebar_animation.width;
-            let size = self.terminal_size(_window);
-            if self.terminal_size != Some(size) {
-                if let Some(terminal) = self.terminal.clone() {
-                    let frame = terminal.try_lock().ok().and_then(|mut terminal| {
-                        terminal.resize(size.0, size.1, size.2, size.3).ok()
-                    });
-                    if let Some(frame) = frame {
-                        self.set_terminal_frame(Arc::new(frame), cx);
-                    }
-                }
-                self.terminal_size = Some(size);
-            }
             cx.notify();
             return;
         }
@@ -1542,7 +1903,22 @@ impl HerdrGui {
     }
 
     #[allow(dead_code)]
-    fn handle_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_mouse_up(
+        &mut self,
+        event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button == MouseButton::Left {
+            self.enqueue_selection(
+                SelectionCommand::Move(
+                    (event.position.x.to_f64(), event.position.y.to_f64()),
+                    event.modifiers.alt,
+                ),
+                cx,
+            );
+            self.enqueue_selection(SelectionCommand::End, cx);
+        }
         if self.sidebar_resizing {
             self.sidebar_resizing = false;
             self.save_settings();
@@ -1690,6 +2066,7 @@ impl Render for HerdrGui {
 
         root.key_context("HerdrGui")
             .track_focus(&self.focus_handle)
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::handle_mouse_up))
             .on_action(cx.listener(Self::toggle_help))
             .on_action(cx.listener(Self::refresh))
             .on_action(cx.listener(Self::split_right))
@@ -1708,6 +2085,7 @@ impl Render for HerdrGui {
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_agents))
             .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::toggle_sidebar_layout))
             .on_action(cx.listener(Self::theme_catppuccin))
             .on_action(cx.listener(Self::theme_catppuccin_latte))
@@ -1942,27 +2320,11 @@ impl HerdrGui {
         }
     }
 
-    fn chrome_height(&self) -> f64 {
-        let mut chrome = MACOS_TITLEBAR_HEIGHT;
-        if self.sidebar_layout == SidebarLayout::Arc {
-            chrome += TOP_TAB_BAR_HEIGHT;
-        }
-        chrome
-    }
-
-    fn terminal_size(&self, window: &Window) -> TerminalSize {
-        let size = window.bounds().size;
-        let width = (size.width.to_f64() - self.sidebar_width() - RESIZE_HANDLE_WIDTH)
-            .max(TERMINAL_MIN_WIDTH);
-        let height = (size.height.to_f64() - self.chrome_height()).max(TERMINAL_MIN_HEIGHT);
-        let cols = (width / TERMINAL_CELL_WIDTH)
-            .floor()
-            .clamp(TERMINAL_MIN_COLS, TERMINAL_MAX_COLS) as u16;
-        let paint_fudge = 2.0;
-        let rows = ((height - paint_fudge) / TERMINAL_CELL_HEIGHT)
-            .floor()
-            .clamp(TERMINAL_MIN_ROWS, TERMINAL_MAX_ROWS) as u16;
-        (cols, rows, width.round() as u16, height.round() as u16)
+    fn terminal_size(&self, cx: &App) -> Option<TerminalSize> {
+        self.terminal_pane
+            .read(cx)
+            .geometry()
+            .map(|geometry| geometry.pty_size())
     }
 
     /// Built inside SidebarPane::render so spaces toggle reflows tabs in-pane only.
@@ -2344,6 +2706,7 @@ impl HerdrGui {
             .line_height(px(18.0))
             .text_color(rgb(theme.text))
             .on_scroll_wheel(cx.listener(Self::handle_terminal_scroll))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::start_selection))
             .child(cached_terminal(self.terminal_pane.clone()))
             .into_any_element()
     }
@@ -2862,6 +3225,7 @@ fn main() {
             KeyBinding::new("cmd-b", ToggleSidebar, None),
             KeyBinding::new("cmd-shift-a", ToggleAgents, None),
             KeyBinding::new("cmd-v", Paste, None),
+            KeyBinding::new("cmd-c", CopySelection, None),
             KeyBinding::new("cmd-shift-l", ToggleSidebarLayout, None),
             KeyBinding::new("cmd-shift-r", ReloadHerdrConfig, None),
             KeyBinding::new("cmd-t", NewTab, None),
@@ -2943,6 +3307,7 @@ fn poll_terminal(receiver: Receiver<Vec<u8>>, token: u64, cx: &mut Context<Herdr
                     return;
                 }
                 if !accumulated.is_empty() {
+                    view.invalidate_selection(cx);
                     bytes_window = bytes_window.saturating_add(accumulated.len());
                     writes_window = writes_window.wrapping_add(1);
                     if let Some(terminal) = view.terminal.clone() {
@@ -2963,6 +3328,7 @@ fn poll_terminal(receiver: Receiver<Vec<u8>>, token: u64, cx: &mut Context<Herdr
                                     view.pending_vt.len() + accumulated.len(),
                                 ));
                                 view.pending_vt.extend_from_slice(&accumulated);
+                                view.terminal_pending_frame = true;
                             }
                         }
                     }
@@ -2995,8 +3361,10 @@ fn poll_terminal(receiver: Receiver<Vec<u8>>, token: u64, cx: &mut Context<Herdr
                 if view.terminal_token != token {
                     return;
                 }
+                view.invalidate_selection(cx);
                 view.terminal_token = view.terminal_token.wrapping_add(1);
                 view.terminal_frame_in_flight = false;
+                view.terminal_resize_in_flight = false;
                 view.terminal = None;
                 view.terminal_target = None;
                 view.terminal_size = None;
@@ -3014,8 +3382,160 @@ fn poll_terminal(receiver: Receiver<Vec<u8>>, token: u64, cx: &mut Context<Herdr
 
 #[cfg(test)]
 mod focus_state_tests {
-    use super::{focused_pane_in_state, rightward_destination, HerdrState, Pane};
+    use super::{
+        focused_pane_in_state, rightward_destination, terminal_frame_due, HerdrState, Pane,
+        SelectionCommand, SelectionFrameStatus, SelectionQueue,
+    };
     use crate::herdr::{PaneLayout, PaneLayoutPane, PaneLayoutRect};
+    use crate::terminal_view::geometry::{Point, Rect, TerminalGeometry};
+
+    #[test]
+    fn release_and_copy_wait_for_current_frames_in_order() {
+        let mut queue = SelectionQueue::default();
+        let geometry = TerminalGeometry::new(
+            Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                width: 800.0,
+                height: 400.0,
+            },
+            8.0,
+            20.0,
+            100,
+            20,
+        );
+        queue.revision = Some(7);
+        queue.geometry = geometry;
+        let now = std::time::Instant::now();
+        queue.push(1, "a", SelectionCommand::Begin((1.0, 2.0)));
+        queue.push(1, "a", SelectionCommand::Move((2.0, 3.0), false));
+        queue.push(1, "a", SelectionCommand::Move((9.0, 8.0), true));
+        queue.push(1, "a", SelectionCommand::End);
+        queue.push(1, "a", SelectionCommand::Copy);
+        assert_eq!(queue.next(1, Some("a"), false, 7, geometry, now), Ok(None));
+        for command in [
+            SelectionCommand::Begin((1.0, 2.0)),
+            SelectionCommand::Move((9.0, 8.0), true),
+            SelectionCommand::End,
+            SelectionCommand::Copy,
+        ] {
+            assert_eq!(
+                queue.next(1, Some("a"), true, 7, geometry, now),
+                Ok(Some(command))
+            );
+            queue.commands.pop_front();
+            assert_eq!(queue.next(1, Some("a"), false, 7, geometry, now), Ok(None));
+        }
+        queue.push(1, "a", SelectionCommand::Copy);
+        assert_eq!(queue.next(2, Some("a"), true, 7, geometry, now), Err(()));
+        assert_eq!(queue.next(1, Some("b"), true, 7, geometry, now), Err(()));
+    }
+
+    #[test]
+    fn queued_pointer_rejects_scroll_resize_and_unbounded_wait() {
+        let mut queue = SelectionQueue::default();
+        let geometry = TerminalGeometry::new(
+            Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                width: 800.0,
+                height: 400.0,
+            },
+            8.0,
+            20.0,
+            100,
+            20,
+        );
+        let resized = TerminalGeometry::new(
+            Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                width: 400.0,
+                height: 400.0,
+            },
+            8.0,
+            20.0,
+            100,
+            20,
+        );
+        queue.revision = Some(7);
+        queue.geometry = geometry;
+        queue.push(1, "a", SelectionCommand::Begin((20.0, 20.0)));
+        queue.push(1, "a", SelectionCommand::Move((100.0, 20.0), false));
+        queue.push(1, "a", SelectionCommand::End);
+        queue.push(1, "a", SelectionCommand::Copy);
+        let now = std::time::Instant::now();
+        assert_eq!(queue.next(1, Some("a"), true, 8, geometry, now), Err(()));
+        for revision in 8..1008 {
+            assert_eq!(
+                queue.next(1, Some("a"), false, revision, geometry, now),
+                Err(())
+            );
+        }
+        assert_eq!(queue.next(1, Some("a"), true, 7, resized, now), Err(()));
+        assert_eq!(queue.next(1, Some("a"), false, 7, geometry, now), Ok(None));
+        assert_eq!(
+            queue.next(
+                1,
+                Some("a"),
+                false,
+                7,
+                geometry,
+                now + std::time::Duration::from_secs(2)
+            ),
+            Err(())
+        );
+        assert_eq!(queue.commands.len(), 4);
+    }
+
+    #[test]
+    fn scrollback_output_still_requests_a_frame() {
+        assert_eq!(terminal_frame_due(false, 0, true, true, true), Some(true));
+        assert_eq!(terminal_frame_due(false, 0, false, true, true), Some(false));
+        assert_eq!(terminal_frame_due(false, 0, true, true, false), None);
+    }
+
+    #[test]
+    fn selection_waits_for_output_resize_scroll_and_paint() {
+        let mut status = SelectionFrameStatus {
+            painted: true,
+            size_matches: true,
+            ..Default::default()
+        };
+        assert!(status.current());
+        status.pending_output = true;
+        assert!(!status.current());
+        status.pending_output = false;
+        status.frame_in_flight = true;
+        assert!(!status.current());
+        status.frame_in_flight = false;
+        status.painted = false;
+        assert!(!status.current());
+        status.painted = true;
+        status.resize_in_flight = true;
+        assert!(!status.current());
+        status.resize_in_flight = false;
+        status.size_matches = false;
+        assert!(!status.current());
+        status.size_matches = true;
+        status.pending_scroll = true;
+        assert!(!status.current());
+        status.pending_scroll = false;
+        assert!(status.current());
+    }
+
+    #[test]
+    fn pty_dimensions_follow_viewport_not_previous_frame_size() {
+        let geometry = TerminalGeometry::new(
+            Rect {
+                origin: Point { x: 200.0, y: 40.0 },
+                width: 803.0,
+                height: 421.0,
+            },
+            8.0,
+            20.0,
+            80,
+            24,
+        );
+        assert_eq!(geometry.map(|g| g.pty_size()), Some((100, 21, 803, 421)));
+    }
 
     #[test]
     fn direction_recovery_requires_matching_rightward_layout() {
