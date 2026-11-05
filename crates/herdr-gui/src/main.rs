@@ -1,3 +1,4 @@
+mod command_worker;
 mod ghostty;
 mod help;
 mod herdr;
@@ -22,6 +23,7 @@ use input::{key_name, should_swallow_gui_keystroke};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{
+    collections::VecDeque,
     sync::mpsc::{Receiver, TryRecvError},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -100,6 +102,10 @@ enum ThemeMode {
 
 struct HerdrGui {
     client: Option<HerdrClient>,
+    command_worker: command_worker::CommandWorker,
+    command_results: VecDeque<Option<Receiver<HerdrState>>>,
+    focus_change_pending: bool,
+    reconciliation_required: bool,
     state_request_in_flight: bool,
     state_generation: u64,
     state_valid: bool,
@@ -231,6 +237,10 @@ impl HerdrGui {
             .clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
         Self {
             client: None,
+            command_worker: command_worker::CommandWorker::new(),
+            command_results: VecDeque::new(),
+            focus_change_pending: false,
+            reconciliation_required: false,
             state_request_in_flight: false,
             state_generation: 0,
             state_valid: false,
@@ -375,9 +385,6 @@ impl HerdrGui {
     }
 
     fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client.clone() else {
-            return;
-        };
         let Some(pane) = self.attached_focused_pane().cloned() else {
             return;
         };
@@ -388,15 +395,7 @@ impl HerdrGui {
             return;
         };
         let pane_id = pane.pane_id;
-        cx.spawn(async move |this, cx| {
-            if let Err(err) = client.paste_text(&pane_id, &text) {
-                let _ = this.update(cx, |view, cx| {
-                    view.status = err.to_string();
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
+        self.submit_command(false, move |client| client.paste_text(&pane_id, &text), cx);
     }
 
     fn theme_system(&mut self, _: &ThemeSystem, _window: &mut Window, cx: &mut Context<Self>) {
@@ -433,9 +432,7 @@ impl HerdrGui {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.with_client(HerdrClient::reload_config);
-        self.refresh_state();
-        cx.notify();
+        self.submit_command(true, HerdrClient::reload_config, cx);
     }
 
     fn save_settings(&mut self) {
@@ -457,11 +454,14 @@ impl HerdrGui {
     }
 
     fn refresh(&mut self, _: &Refresh, window: &mut Window, cx: &mut Context<Self>) {
-        self.request_state(window, cx);
+        self.request_state(window, cx, true);
     }
 
-    fn request_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.state_request_in_flight {
+    fn request_state(&mut self, window: &mut Window, cx: &mut Context<Self>, explicit: bool) {
+        if self.state_request_in_flight || !self.command_results.is_empty() {
+            return;
+        }
+        if self.reconciliation_required && !explicit {
             return;
         }
         self.state_request_in_flight = true;
@@ -489,12 +489,20 @@ impl HerdrGui {
                     view.state_request_in_flight = false;
                     if view.state_generation != generation {
                         if view.client.is_none() {
-                            view.request_state(window, cx);
+                            view.request_state(window, cx, false);
                         }
                         return;
                     }
                     match result {
                         Ok((client, state)) => {
+                            if view.reconciliation_required {
+                                if view.command_worker.resume().is_err() {
+                                    view.status = "Command worker unavailable".to_string();
+                                    cx.notify();
+                                    return;
+                                }
+                                view.reconciliation_required = false;
+                            }
                             view.client = Some(client);
                             view.state = state;
                             view.state_valid = true;
@@ -505,7 +513,11 @@ impl HerdrGui {
                             view.client = None;
                             view.state = HerdrState::default();
                             view.state_valid = false;
-                            view.status = format!("{err}; use Refresh to retry");
+                            view.status = if view.reconciliation_required {
+                                format!("Outcome may be unknown; reconciliation failed: {err}; use Refresh to retry")
+                            } else {
+                                format!("{err}; use Refresh to retry")
+                            };
                             view.attach_focused_terminal(window, cx);
                         }
                     }
@@ -525,7 +537,7 @@ impl HerdrGui {
                 .update(cx, |_, window, cx| {
                     this.update(cx, |view, cx| {
                         if view.client.is_some() {
-                            view.request_state(window, cx);
+                            view.request_state(window, cx, false);
                         }
                     })
                 })
@@ -537,37 +549,121 @@ impl HerdrGui {
         .detach();
     }
 
+    fn submit_command(
+        &mut self,
+        changes_focus: bool,
+        command: impl FnOnce(&HerdrClient) -> Result<(), herdr::HerdrError> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        if self.reconciliation_required || !self.state_valid || self.focus_change_pending {
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let result = self.command_worker.submit(move || {
+            command(&client).map_err(|_| "Command failed; outcome may be unknown".to_string())?;
+            if changes_focus {
+                let state = client
+                    .state()
+                    .map_err(|_| "State refresh failed; outcome may be unknown".to_string())?;
+                let _ = sender.send(state);
+            }
+            Ok(())
+        });
+        if result.is_err() {
+            self.reconciliation_required = true;
+            self.state_valid = false;
+            self.status = "Command worker unavailable; outcome may be unknown".to_string();
+            cx.notify();
+            return;
+        }
+        self.command_results
+            .push_back(changes_focus.then_some(receiver));
+        self.state_generation = self.state_generation.wrapping_add(1);
+        if changes_focus {
+            self.focus_change_pending = true;
+        }
+    }
+
+    fn start_command_polling(window: &mut Window, cx: &mut Context<Self>) {
+        let window = window.window_handle();
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(16))
+                .await;
+            if window
+                .update(cx, |_, window, cx| {
+                    this.update(cx, |view, cx| loop {
+                        let completion = match view.command_worker.try_recv() {
+                            Ok(completion) => completion,
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => {
+                                view.reconciliation_required = true;
+                                view.state_valid = false;
+                                view.status = "Command worker unavailable; outcome may be unknown"
+                                    .to_string();
+                                cx.notify();
+                                break;
+                            }
+                        };
+                        let Some(result) = view.command_results.pop_front() else {
+                            break;
+                        };
+                        if result.is_some() {
+                            view.focus_change_pending = false;
+                        }
+                        match completion {
+                            command_worker::Completion::Finished(Ok(())) => {
+                                if let Some(receiver) = result {
+                                    if let Ok(state) = receiver.try_recv() {
+                                        if !view.reconciliation_required {
+                                            view.state = state;
+                                            view.state_valid = true;
+                                            view.attach_focused_terminal(window, cx);
+                                            view.notify_sidebar(cx);
+                                        }
+                                    }
+                                }
+                            }
+                            command_worker::Completion::Finished(Err(error)) => {
+                                view.reconciliation_required = true;
+                                view.state_valid = false;
+                                view.state_generation = view.state_generation.wrapping_add(1);
+                                view.status = format!("{error}; use Refresh to reconcile");
+                            }
+                            command_worker::Completion::Skipped => {}
+                        }
+                        cx.notify();
+                    })
+                })
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
+    }
+
     fn split_right(&mut self, _: &SplitRight, _window: &mut Window, cx: &mut Context<Self>) {
-        self.with_first_pane(|client, pane| client.split_right(&pane.pane_id));
-        self.refresh_state();
-        cx.notify();
+        self.with_first_pane(|client, pane| client.split_right(&pane.pane_id), cx);
     }
 
     fn split_down(&mut self, _: &SplitDown, _window: &mut Window, cx: &mut Context<Self>) {
-        self.with_first_pane(|client, pane| client.split_down(&pane.pane_id));
-        self.refresh_state();
-        cx.notify();
+        self.with_first_pane(|client, pane| client.split_down(&pane.pane_id), cx);
     }
 
-    fn focus_right(&mut self, _: &FocusRight, window: &mut Window, cx: &mut Context<Self>) {
-        self.with_client(HerdrClient::focus_right);
-        self.refresh_state();
-        self.attach_focused_terminal(window, cx);
-        cx.notify();
+    fn focus_right(&mut self, _: &FocusRight, _window: &mut Window, cx: &mut Context<Self>) {
+        self.submit_command(true, HerdrClient::focus_right, cx);
     }
 
     fn resize_right(&mut self, _: &ResizeRight, _window: &mut Window, cx: &mut Context<Self>) {
-        self.with_first_pane(|client, pane| client.resize_right(&pane.pane_id));
-        self.refresh_state();
-        cx.notify();
+        self.with_first_pane(|client, pane| client.resize_right(&pane.pane_id), cx);
     }
 
-    fn close_pane(&mut self, _: &ClosePane, window: &mut Window, cx: &mut Context<Self>) {
-        self.with_first_pane(|client, pane| client.close_pane(&pane.pane_id));
-        self.refresh_state();
-        self.close_active_workspace_if_empty();
-        self.attach_focused_terminal(window, cx);
-        cx.notify();
+    fn close_pane(&mut self, _: &ClosePane, _window: &mut Window, cx: &mut Context<Self>) {
+        self.with_first_pane(|client, pane| client.close_pane(&pane.pane_id), cx);
     }
 
     fn previous_tab(&mut self, _: &PreviousTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -578,44 +674,37 @@ impl HerdrGui {
         self.focus_tab_offset(1, window, cx);
     }
 
-    fn new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
+    fn new_tab(&mut self, _: &NewTab, _window: &mut Window, cx: &mut Context<Self>) {
         let workspace_id = self.active_workspace_id().map(str::to_string);
-        self.with_client(|client| client.create_tab(workspace_id.as_deref()));
-        self.refresh_state();
-        self.attach_focused_terminal(window, cx);
-        self.notify_sidebar(cx);
-        cx.notify();
+        self.submit_command(
+            true,
+            move |client| client.create_tab(workspace_id.as_deref()),
+            cx,
+        );
     }
 
-    fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+    fn close_tab(&mut self, _: &CloseTab, _window: &mut Window, cx: &mut Context<Self>) {
         let tab_id = self.active_tab().map(|tab| tab.tab_id.clone());
         if let Some(tab_id) = tab_id {
-            self.with_client(|client| client.close_tab(&tab_id));
-            self.refresh_state();
-            self.attach_focused_terminal(window, cx);
-            cx.notify();
+            self.submit_command(true, move |client| client.close_tab(&tab_id), cx);
         }
     }
 
-    fn new_workspace(&mut self, _: &NewWorkspace, window: &mut Window, cx: &mut Context<Self>) {
-        self.with_client(HerdrClient::create_workspace);
-        self.refresh_state();
-        self.attach_focused_terminal(window, cx);
-        cx.notify();
+    fn new_workspace(&mut self, _: &NewWorkspace, _window: &mut Window, cx: &mut Context<Self>) {
+        self.submit_command(true, HerdrClient::create_workspace, cx);
     }
 
     fn close_workspace_id(
         &mut self,
         workspace_id: String,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.with_client(|client| client.close_workspace(&workspace_id));
-        self.refresh_state();
-        self.terminal_target = None;
-        self.terminal_size = None;
-        self.attach_focused_terminal(window, cx);
-        cx.notify();
+        self.submit_command(
+            true,
+            move |client| client.close_workspace(&workspace_id),
+            cx,
+        );
     }
 
     fn previous_workspace(
@@ -634,24 +723,20 @@ impl HerdrGui {
     fn focus_workspace_id(
         &mut self,
         workspace_id: String,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.sidebar_pane
             .update(cx, |pane, cx| pane.close_spaces(cx));
-        self.with_client(|client| client.focus_workspace(&workspace_id));
-        self.refresh_state();
-        self.attach_focused_terminal(window, cx);
-        self.notify_sidebar(cx);
-        cx.notify();
+        self.submit_command(
+            true,
+            move |client| client.focus_workspace(&workspace_id),
+            cx,
+        );
     }
 
-    fn focus_tab_id(&mut self, tab_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.with_client(|client| client.focus_tab(&tab_id));
-        self.refresh_state();
-        self.attach_focused_terminal(window, cx);
-        self.notify_sidebar(cx);
-        cx.notify();
+    fn focus_tab_id(&mut self, tab_id: String, _window: &mut Window, cx: &mut Context<Self>) {
+        self.submit_command(true, move |client| client.focus_tab(&tab_id), cx);
     }
 
     fn focus_tab_offset(&mut self, offset: isize, window: &mut Window, cx: &mut Context<Self>) {
@@ -701,13 +786,9 @@ impl HerdrGui {
         );
     }
 
-    fn focus_pane_id(&mut self, pane_id: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn focus_pane_id(&mut self, pane_id: String, _window: &mut Window, cx: &mut Context<Self>) {
         self.reset_terminal_scroll_state();
-        self.with_client(|client| client.focus_pane(&pane_id));
-        self.refresh_state();
-        self.attach_focused_terminal(window, cx);
-        self.maybe_refresh_terminal_frame(cx, true);
-        cx.notify();
+        self.submit_command(true, move |client| client.focus_pane(&pane_id), cx);
     }
 
     fn focus_target(
@@ -715,53 +796,25 @@ impl HerdrGui {
         workspace_id: Option<String>,
         tab_id: Option<String>,
         pane_id: Option<String>,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(workspace_id) = workspace_id {
-            self.with_client(|client| client.focus_workspace(&workspace_id));
-        }
-        if let Some(tab_id) = tab_id {
-            self.with_client(|client| client.focus_tab(&tab_id));
-        }
-        if let Some(pane_id) = pane_id {
-            self.with_client(|client| client.focus_pane(&pane_id));
-        }
-        self.refresh_state();
-        self.attach_focused_terminal(window, cx);
-        cx.notify();
-    }
-
-    fn refresh_state(&mut self) {
-        self.state_generation = self.state_generation.wrapping_add(1);
-        let started = Instant::now();
-        if let Some(client) = &self.client {
-            match client.state() {
-                Ok(state) => {
-                    lag_log(format_args!(
-                        "refresh_state ok workspaces={} tabs={} panes={} agents={} {:.2}ms",
-                        state.workspaces.len(),
-                        state.tabs.len(),
-                        state.panes.len(),
-                        state.agents.len(),
-                        started.elapsed().as_secs_f64() * 1000.0,
-                    ));
-                    self.state = state;
-                    self.state_valid = true;
-                    self.status = "connected".to_string();
+        self.submit_command(
+            true,
+            move |client| {
+                if let Some(workspace_id) = workspace_id {
+                    client.focus_workspace(&workspace_id)?;
                 }
-                Err(err) => {
-                    self.state_valid = false;
-                    lag_log(format_args!(
-                        "refresh_state err {err} {:.2}ms",
-                        started.elapsed().as_secs_f64() * 1000.0
-                    ));
-                    self.status = err.to_string();
+                if let Some(tab_id) = tab_id {
+                    client.focus_tab(&tab_id)?;
                 }
-            }
-        } else {
-            lag_log(format_args!("refresh_state skipped no client"));
-        }
+                if let Some(pane_id) = pane_id {
+                    client.focus_pane(&pane_id)?;
+                }
+                Ok(())
+            },
+            cx,
+        );
     }
 
     fn set_terminal_frame(&mut self, frame: Arc<TerminalFrame>, cx: &mut Context<Self>) {
@@ -958,7 +1011,9 @@ impl HerdrGui {
                         if let Some(receiver) = session.output.take() {
                             view.terminal = Some(Arc::new(Mutex::new(session)));
                             view.terminal_size = Some(size);
-                            view.status = "connected".to_string();
+                            if !view.reconciliation_required {
+                                view.status = "connected".to_string();
+                            }
                             poll_terminal(receiver, token, cx);
                         }
                     }
@@ -977,7 +1032,9 @@ impl HerdrGui {
                             }),
                             cx,
                         );
-                        view.status = err;
+                        if !view.reconciliation_required {
+                            view.status = err;
+                        }
                     }
                 }
                 cx.notify();
@@ -986,40 +1043,13 @@ impl HerdrGui {
         .detach();
     }
 
-    fn close_active_workspace_if_empty(&mut self) {
-        let Some(workspace_id) = self.active_workspace_id().map(str::to_string) else {
-            return;
-        };
-        let has_panes = self
-            .state
-            .panes
-            .iter()
-            .any(|pane| pane.workspace_id.as_deref() == Some(workspace_id.as_str()));
-        if !has_panes {
-            self.with_client(|client| client.close_workspace(&workspace_id));
-            self.refresh_state();
-        }
-    }
-
-    fn with_client(&mut self, f: impl FnOnce(&HerdrClient) -> Result<(), herdr::HerdrError>) {
-        self.state_generation = self.state_generation.wrapping_add(1);
-        if let Some(client) = &self.client {
-            if let Err(err) = f(client) {
-                self.status = err.to_string();
-            }
-        }
-    }
-
     fn with_first_pane(
         &mut self,
-        f: impl FnOnce(&HerdrClient, &Pane) -> Result<(), herdr::HerdrError>,
+        f: impl FnOnce(&HerdrClient, &Pane) -> Result<(), herdr::HerdrError> + Send + 'static,
+        cx: &mut Context<Self>,
     ) {
-        self.state_generation = self.state_generation.wrapping_add(1);
-        let pane = self.focused_pane().cloned();
-        if let (Some(client), Some(pane)) = (&self.client, pane) {
-            if let Err(err) = f(client, &pane) {
-                self.status = err.to_string();
-            }
+        if let Some(pane) = self.focused_pane().cloned() {
+            self.submit_command(true, move |client| f(client, &pane), cx);
         }
     }
 
@@ -1055,9 +1085,6 @@ impl HerdrGui {
             return;
         }
 
-        let Some(client) = self.client.clone() else {
-            return;
-        };
         let Some(pane) = self.attached_focused_pane().cloned() else {
             return;
         };
@@ -1083,28 +1110,13 @@ impl HerdrGui {
         let pane_id = pane.pane_id;
         if key.modifiers.alt || key.modifiers.platform || key.modifiers.control || is_named {
             let key_str = key_name(key);
-            cx.spawn(async move |this, cx| {
-                if let Err(err) = client.send_key(&pane_id, &key_str) {
-                    let _ = this.update(cx, |view, _cx| view.status = err.to_string());
-                }
-            })
-            .detach();
+            self.submit_command(false, move |client| client.send_key(&pane_id, &key_str), cx);
         } else if let Some(text) = key.key_char.as_deref() {
             let text = text.to_string();
-            cx.spawn(async move |this, cx| {
-                if let Err(err) = client.send_text(&pane_id, &text) {
-                    let _ = this.update(cx, |view, _cx| view.status = err.to_string());
-                }
-            })
-            .detach();
+            self.submit_command(false, move |client| client.send_text(&pane_id, &text), cx);
         } else {
             let key_str = key_name(key);
-            cx.spawn(async move |this, cx| {
-                if let Err(err) = client.send_key(&pane_id, &key_str) {
-                    let _ = this.update(cx, |view, _cx| view.status = err.to_string());
-                }
-            })
-            .detach();
+            self.submit_command(false, move |client| client.send_key(&pane_id, &key_str), cx);
         }
     }
 
@@ -1441,8 +1453,19 @@ impl HerdrGui {
         let tabs = self.visible_tabs();
         let pane_container = div()
             .flex_1()
+            .flex()
+            .flex_col()
             .overflow_hidden()
             .ml(px((self.swipe_progress * 28.0) as f32))
+            .when(self.reconciliation_required, |el| {
+                el.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .text_color(rgb(theme.label))
+                        .child(self.status.clone()),
+                )
+            })
             .child(self.pane_grid(panes, pane_frame, theme, cx))
             .into_any_element();
         let show_top_tabs = self.sidebar_layout == SidebarLayout::Arc;
@@ -1801,10 +1824,7 @@ impl HerdrGui {
                         this.focus_tab_id(id.clone(), window, cx)
                     }),
                     cx.listener(move |this, _, window, cx| {
-                        this.with_client(|client| client.close_tab(&close_id));
-                        this.refresh_state();
-                        this.attach_focused_terminal(window, cx);
-                        cx.notify();
+                        this.close_tab_by_id(close_id.clone(), window, cx);
                     }),
                 )
             }))
@@ -1826,11 +1846,8 @@ impl HerdrGui {
             )
     }
 
-    fn close_tab_by_id(&mut self, tab_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.with_client(|client| client.close_tab(&tab_id));
-        self.refresh_state();
-        self.attach_focused_terminal(window, cx);
-        cx.notify();
+    fn close_tab_by_id(&mut self, tab_id: String, _window: &mut Window, cx: &mut Context<Self>) {
+        self.submit_command(true, move |client| client.close_tab(&tab_id), cx);
     }
 
     #[allow(dead_code)]
@@ -1914,6 +1931,21 @@ impl HerdrGui {
         theme: UiTheme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if !panes.is_empty()
+            && pane_frame.lines.is_empty()
+            && self.terminal.is_none()
+            && self.terminal_target.is_none()
+        {
+            return div()
+                .flex()
+                .flex_1()
+                .h_full()
+                .items_center()
+                .justify_center()
+                .child(ui_text(&self.status, 12, theme.muted, false, ""))
+                .into_any_element();
+        }
+
         if panes.is_empty() && pane_frame.lines.is_empty() {
             return div()
                 .flex()
@@ -2524,8 +2556,9 @@ fn main() {
         let window = cx.open_window(options, |_window, cx| cx.new(HerdrGui::new));
         if let Ok(window) = window {
             let _ = window.update(cx, |view, window, cx| {
-                view.request_state(window, cx);
+                view.request_state(window, cx, false);
                 HerdrGui::start_state_polling(window, cx);
+                HerdrGui::start_command_polling(window, cx);
             });
             let view = window.update(cx, |_, _, cx| cx.entity());
             if let Ok(view) = view {
@@ -2630,7 +2663,9 @@ fn poll_terminal(receiver: Receiver<Vec<u8>>, token: u64, cx: &mut Context<Herdr
                 view.terminal_target = None;
                 view.terminal_size = None;
                 view.set_terminal_frame(Arc::new(TerminalFrame::default()), cx);
-                view.status = "Terminal disconnected; use Refresh to retry".to_string();
+                if !view.reconciliation_required {
+                    view.status = "Terminal disconnected; use Refresh to retry".to_string();
+                }
                 cx.notify();
             });
             break;
