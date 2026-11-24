@@ -44,6 +44,7 @@ pub fn should_swallow_gui_keystroke(key: &Keystroke) -> bool {
     }
     let shift = key.modifiers.shift;
     match key.key.as_str() {
+        "c" => !shift,
         "v" => !shift,
         "r" => true,
         "s" => shift,
@@ -84,5 +85,14 @@ mod tests {
     fn cmd_v_is_swallowed_for_terminal_observer() {
         assert!(should_swallow_gui_keystroke(&ks("v", true, false)));
         assert!(!should_swallow_gui_keystroke(&ks("backspace", true, false)));
+    }
+
+    #[test]
+    fn copy_is_swallowed_but_control_c_is_terminal_input() {
+        assert!(should_swallow_gui_keystroke(&ks("c", true, false)));
+        let mut ctrl_c = ks("c", false, false);
+        ctrl_c.modifiers.control = true;
+        assert!(!should_swallow_gui_keystroke(&ctrl_c));
+        assert_eq!(key_name(&ctrl_c), "ctrl+c");
     }
 }
