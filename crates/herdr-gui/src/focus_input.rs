@@ -15,6 +15,7 @@ pub enum PendingInput {
 }
 
 const DIRECTION_WARNING: &str = "Directional focus could not be confirmed (layout unavailable or destination mismatch); input remains blocked. Click the desired pane to resume input.";
+const FOCUS_WARNING: &str = "Requested focus was not confirmed; buffered input discarded. Click the desired pane to resume input.";
 
 #[derive(Clone, Debug)]
 pub enum RecoveryTarget {
@@ -111,7 +112,13 @@ impl InputBuffer {
     }
 
     pub fn start_recovery(&mut self, target: RecoveryTarget) {
-        if self.blocked {
+        // Directional destinations are resolved only during blocked-input recovery.
+        if self.blocked
+            || !matches!(
+                target,
+                RecoveryTarget::Direction { .. } | RecoveryTarget::DirectionUnavailable
+            )
+        {
             self.recovery_target = Some(target);
         }
     }
@@ -141,29 +148,38 @@ impl InputBuffer {
         if target.matches(&focus) {
             self.blocked = false;
             None
-        } else if matches!(
-            target,
-            RecoveryTarget::Direction { .. } | RecoveryTarget::DirectionUnavailable
-        ) {
-            Some(DIRECTION_WARNING)
         } else {
-            None
+            self.reject_focus();
+            Some(
+                if matches!(
+                    target,
+                    RecoveryTarget::Direction { .. } | RecoveryTarget::DirectionUnavailable
+                ) {
+                    DIRECTION_WARNING
+                } else {
+                    FOCUS_WARNING
+                },
+            )
         }
     }
 
     pub fn take_ready(
         &mut self,
         confirmed: bool,
-        pane_id: &str,
+        focus: FocusSnapshot<'_>,
         expected_target: &str,
         attached_target: Option<&str>,
         token: u64,
         current_token: u64,
-    ) -> Option<(String, VecDeque<PendingInput>)> {
+    ) -> Result<Option<(String, VecDeque<PendingInput>)>, &'static str> {
         if !confirmed || attached_target != Some(expected_target) || token != current_token {
-            return None;
+            return Ok(None);
         }
-        Some((pane_id.to_string(), std::mem::take(&mut self.inputs)))
+        let pane_id = focus.pane.to_string();
+        if let Some(warning) = self.finish_recovery(focus) {
+            return Err(warning);
+        }
+        Ok(Some((pane_id, std::mem::take(&mut self.inputs))))
     }
 }
 
@@ -228,35 +244,36 @@ mod tests {
     #[test]
     fn waits_for_confirmed_current_attachment_and_preserves_fifo() {
         let mut input = InputBuffer::default();
+        input.start_recovery(RecoveryTarget::Pane("pane-new".into()));
         input.push(PendingInput::Text("a".into()));
         input.push(PendingInput::Key("enter".into()));
         input.push(PendingInput::Paste("b".into()));
         assert_eq!(
-            input.take_ready(false, "pane-new", "new", Some("old"), 1, 1),
-            None
+            input.take_ready(false, focus("pane-new"), "new", Some("old"), 1, 1),
+            Ok(None)
         );
         assert_eq!(
-            input.take_ready(true, "pane-new", "new", Some("old"), 1, 1),
-            None
+            input.take_ready(true, focus("pane-new"), "new", Some("old"), 1, 1),
+            Ok(None)
         );
         assert_eq!(
-            input.take_ready(true, "pane-new", "new", Some("new"), 1, 2),
-            None
+            input.take_ready(true, focus("pane-new"), "new", Some("new"), 1, 2),
+            Ok(None)
         );
         assert_eq!(
-            input.take_ready(true, "pane-new", "new", Some("new"), 2, 2),
-            Some((
+            input.take_ready(true, focus("pane-new"), "new", Some("new"), 2, 2),
+            Ok(Some((
                 "pane-new".into(),
                 VecDeque::from([
                     PendingInput::Text("a".into()),
                     PendingInput::Key("enter".into()),
                     PendingInput::Paste("b".into()),
                 ])
-            ))
+            )))
         );
         assert_eq!(
-            input.take_ready(true, "pane-new", "new", Some("new"), 2, 2),
-            Some(("pane-new".into(), VecDeque::new()))
+            input.take_ready(true, focus("pane-new"), "new", Some("new"), 2, 2),
+            Ok(Some(("pane-new".into(), VecDeque::new())))
         );
     }
 
@@ -266,8 +283,44 @@ mod tests {
         input.push(PendingInput::Text("secret".into()));
         input.discard();
         assert_eq!(
-            input.take_ready(true, "pane-new", "new", Some("new"), 2, 2),
-            Some(("pane-new".into(), VecDeque::new()))
+            input.take_ready(true, focus("pane-new"), "new", Some("new"), 2, 2),
+            Ok(Some(("pane-new".into(), VecDeque::new())))
+        );
+    }
+
+    #[test]
+    fn requested_b_but_observed_c_never_releases_buffered_paste_to_c() {
+        let mut input = InputBuffer::default();
+        input.start_recovery(RecoveryTarget::Pane("B".into()));
+        input.push(PendingInput::Paste("intended for B".into()));
+
+        assert_eq!(
+            input.take_ready(true, focus("C"), "C-terminal", Some("C-terminal"), 1, 2),
+            Ok(None)
+        );
+        assert!(!input.is_blocked());
+
+        let ready = input.take_ready(true, focus("C"), "C-terminal", Some("C-terminal"), 2, 2);
+        if let Ok(Some((_, inputs))) = &ready {
+            assert!(inputs.is_empty(), "delivered to C: {inputs:?}");
+        }
+        assert_eq!(ready, Err(FOCUS_WARNING));
+        assert!(input.is_blocked());
+
+        input.push(PendingInput::Paste("still blocked".into()));
+        input.start_recovery(RecoveryTarget::Pane("B".into()));
+        assert_eq!(
+            input.take_ready(true, focus("B"), "B-terminal", Some("B-terminal"), 3, 3),
+            Ok(Some(("B".into(), VecDeque::new())))
+        );
+        assert!(!input.is_blocked());
+        input.push(PendingInput::Text("new input".into()));
+        assert_eq!(
+            input.take_ready(true, focus("B"), "B-terminal", Some("B-terminal"), 3, 3),
+            Ok(Some((
+                "B".into(),
+                VecDeque::from([PendingInput::Text("new input".into())])
+            )))
         );
     }
 
@@ -278,8 +331,8 @@ mod tests {
         input.reject_focus();
         input.push(PendingInput::Paste("intended for C".into()));
         assert_eq!(
-            input.take_ready(true, "B", "B-terminal", Some("B-terminal"), 1, 1),
-            Some(("B".into(), VecDeque::new()))
+            input.take_ready(true, focus("B"), "B-terminal", Some("B-terminal"), 1, 1),
+            Ok(Some(("B".into(), VecDeque::new())))
         );
         let _ = input.finish_recovery(focus("B"));
         assert!(input.is_blocked());
@@ -291,11 +344,11 @@ mod tests {
         assert!(!input.is_blocked());
         input.push(PendingInput::Text("new input".into()));
         assert_eq!(
-            input.take_ready(true, "C", "C-terminal", Some("C-terminal"), 2, 2),
-            Some((
+            input.take_ready(true, focus("C"), "C-terminal", Some("C-terminal"), 2, 2),
+            Ok(Some((
                 "C".into(),
                 VecDeque::from([PendingInput::Text("new input".into())])
-            ))
+            )))
         );
     }
 
@@ -313,8 +366,8 @@ mod tests {
         assert!(input.is_blocked());
         input.push(PendingInput::Paste("not sent".into()));
         assert_eq!(
-            input.take_ready(true, "C", "C-terminal", Some("C-terminal"), 3, 3),
-            Some(("C".into(), VecDeque::new()))
+            input.take_ready(true, focus("C"), "C-terminal", Some("C-terminal"), 3, 3),
+            Ok(Some(("C".into(), VecDeque::new())))
         );
     }
 

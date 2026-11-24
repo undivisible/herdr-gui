@@ -1488,27 +1488,31 @@ impl HerdrGui {
         let tab_id = pane.tab_id.clone();
         let workspace_id = pane.workspace_id.clone();
         let target = target.to_string();
-        let Some((pane_id, mut inputs)) = self.pending_input.take_ready(
+        let was_blocked = self.pending_input.is_blocked();
+        let (pane_id, mut inputs) = match self.pending_input.take_ready(
             true,
-            &pane_id,
+            FocusSnapshot {
+                pane: &pane_id,
+                tab: tab_id.as_deref(),
+                workspace: workspace_id.as_deref(),
+            },
             &target,
             self.terminal_target.as_deref(),
             token,
             self.terminal_token,
-        ) else {
-            return;
+        ) {
+            Ok(Some(ready)) => ready,
+            Ok(None) => return,
+            Err(warning) => {
+                self.discard_pending_input();
+                self.warn(warning);
+                cx.notify();
+                return;
+            }
         };
         self.focus_change_pending = false;
         self.focus_result_confirmed = false;
-        let was_blocked = self.pending_input.is_blocked();
-        if let Some(warning) = self.pending_input.finish_recovery(FocusSnapshot {
-            pane: &pane_id,
-            tab: tab_id.as_deref(),
-            workspace: workspace_id.as_deref(),
-        }) {
-            self.warn(warning);
-            cx.notify();
-        } else if was_blocked && !self.pending_input.is_blocked() {
+        if was_blocked && !self.pending_input.is_blocked() {
             self.status = "connected".to_string();
             cx.notify();
         }
