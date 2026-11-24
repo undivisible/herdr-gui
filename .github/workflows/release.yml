@@ -13,14 +13,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: softwarecorporation/crepuscularity
-          path: crepuscularity
-          token: ${{ secrets.CREPUSCULARITY_TOKEN || secrets.GITHUB_TOKEN }}
-      - run: mv crepuscularity ../crepuscularity
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release
+      - run: cargo build --locked --release
       - run: |
           mkdir -p dist
           tar -czf dist/herdr-gui-macos-aarch64.tar.gz -C target/release herdr-gui
